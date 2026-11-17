@@ -17,7 +17,8 @@
 
 - **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 `omp` 输入框 `sendable=true` 后单次原子投递。
 - **零轮询 `AF_UNIX` 原生事件总线（`tern.process.spawn` + `agent_finished`）**：0 磁盘 `.jsonl` 轮询、0 定时器扫目录、0 临时 TCP 端口；通过本地 `0600` UNIX Domain Socket 原生跨线程唤醒 UI 虚拟机（Wayland 后台失焦同样稳定 `2~10 ms` 响应），并支持插件热重载不断连恢复。
-- **显式 `anchor → wingman` 归属绑定表**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机，哪怕切进 `ovnfs` 检出目录或子目录，`same` / `interrupt` / `pip` 依然精准锁定归属面板。
+- **显式 `anchor → wingman` 归属绑定与原生排队（`unqueue`）**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机；僚机忙碌时继续派单会在 `window.luau` 内存队列自动排队并在 `agent_finished` 时按序推进，支持随时 `unqueue` 撤回。
+- **全双工双向回推（`report` 主动汇报 + 异步轮次自动唤醒）**：当 `omp` 内部后台长任务（如 `bg_x`）跑完自动开启新一轮并结束时，即便主控 `agy` 早已进入 `idle`，插件也会自动把本轮结果回推唤醒主控（若主控正忙则自动缓冲合并投递）；同时 `omp` 也可随时调用 `wingman.py report -m "..."` 沿着 `boundOwner` 主动上报进度或提问。
 - **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片。
 - **零抢焦点分屏 & 画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；随时支持 `--pip br` 缩成角落画中画小窗盯盘、`dock` 一键贴回分屏。
 - **纯机制、零越俎代庖**：脚本只做忠实透明管道，不篡改 Prompt、不魔改任何全局扩展；每次派单是用干净新会话（`new`）、原位续跑（`same`）、还是配合 [`ovnfs`](https://github.com/stencil-hq/ovnfs) 开零拷贝写时复制沙箱，完全由主控模型按任务性质自主权衡。
@@ -58,11 +59,16 @@ python3 skills/wingman/scripts/wingman.py send new \
 # 直接从 Tern 内存读取结构化消息与工具卡片
 python3 skills/wingman/scripts/wingman.py transcript --last 6
 
-# 画中画悬浮 / 贴回分屏 / 中断当前回合 / 关闭分屏
+# 画中画悬浮 / 贴回分屏 / 中断当前回合 / 撤回排队任务 / 关闭分屏
 python3 skills/wingman/scripts/wingman.py pip --corner br
 python3 skills/wingman/scripts/wingman.py dock --dir right
 python3 skills/wingman/scripts/wingman.py interrupt
+python3 skills/wingman/scripts/wingman.py unqueue
 python3 skills/wingman/scripts/wingman.py stop
+
+# 僚机反向主动汇报主控 / 查看或切换自动回推开关
+python3 skills/wingman/scripts/wingman.py report -m "后台链路已跑完，测试全绿，请验收"
+python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 ```
 
 ## 开源协议

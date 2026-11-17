@@ -115,8 +115,53 @@ class WingmanTests(unittest.TestCase):
         self.assertEqual(ns_unq.position, 2)
         ns_send = parser.parse_args(["send", "same", "--prompt", "hi", "--no-queue"])
         self.assertTrue(ns_send.no_queue)
-        ns_send_def = parser.parse_args(["send", "same", "--prompt", "hi"])
-        self.assertFalse(ns_send_def.no_queue)
+        self.assertIsNone(ns_send.auto_callback)
+        ns_send_cb_off = parser.parse_args(["send", "same", "--prompt", "hi", "--no-auto-callback"])
+        self.assertFalse(ns_send_cb_off.auto_callback)
+        ns_send_cb_on = parser.parse_args(["send", "same", "--prompt", "hi", "--auto-callback"])
+        self.assertTrue(ns_send_cb_on.auto_callback)
+        ns_rep = parser.parse_args(["report", "-m", "done!", "--kind", "progress", "--pane", "100"])
+        self.assertEqual(ns_rep.prompt, "done!")
+        self.assertEqual(ns_rep.kind, "progress")
+        self.assertEqual(ns_rep.pane, "100")
+        ns_cb = parser.parse_args(["callback", "off", "--global"])
+        self.assertEqual(ns_cb.mode, "off")
+        self.assertTrue(ns_cb.global_scope)
+
+    def test_select_owner_pane_from_status_reverse_lookup(self) -> None:
+        # 1. Explicit `owner_pane` from bindings_v1 works even across ovnfs checkouts & multiple agents in tab
+        status_bound = {
+            "owner_pane": 100,
+            "agents": [
+                {"pane": 100, "is_self": False, "same_tab": True, "cwd": "/tmp/main"},
+                {"pane": 200, "is_self": False, "same_tab": True, "cwd": "/tmp/main"},
+                {"pane": 105, "is_self": True, "bound_owner": 100, "same_tab": True, "cwd": "/tmp/ovnfs-1"},
+            ],
+        }
+        self.assertEqual(wingman.select_owner_pane_from_status(status_bound, 105), 100)
+
+        # 2. Unbound fallback picks sole peer in same tab when unambiguous
+        status_sole_peer = {
+            "owner_pane": None,
+            "agents": [
+                {"pane": 100, "is_self": False, "same_tab": True, "cwd": "/tmp/main"},
+                {"pane": 105, "is_self": True, "bound_owner": None, "same_tab": True, "cwd": "/tmp/main"},
+                {"pane": 300, "is_self": False, "same_tab": False, "cwd": "/tmp/other"},
+            ],
+        }
+        self.assertEqual(wingman.select_owner_pane_from_status(status_sole_peer, 105), 100)
+
+        # 3. Refuses ambiguous multi-peer tab when unbound
+        status_ambiguous = {
+            "owner_pane": None,
+            "agents": [
+                {"pane": 100, "is_self": False, "same_tab": True, "cwd": "/tmp/main"},
+                {"pane": 200, "is_self": False, "same_tab": True, "cwd": "/tmp/main"},
+                {"pane": 105, "is_self": True, "bound_owner": None, "same_tab": True, "cwd": "/tmp/main"},
+            ],
+        }
+        with self.assertRaises(SystemExit):
+            wingman.select_owner_pane_from_status(status_ambiguous, 105)
 
     def test_mux_unix_socket_multiwindow_ack_and_hot_reload_recovery(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:

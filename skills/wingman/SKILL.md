@@ -31,7 +31,9 @@ python3 "$WINGMAN_PY" send <new|same|sessionId> \
 python3 "$WINGMAN_PY" transcript --last 6
 python3 "$WINGMAN_PY" peek [latest|sessionId] --cwd /path/to/project
 
-# Layout & lifecycle controls
+# Layout, bidirectional reporting & lifecycle controls
+python3 "$WINGMAN_PY" report --prompt "Summary or question for bound supervisor" [--kind final|progress|question]
+python3 "$WINGMAN_PY" callback [status|on|off|reset] [--global]
 python3 "$WINGMAN_PY" pip --corner br
 python3 "$WINGMAN_PY" dock --dir right
 python3 "$WINGMAN_PY" interrupt
@@ -43,5 +45,8 @@ python3 "$WINGMAN_PY" stop
 
 - Interactive `ask` calls inside `omp` pause the turn with `waiting_input` (exit code `2`) until answered by the user.
 - Calling `send same` while the wingman pane is `working` natively queues the prompt inside Tern's `window.luau` and promotes it automatically on `agent_finished` (pass `--no-queue` to fail fast instead).
+- **Bidirectional push (`omp -> supervisor`)**:
+  - **Auto-Callback (default ON)**: If a bound wingman finishes an unsolicited turn (e.g., an internal background job triggers a follow-up turn after the supervisor went `idle`, or `--max-time` disconnected earlier), `window.luau` automatically pushes `[Wingman auto-callback · pane <id>]` into the supervisor's composer (or queues it until the supervisor becomes `idle`). Toggle with `--no-auto-callback` or `wingman.py callback off`.
+  - **Proactive `report`**: From inside the wingman pane, run `wingman.py report -m "..."` (`--kind progress` for mid-turn updates, `--kind final` or `question` for completion/escalation) to push directly up to `boundOwner` without blocking.
 - When `ovnfsBin` is present in `info`, zero-copy Copy-on-Write checkouts are available via `ovnfs new <dir>`, `ovnfs diff <checkout>`, `ovnfs apply <checkout>`, and `ovnfs rm <checkout>`.
 - For TSP bridge details, Tern native blocks (`tern open --preview`, `tern browser`), and stateful RPC mode, see [internals.md](./references/internals.md).

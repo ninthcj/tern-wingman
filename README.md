@@ -24,7 +24,8 @@ Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across
 
 - **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until `omp` reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
 - **Zero-polling `AF_UNIX` event bus (`tern.process.spawn` + `agent_finished`)** — zero `.jsonl` polling, zero timer directory scans, and zero ephemeral TCP ports; `window.luau` wakes `wingman.py` over a `0600` UNIX domain socket in `2–10 ms` (even when occluded on Wayland) and survives live `tern plugin reload`.
-- **Explicit `anchor → wingman` ownership graph** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs, and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
+- **Explicit `anchor → wingman` ownership graph & FIFO queueing** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs; sending to a busy worker queues natively in `window.luau` (`unqueue` cancels pending slots), and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
+- **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if `omp` finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if the lead agent is busy); `omp` can also push mid-turn progress or questions proactively via `wingman.py report`.
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
 - **Non-intrusive Splits & Picture-in-Picture (`--pip br`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), and floats/docks the wingman as a corner PiP overlay on demand.
 - **Mechanism, not policy** — zero prompt rewriting and zero hidden config overrides; the lead agent decides per task whether to open a fresh session (`new`), iterate in place (`same`), resume a specific session, or isolate risky changes in an [`ovnfs`](https://github.com/stencil-hq/ovnfs) copy-on-write checkout.
@@ -103,11 +104,16 @@ python3 skills/wingman/scripts/wingman.py send same --pip br --prompt "Run pytes
 # Read structured TSP chat messages & tool cards directly from Tern memory
 python3 skills/wingman/scripts/wingman.py transcript --last 6
 
-# Float to PiP, dock back into split, interrupt Ctrl-C, or close worker
+# Float to PiP, dock back into split, interrupt Ctrl-C, cancel queued prompts, or close worker
 python3 skills/wingman/scripts/wingman.py pip --corner br
 python3 skills/wingman/scripts/wingman.py dock --dir right
 python3 skills/wingman/scripts/wingman.py interrupt
+python3 skills/wingman/scripts/wingman.py unqueue
 python3 skills/wingman/scripts/wingman.py stop
+
+# Bidirectional worker -> supervisor reporting & auto-callback policy
+python3 skills/wingman/scripts/wingman.py report -m "Finished v4 pipeline; ready for review"
+python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 ```
 
 ### Pairing with `deja-vu` & `ovnfs`

@@ -560,6 +560,40 @@ def select_wingman_pane_from_status(
     )
 
 
+def select_owner_pane_from_status(
+    status: dict[str, Any],
+    my_pane: int,
+) -> int:
+    """Resolve the caller wingman's supervisor/owner pane (`boundOwner`) for reverse reporting."""
+    agents = [
+        a
+        for a in status.get("agents", [])
+        if not a.get("is_self") and int(a["pane"]) != my_pane
+    ]
+    active_ids = {int(a["pane"]) for a in agents}
+
+    raw_owner = status.get("owner_pane")
+    if raw_owner is not None:
+        oid = int(raw_owner)
+        if oid != my_pane and oid in active_ids:
+            return oid
+
+    for a in status.get("agents", []):
+        if int(a["pane"]) == my_pane and a.get("bound_owner") is not None:
+            oid = int(a["bound_owner"])
+            if oid != my_pane and oid in active_ids:
+                return oid
+
+    same_tab_peers = [int(a["pane"]) for a in agents if a.get("same_tab")]
+    if len(same_tab_peers) == 1:
+        return same_tab_peers[0]
+
+    raise SystemExit(
+        "error: no supervisor/owner pane is bound to this pane "
+        "(pass `--pane <id>` from `wingman.py info` to specify the target owner pane)"
+    )
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     omp_bin = find_omp_bin()
     tern_bin = find_tern_bin()
@@ -617,8 +651,10 @@ def cmd_info(args: argparse.Namespace) -> None:
                     "isSelf": bool(a.get("is_self") or (my_pane is not None and pid == my_pane)),
                     "isBoundToMe": bool(a.get("is_bound_to_me")),
                     "boundOwner": a.get("bound_owner"),
+                    "autoCallback": a.get("auto_callback"),
                     "queuedCount": int(a.get("queued_count") or 0),
                     "queuedPreview": a.get("queued_preview"),
+                    "queuedCallbacksCount": int(a.get("queued_callbacks_count") or 0),
                     "sameTab": a.get("same_tab"),
                     "state": a.get("state"),
                     "model": a.get("model"),
@@ -633,6 +669,8 @@ def cmd_info(args: argparse.Namespace) -> None:
         "ovnfsBin": ovnfs_bin,
         "ternPane": my_pane,
         "boundWingmanPane": bridge_status.get("bound_pane") if bridge_status else None,
+        "ownerPane": bridge_status.get("owner_pane") if bridge_status else None,
+        "autoCallback": bridge_status.get("auto_callback") if bridge_status else None,
         "wingmanBridgeReady": bool(bridge_status and bridge_status.get("ok")),
         "floats": bridge_status.get("floats", []) if bridge_status else [],
         "ternAgents": agents_out,
@@ -708,7 +746,7 @@ def cmd_send(args: argparse.Namespace) -> None:
         if args.thinking:
             cmd_parts += ["--thinking", args.thinking]
 
-        req = {
+        req: dict[str, Any] = {
             "op": "dispatch",
             "anchor_pane": my_pane,
             "target_pane": target_pane,
@@ -719,6 +757,8 @@ def cmd_send(args: argparse.Namespace) -> None:
             "prompt": prompt,
             "pip_corner": args.pip,
         }
+        if args.auto_callback is not None:
+            req["auto_callback"] = bool(args.auto_callback)
 
         def _on_ack(frame: dict[str, Any]) -> None:
             pane_id = int(frame["pane"])
@@ -908,6 +948,88 @@ def cmd_stop(args: argparse.Namespace) -> None:
     print(json.dumps({"pane": pane, "stopped": True}, indent=2))
 
 
+def cmd_report(args: argparse.Namespace) -> None:
+    """Push a report/progress/question from a wingman pane back up to its bound supervisor (`boundOwner`)."""
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `report` requires running inside Tern")
+
+    prompt = args.prompt
+    if args.prompt_file:
+        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    if not prompt or not prompt.strip():
+        raise SystemExit("error: report prompt is empty")
+    prompt = prompt.strip()
+
+    explicit_owner: int | None = None
+    if args.pane:
+        if not str(args.pane).isdigit():
+            raise SystemExit(f"error: invalid owner pane id: {args.pane!r}")
+        explicit_owner = int(args.pane)
+        if explicit_owner == my_pane:
+            raise SystemExit(f"error: refusing to report onto caller's own pane ({my_pane})")
+    else:
+        status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
+        explicit_owner = select_owner_pane_from_status(status, my_pane)
+
+    reply = call_bridge(
+        {
+            "op": "report",
+            "anchor_pane": my_pane,
+            "target_pane": explicit_owner,
+            "kind": args.kind,
+            "prompt": prompt,
+        },
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    print(
+        json.dumps(
+            {
+                "workerPane": reply.get("worker_pane", my_pane),
+                "ownerPane": reply.get("owner_pane", explicit_owner),
+                "kind": reply.get("kind", args.kind),
+                "delivered": bool(reply.get("delivered")),
+                "queued": bool(reply.get("queued")),
+                "position": int(reply.get("position") or 0),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def cmd_callback(args: argparse.Namespace) -> None:
+    """Inspect or toggle unsolicited wingman -> supervisor auto-callback policy."""
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `callback` requires running inside Tern")
+    owner_pane: int | None = int(args.pane) if (args.pane and str(args.pane).isdigit()) else None
+    reply = call_bridge(
+        {
+            "op": "callback",
+            "anchor_pane": my_pane,
+            "owner_pane": owner_pane,
+            "mode": args.mode,
+            "scope": "global" if args.global_scope else "owner",
+        },
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    print(
+        json.dumps(
+            {
+                "ownerPane": reply.get("owner_pane"),
+                "autoCallback": bool(reply.get("enabled")),
+                "defaultAutoCallback": bool(reply.get("default_enabled")),
+            },
+            indent=2,
+        )
+    )
+
+
 def cmd_peek(args: argparse.Namespace) -> None:
     """O(1) tail seek on .jsonl for granular mid-turn TOOL_START / TOOL_RESULT inspection."""
     cwd = Path(args.cwd).resolve()
@@ -998,7 +1120,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--takeover-idle", action="store_true")
     p_send.add_argument("--allow-fork", action="store_true")
     p_send.add_argument("--no-queue", action="store_true", help="Fail immediately if target wingman pane is busy instead of queueing natively")
+    cb_grp = p_send.add_mutually_exclusive_group()
+    cb_grp.add_argument("--auto-callback", dest="auto_callback", action="store_true", default=None, help="Enable unsolicited worker->owner auto-callback (default: on)")
+    cb_grp.add_argument("--no-auto-callback", dest="auto_callback", action="store_false", help="Disable unsolicited worker->owner auto-callback for this binding")
     p_send.set_defaults(func=cmd_send)
+
+    p_rep = sub.add_parser("report", help="Push a report/progress/question from a wingman pane back up to its bound supervisor")
+    rep_grp = p_rep.add_mutually_exclusive_group(required=True)
+    rep_grp.add_argument("--prompt", "--message", "-m", dest="prompt", help="Report message text")
+    rep_grp.add_argument("--prompt-file", help="Path to report markdown/text file")
+    p_rep.add_argument("--kind", choices=["final", "progress", "question"], default="final", help="Report kind (`progress` keeps end-of-turn auto-callback active)")
+    p_rep.add_argument("--pane", help="Optional explicit supervisor/owner pane id (defaults to caller's boundOwner)")
+    p_rep.set_defaults(func=cmd_report)
+
+    p_cb = sub.add_parser("callback", help="Inspect or toggle unsolicited wingman -> supervisor auto-callback")
+    p_cb.add_argument("mode", nargs="?", choices=["status", "on", "off", "reset"], default="status")
+    p_cb.add_argument("--global", dest="global_scope", action="store_true", help="Apply to global default instead of current owner binding")
+    p_cb.add_argument("--pane", help="Optional owner pane id")
+    p_cb.set_defaults(func=cmd_callback)
 
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")
     p_tr.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
