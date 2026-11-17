@@ -617,6 +617,8 @@ def cmd_info(args: argparse.Namespace) -> None:
                     "isSelf": bool(a.get("is_self") or (my_pane is not None and pid == my_pane)),
                     "isBoundToMe": bool(a.get("is_bound_to_me")),
                     "boundOwner": a.get("bound_owner"),
+                    "queuedCount": int(a.get("queued_count") or 0),
+                    "queuedPreview": a.get("queued_preview"),
                     "sameTab": a.get("same_tab"),
                     "state": a.get("state"),
                     "model": a.get("model"),
@@ -864,6 +866,34 @@ def cmd_interrupt(args: argparse.Namespace) -> None:
     print(json.dumps({"pane": pane, "interrupted": True}, indent=2))
 
 
+def cmd_unqueue(args: argparse.Namespace) -> None:
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `unqueue` requires running inside Tern")
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {
+            "op": "unqueue",
+            "anchor_pane": my_pane,
+            "target_pane": pane,
+            "position": args.position,
+        },
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    print(
+        json.dumps(
+            {
+                "pane": pane,
+                "cancelled": reply.get("cancelled", 0),
+                "remaining": reply.get("remaining", 0),
+            },
+            indent=2,
+        )
+    )
+
+
 def cmd_stop(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
@@ -992,6 +1022,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_int.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
     p_int.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_int.set_defaults(func=cmd_interrupt)
+
+    p_unq = sub.add_parser("unqueue", help="Cancel queued (not-yet-sent) prompts waiting on a busy wingman pane")
+    p_unq.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    p_unq.add_argument("--position", type=int, help="Optional 1-based queue slot to cancel (default: cancel all)")
+    p_unq.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    p_unq.set_defaults(func=cmd_unqueue)
 
     p_stop = sub.add_parser("stop", help="Close worker pane and terminate process via `cx.agents:stop`")
     p_stop.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")

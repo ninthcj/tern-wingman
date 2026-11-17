@@ -505,6 +505,12 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		for _, a in ipairs(cx.agents:list()) do
 			local atab = cx.session:tab_of(a.pane)
 			local owner = owner_of_pane(cx, a.pane)
+			local q = queued_dispatches[a.pane]
+			local q_count = if q then #q else 0
+			local q_preview: string? = nil
+			if q and #q > 0 then
+				q_preview = string.sub(q[1].prompt, 1, 120)
+			end
 			table.insert(out, {
 				pane = a.pane,
 				tab = atab,
@@ -512,6 +518,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				is_self = (anchor ~= nil and a.pane == anchor),
 				is_bound_to_me = (bound_pane ~= nil and a.pane == bound_pane),
 				bound_owner = owner,
+				queued_count = q_count,
+				queued_preview = q_preview,
 				cwd = a.cwd,
 				state = a.state,
 				model = if a.model ~= tern.json.null then a.model else nil,
@@ -569,6 +577,57 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			cx.agents:interrupt(tp)
 		end)
 		send_mux(cid, { ok = ok_i, error = if not ok_i then tostring(err_i) else nil }, false)
+		return
+	end
+
+	if op == "unqueue" then
+		local tp = tonumber(req.target_pane) :: number
+		if anchor and tp == anchor then
+			send_mux(cid, { ok = false, error = "refusing to unqueue anchor_pane (caller agent itself)" }, false)
+			return
+		end
+		local q = queued_dispatches[tp]
+		if not q or #q == 0 then
+			send_mux(cid, { ok = true, pane = tp, cancelled = 0, remaining = 0 }, false)
+			return
+		end
+		local pos = if req.position ~= nil and req.position ~= tern.json.null then tonumber(req.position) else nil
+		local cancelled = 0
+		if pos then
+			local idx = math.floor(pos)
+			if idx < 1 or idx > #q then
+				send_mux(cid, { ok = false, error = string.format("queue position %d out of range (1..%d)", idx, #q) }, false)
+				return
+			end
+			local removed = table.remove(q, idx) :: QueuedDispatch
+			cancelled = 1
+			send_mux(removed.cid, {
+				ok = false,
+				pane = tp,
+				status = "cancelled",
+				error = "Cancelled from queue via unqueue",
+				last_message = "",
+				transcript = tern.json.array(),
+			}, false)
+			if #q == 0 then
+				queued_dispatches[tp] = nil
+			end
+		else
+			queued_dispatches[tp] = nil
+			for _, item in ipairs(q) do
+				cancelled += 1
+				send_mux(item.cid, {
+					ok = false,
+					pane = tp,
+					status = "cancelled",
+					error = "Cancelled from queue via unqueue",
+					last_message = "",
+					transcript = tern.json.array(),
+				}, false)
+			end
+		end
+		local rem = if queued_dispatches[tp] then #queued_dispatches[tp] else 0
+		send_mux(cid, { ok = true, pane = tp, cancelled = cancelled, remaining = rem }, false)
 		return
 	end
 

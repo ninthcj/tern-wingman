@@ -35,6 +35,7 @@ python3 "$WINGMAN_PY" peek [latest|sessionId] --cwd /path/to/project
 python3 "$WINGMAN_PY" pip --corner br
 python3 "$WINGMAN_PY" dock --dir right
 python3 "$WINGMAN_PY" interrupt
+python3 "$WINGMAN_PY" unqueue [--position 1]
 python3 "$WINGMAN_PY" stop
 ```
 

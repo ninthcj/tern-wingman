@@ -108,9 +108,11 @@ class WingmanTests(unittest.TestCase):
 
     def test_cli_control_subcommands_accept_cwd(self) -> None:
         parser = wingman.build_parser()
-        for sub in ("interrupt", "stop", "pip", "dock", "transcript"):
+        for sub in ("interrupt", "unqueue", "stop", "pip", "dock", "transcript"):
             ns = parser.parse_args([sub, "--cwd", "/tmp/demo-repo"])
             self.assertEqual(ns.cwd, "/tmp/demo-repo")
+        ns_unq = parser.parse_args(["unqueue", "--position", "2"])
+        self.assertEqual(ns_unq.position, 2)
         ns_send = parser.parse_args(["send", "same", "--prompt", "hi", "--no-queue"])
         self.assertTrue(ns_send.no_queue)
         ns_send_def = parser.parse_args(["send", "same", "--prompt", "hi"])
