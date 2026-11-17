@@ -90,7 +90,6 @@ python3 skills/wingman/scripts/wingman.py info --cwd /path/to/project
 # Dispatch work to a fresh session ('new'), active pane ('same'), or specific session ID
 python3 skills/wingman/scripts/wingman.py send new \
   --cwd /path/to/project \
-  --thinking high \
   --prompt-file /path/to/spec.md
 
 # Dispatch directly into a bottom-right Picture-in-Picture floating pane

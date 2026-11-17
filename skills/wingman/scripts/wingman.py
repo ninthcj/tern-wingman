@@ -525,7 +525,10 @@ def cmd_send(args: argparse.Namespace) -> None:
         )
 
         if args.session == "same" and target_pane is None:
-            session_path = resolve_session("latest", cwd, allow_missing=True)
+            raise SystemExit(
+                "error: `same` requested, but no wingman pane is open in this tab for this cwd. "
+                "Choose `new` for a fresh session, or pass `latest` / an explicit `<sessionId>` from `info`."
+            )
 
         if target_pane is None and session_path is not None:
             sid = read_session_header(session_path).get("id", "")
@@ -586,7 +589,9 @@ def cmd_send(args: argparse.Namespace) -> None:
 
     # Headless fallback outside Tern (-p --wait-async --auto-approve)
     if args.session == "same":
-        session_path = resolve_session("latest", cwd, allow_missing=True)
+        raise SystemExit(
+            "error: `same` refers to an active Tern pane; in headless mode choose `new`, `latest`, or an explicit `<sessionId>`."
+        )
 
     sid = read_session_header(session_path).get("id", "") if session_path else ""
     if sid and sid in check_leases(omp_bin, [sid]) and not args.allow_fork:

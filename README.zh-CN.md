@@ -52,7 +52,6 @@ python3 skills/wingman/scripts/wingman.py info --cwd /path/to/project
 # 派发任务（显式指定 new / same / <sessionId>；加 --pip br 可直接挂右下角画中画）
 python3 skills/wingman/scripts/wingman.py send new \
   --cwd /path/to/project \
-  --thinking high \
   --prompt-file /path/to/spec.md
 
 # 直接从 Tern 内存读取结构化消息与工具卡片

@@ -44,6 +44,9 @@ class WingmanTests(unittest.TestCase):
         pane_new, reset_new2 = wingman.resolve_target_pane_from_status(status, None, cwd, "new", None)
         self.assertEqual((pane_new, reset_new2), (101, True))
 
+        pane_none, reset_none = wingman.resolve_target_pane_from_status({"agents": []}, None, cwd, "same", None)
+        self.assertEqual((pane_none, reset_none), (None, False))
+
     def test_call_bridge_loopback_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_xdg = os.environ.get("XDG_RUNTIME_DIR")
