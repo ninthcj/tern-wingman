@@ -111,6 +111,10 @@ class WingmanTests(unittest.TestCase):
         for sub in ("interrupt", "stop", "pip", "dock", "transcript"):
             ns = parser.parse_args([sub, "--cwd", "/tmp/demo-repo"])
             self.assertEqual(ns.cwd, "/tmp/demo-repo")
+        ns_send = parser.parse_args(["send", "same", "--prompt", "hi", "--no-queue"])
+        self.assertTrue(ns_send.no_queue)
+        ns_send_def = parser.parse_args(["send", "same", "--prompt", "hi"])
+        self.assertFalse(ns_send_def.no_queue)
 
     def test_mux_unix_socket_multiwindow_ack_and_hot_reload_recovery(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
@@ -199,7 +203,7 @@ class WingmanTests(unittest.TestCase):
                 reply = wingman.call_bridge(
                     {"op": "dispatch", "anchor_pane": 42, "prompt": "hi"},
                     timeout=4.0,
-                    on_ack=acked.append,
+                    on_ack=lambda f: acked.append(int(f["pane"])),
                 )
                 self.assertEqual(acked, [777])
                 self.assertTrue(reply["ok"])

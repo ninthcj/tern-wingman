@@ -28,10 +28,19 @@ type WaitEntry = {
 	ask_deadline: number?,
 }
 
+type QueuedDispatch = {
+	cid: number,
+	anchor: number,
+	prompt: string,
+	pip_corner: string?,
+}
+
 -- Explicit ownership bijection: anchor_pane -> wingman_pane
 local bindings: { [number]: number } = {}
 -- Active in-flight turn waits keyed by wingman pane_id
 local pending_waits: { [number]: WaitEntry } = {}
+-- Native per-pane FIFO dispatch queue when target_pane is busy (`working`)
+local queued_dispatches: { [number]: { QueuedDispatch } } = {}
 
 local mux_child: Child? = nil
 local unloading = false
@@ -179,6 +188,52 @@ local function collect_turn_output(cx: WindowCx, pane_id: number): (string?, any
 	return last_msg, transcript
 end
 
+local ensure_watchdog: () -> ()
+
+local function promote_next_queued(cx: WindowCx, pane_id: number)
+	local q = queued_dispatches[pane_id]
+	if not q or #q == 0 then
+		queued_dispatches[pane_id] = nil
+		return
+	end
+	local item = table.remove(q, 1) :: QueuedDispatch
+	if #q == 0 then
+		queued_dispatches[pane_id] = nil
+	end
+
+	local ok_ask, err_ask = pcall(function()
+		cx.agents:ask(pane_id, item.prompt)
+	end)
+	if not ok_ask then
+		send_mux(item.cid, {
+			ok = false,
+			pane = pane_id,
+			status = "failed",
+			error = "queued cx.agents:ask failed: " .. tostring(err_ask),
+			last_message = "",
+			transcript = tern.json.array(),
+		}, false)
+		promote_next_queued(cx, pane_id)
+		return
+	end
+
+	bind_wingman(item.anchor, pane_id)
+	if item.pip_corner and item.pip_corner ~= "" then
+		pcall(function()
+			cx.layout:float(pane_id, item.anchor, item.pip_corner, { focus = false })
+		end)
+	end
+	pending_waits[pane_id] = {
+		cids = { item.cid },
+		started_ms = tern.now(),
+		saw_working = false,
+		idle_since = nil,
+		pending_prompt = nil,
+		ask_deadline = nil,
+	}
+	ensure_watchdog()
+end
+
 local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_msg: string?)
 	local w = pending_waits[pane_id]
 	if not w then
@@ -197,6 +252,24 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 	for _, cid in ipairs(w.cids) do
 		send_mux(cid, payload, false)
 	end
+	if status == "done" or status == "idle" then
+		promote_next_queued(cx, pane_id)
+	else
+		local q = queued_dispatches[pane_id]
+		if q then
+			queued_dispatches[pane_id] = nil
+			for _, item in ipairs(q) do
+				send_mux(item.cid, {
+					ok = false,
+					pane = pane_id,
+					status = status,
+					error = err_msg or ("queued dispatch aborted: " .. status),
+					last_message = last_msg or "",
+					transcript = transcript,
+				}, false)
+			end
+		end
+	end
 end
 
 local function drop_disconnected_cid(cid: number)
@@ -213,11 +286,24 @@ local function drop_disconnected_cid(cid: number)
 			w.cids = kept
 		end
 	end
+	for pane_id, q in pairs(queued_dispatches) do
+		local kept: { QueuedDispatch } = {}
+		for _, item in ipairs(q) do
+			if item.cid ~= cid then
+				table.insert(kept, item)
+			end
+		end
+		if #kept == 0 then
+			queued_dispatches[pane_id] = nil
+		else
+			queued_dispatches[pane_id] = kept
+		end
+	end
 end
 
 local function watchdog_step(cx: WindowCx?)
 	watchdog_armed = false
-	if next(pending_waits) == nil then
+	if next(pending_waits) == nil and next(queued_dispatches) == nil then
 		return
 	end
 	if cx then
@@ -263,15 +349,40 @@ local function watchdog_step(cx: WindowCx?)
 				end
 			end
 		end
+
+		-- Also promote queued dispatches for panes whose active turn wasn't started via `pending_waits`
+		for pane_id, _ in pairs(queued_dispatches) do
+			if pending_waits[pane_id] == nil then
+				local ainfo = find_agent_info(cx, pane_id)
+				if not ainfo and cx.session:pane(pane_id) == nil then
+					local q = queued_dispatches[pane_id]
+					queued_dispatches[pane_id] = nil
+					if q then
+						for _, item in ipairs(q) do
+							send_mux(item.cid, {
+								ok = false,
+								pane = pane_id,
+								status = "closed",
+								error = "Agent pane disappeared",
+								last_message = "",
+								transcript = tern.json.array(),
+							}, false)
+						end
+					end
+				elseif ainfo and ainfo.state == "idle" then
+					promote_next_queued(cx, pane_id)
+				end
+			end
+		end
 	end
-	if next(pending_waits) ~= nil and not watchdog_armed then
+	if (next(pending_waits) ~= nil or next(queued_dispatches) ~= nil) and not watchdog_armed then
 		watchdog_armed = true
 		tern.timer(500, watchdog_step)
 	end
 end
 
-local function ensure_watchdog()
-	if not watchdog_armed and next(pending_waits) ~= nil then
+ensure_watchdog = function()
+	if not watchdog_armed and (next(pending_waits) ~= nil or next(queued_dispatches) ~= nil) then
 		watchdog_armed = true
 		tern.timer(500, watchdog_step)
 	end
@@ -304,16 +415,54 @@ end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	local w = pending_waits[ev.pane]
-	if not w or w.pending_prompt ~= nil then
+	if w then
+		if w.pending_prompt ~= nil then
+			return
+		end
+		finish_wait(cx, ev.pane, ev.result, nil)
 		return
 	end
-	finish_wait(cx, ev.pane, ev.result, nil)
+	if queued_dispatches[ev.pane] then
+		if ev.result == "done" then
+			promote_next_queued(cx, ev.pane)
+		else
+			local q = queued_dispatches[ev.pane]
+			queued_dispatches[ev.pane] = nil
+			if q then
+				for _, item in ipairs(q) do
+					send_mux(item.cid, {
+						ok = false,
+						pane = ev.pane,
+						status = ev.result,
+						error = "Previous turn ended with " .. ev.result,
+						last_message = "",
+						transcript = tern.json.array(),
+					}, false)
+				end
+			end
+		end
+	end
 end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	unbind_pane(ev.pane)
 	if pending_waits[ev.pane] then
 		finish_wait(cx, ev.pane, "closed", "Agent pane was closed")
+	elseif queued_dispatches[ev.pane] then
+		local q = queued_dispatches[ev.pane]
+		queued_dispatches[ev.pane] = nil
+		if q then
+			for _, item in ipairs(q) do
+				send_mux(item.cid, {
+					ok = false,
+					pane = ev.pane,
+					status = "closed",
+					error = "Agent pane was closed",
+					last_message = "",
+					transcript = tern.json.array(),
+				}, false)
+			end
+		end
 	end
 end)
 
@@ -524,7 +673,25 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		if target_pane then
 			local ainfo = find_agent_info(cx, target_pane)
 			if ainfo and ainfo.state == "working" then
-				send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
+				if req.queue == false then
+					send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
+					return
+				end
+				bind_wingman(anchor, target_pane)
+				local q = queued_dispatches[target_pane]
+				if not q then
+					q = {}
+					queued_dispatches[target_pane] = q
+				end
+				local corner_str: string? = if type(pip_corner) == "string" and pip_corner ~= "" then pip_corner else nil
+				table.insert(q, {
+					cid = cid,
+					anchor = anchor,
+					prompt = prompt,
+					pip_corner = corner_str,
+				})
+				send_mux(cid, { _ack = true, pane = target_pane, queued = true, position = #q }, true)
+				ensure_watchdog()
 				return
 			end
 			local ok_ask, err_ask = pcall(function()

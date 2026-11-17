@@ -172,7 +172,7 @@ def _read_json_line(
 def call_bridge(
     payload: dict[str, Any],
     timeout: float | None = DEFAULT_BRIDGE_TIMEOUT,
-    on_ack: Callable[[int], None] | None = None,
+    on_ack: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Send one RPC over AF_UNIX stream socket to `window.luau`'s event-driven `mux.py`."""
     deadline = (time.monotonic() + timeout) if timeout is not None else None
@@ -225,7 +225,7 @@ def call_bridge(
                         ack_pane = int(frame["pane"])
                         if on_ack is not None and not notified_ack:
                             notified_ack = True
-                            on_ack(ack_pane)
+                            on_ack(frame)
                         continue
                     if frame.get("_reload"):
                         need_reload_retry = True
@@ -711,18 +711,28 @@ def cmd_send(args: argparse.Namespace) -> None:
             "anchor_pane": my_pane,
             "target_pane": target_pane,
             "reset_new": reset_new,
+            "queue": not args.no_queue,
             "cwd": str(cwd),
             "command": shlex.join(cmd_parts),
             "prompt": prompt,
             "pip_corner": args.pip,
         }
 
-        def _on_ack(pane_id: int) -> None:
-            print(
-                f"[wingman] Native TSP dispatch ({len(prompt)} chars) -> pane {pane_id}",
-                file=sys.stderr,
-                flush=True,
-            )
+        def _on_ack(frame: dict[str, Any]) -> None:
+            pane_id = int(frame["pane"])
+            if frame.get("queued"):
+                pos = frame.get("position", 1)
+                print(
+                    f"[wingman] Native TSP queued (#{pos}, {len(prompt)} chars) -> pane {pane_id} (waiting on agent_finished)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[wingman] Native TSP dispatch ({len(prompt)} chars) -> pane {pane_id}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         try:
             reply = call_bridge(req, timeout=timeout_s, on_ack=_on_ack)
@@ -957,6 +967,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--max-time", help="Optional max runtime (e.g. 30m, 1h)")
     p_send.add_argument("--takeover-idle", action="store_true")
     p_send.add_argument("--allow-fork", action="store_true")
+    p_send.add_argument("--no-queue", action="store_true", help="Fail immediately if target wingman pane is busy instead of queueing natively")
     p_send.set_defaults(func=cmd_send)
 
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")

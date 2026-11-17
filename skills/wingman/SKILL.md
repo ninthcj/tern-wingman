@@ -41,5 +41,6 @@ python3 "$WINGMAN_PY" stop
 ## Notes
 
 - Interactive `ask` calls inside `omp` pause the turn with `waiting_input` (exit code `2`) until answered by the user.
+- Calling `send same` while the wingman pane is `working` natively queues the prompt inside Tern's `window.luau` and promotes it automatically on `agent_finished` (pass `--no-queue` to fail fast instead).
 - When `ovnfsBin` is present in `info`, zero-copy Copy-on-Write checkouts are available via `ovnfs new <dir>`, `ovnfs diff <checkout>`, `ovnfs apply <checkout>`, and `ovnfs rm <checkout>`.
 - For TSP bridge details, Tern native blocks (`tern open --preview`, `tern browser`), and stateful RPC mode, see [internals.md](./references/internals.md).
