@@ -1,6 +1,6 @@
 schema = 1
 id = "wingman"
 name = "Wingman"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native WindowCx.agents TSP bridge letting any coding agent in Tern spawn, steer, PiP-float, and await side-pane omp workers."
 window = "window.luau"

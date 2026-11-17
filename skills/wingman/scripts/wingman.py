@@ -4,21 +4,22 @@
 from __future__ import annotations
 
 import argparse
-import http.server
 import json
 import os
 import re
-import secrets
 import shlex
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
-import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+DEFAULT_BRIDGE_TIMEOUT = 5.0
 
 
 def home_dir() -> Path:
@@ -46,7 +47,6 @@ def sessions_root() -> Path:
     if os.environ.get("DEJA_OMP_ROOT"):
         return Path(os.environ["DEJA_OMP_ROOT"]).expanduser()
     d = active_omp_agent_dir()
-    # XDG layout stores sessions directly under $XDG_DATA_HOME/omp/sessions
     return d / "sessions"
 
 
@@ -116,10 +116,21 @@ def current_tern_pane() -> int | None:
 
 
 def bridge_ipc_dir() -> Path:
+    """Resolve the secure AF_UNIX socket directory shared with `window.luau` (kept <= 72 chars for sun_path)."""
     rt = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    base = Path(rt) if rt else (home_dir() / ".cache")
-    d = base / "tern-wingman"
+    if rt and len(rt) <= 72:
+        d = Path(rt) / "tern-wingman"
+    else:
+        fallback = home_dir() / ".cache" / "tern-wingman"
+        if len(str(fallback)) <= 72:
+            d = fallback
+        else:
+            user = os.environ.get("USER") or str(os.getuid())
+            d = Path(f"/tmp/tern-wingman-{user}")
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    st = os.lstat(d)
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+        raise SystemExit(f"error: insecure IPC directory {d}")
     try:
         os.chmod(d, 0o700)
     except OSError:
@@ -127,63 +138,133 @@ def bridge_ipc_dir() -> Path:
     return d
 
 
-def call_bridge(payload: dict[str, Any], timeout: float | None = 5.0) -> dict[str, Any]:
-    """Call the `wingman` Tern Luau window plugin over authenticated loopback HTTP."""
-    result_box: dict[str, Any] = {}
-    done_ev = threading.Event()
-    token = secrets.token_hex(16)
+def _read_json_line(
+    sock: socket.socket,
+    buf: bytearray,
+    deadline: float | None,
+) -> dict[str, Any] | None:
+    while True:
+        nl = buf.find(b"\n")
+        if nl >= 0:
+            raw = bytes(buf[:nl]).decode("utf-8", errors="replace").strip()
+            del buf[: nl + 1]
+            if not raw:
+                continue
+            return json.loads(raw)
 
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            if self.headers.get("Authorization") != f"Bearer {token}":
-                self.send_response(403)
-                self.end_headers()
-                return
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length).decode("utf-8", errors="replace")
-            try:
-                result_box["reply"] = json.loads(raw)
-            except Exception as exc:
-                result_box["reply"] = {"ok": False, "error": f"invalid bridge JSON: {exc}"}
-            self.send_response(200)
-            self.end_headers()
-            done_ev.set()
+        if deadline is not None:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError("timed out waiting for Tern wingman plugin")
+            sock.settimeout(rem)
+        else:
+            sock.settimeout(None)
 
-        def log_message(self, *args: Any) -> None:
-            pass
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout as exc:
+            raise TimeoutError("timed out waiting for Tern wingman plugin") from exc
+        if not chunk:
+            return None
+        buf.extend(chunk)
 
-    srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=srv.serve_forever, daemon=True)
-    thread.start()
 
+def call_bridge(
+    payload: dict[str, Any],
+    timeout: float | None = DEFAULT_BRIDGE_TIMEOUT,
+    on_ack: Callable[[int], None] | None = None,
+) -> dict[str, Any]:
+    """Send one RPC over AF_UNIX stream socket to `window.luau`'s event-driven `mux.py`."""
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
     ipc = bridge_ipc_dir()
-    stamp = f"{int(time.time() * 1000)}-{secrets.token_hex(4)}"
-    tmp_path = ipc / f".tmp-{stamp}"
-    req_path = ipc / f"req-{stamp}.json"
+    daemon_sock = os.environ.get("TERN_DAEMON_SOCKET") or os.environ.get("TERN_PANE_SOCKET") or ""
 
-    body = dict(payload)
-    body["port"] = srv.server_port
-    body["token"] = token
-    body.setdefault("daemon_socket", os.environ.get("TERN_DAEMON_SOCKET", ""))
+    cur_payload = dict(payload)
+    cur_payload.setdefault("daemon_socket", daemon_sock)
+    ack_pane: int | None = None
+    notified_ack = False
 
-    try:
-        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(body, f, ensure_ascii=False)
-        # Atomic rename so window.luau never observes a partially written .json file
-        os.replace(tmp_path, req_path)
-        finished = done_ev.wait(timeout=timeout)
-        if not finished:
-            raise TimeoutError(f"timed out after {timeout}s waiting for Tern wingman plugin")
-        return result_box["reply"]
-    finally:
-        for p in (tmp_path, req_path):
+    while True:
+        sock_files = sorted(ipc.glob("w-*.sock"))
+        need_reload_retry = False
+
+        for sp in sock_files:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out after {timeout}s waiting for Tern wingman plugin")
+
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
-        srv.shutdown()
-        srv.server_close()
+                connect_timeout = 1.0
+                if deadline is not None:
+                    connect_timeout = max(0.05, min(1.0, deadline - time.monotonic()))
+                sock.settimeout(connect_timeout)
+                try:
+                    sock.connect(str(sp))
+                except (ConnectionRefusedError, FileNotFoundError):
+                    try:
+                        sp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    continue
+                except OSError:
+                    continue
+
+                wire = (json.dumps(cur_payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                sock.sendall(wire)
+
+                buf = bytearray()
+                while True:
+                    frame = _read_json_line(sock, buf, deadline)
+                    if frame is None:
+                        if ack_pane is not None:
+                            need_reload_retry = True
+                        break
+                    if frame.get("_skip"):
+                        break
+                    if frame.get("_ack"):
+                        ack_pane = int(frame["pane"])
+                        if on_ack is not None and not notified_ack:
+                            notified_ack = True
+                            on_ack(ack_pane)
+                        continue
+                    if frame.get("_reload"):
+                        need_reload_retry = True
+                        break
+                    return frame
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+            if need_reload_retry:
+                break
+
+        if need_reload_retry and ack_pane is not None:
+            # `window.luau` reloaded mid-turn; seamlessly re-attach via `await` once the new mux socket binds
+            cur_payload = {
+                "op": "await",
+                "anchor_pane": payload.get("anchor_pane"),
+                "target_pane": ack_pane,
+                "daemon_socket": daemon_sock,
+            }
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out after {timeout}s waiting for Tern wingman plugin")
+            time.sleep(0.15)
+            continue
+
+        # If no active mux socket answered yet (e.g. plugin is mid-reload), retry briefly up to 1.5s / deadline
+        now = time.monotonic()
+        wait_cap = min(deadline, now + 0.15) if deadline is not None else (now + 0.15)
+        if not sock_files and (deadline is None or now + 0.05 < deadline):
+            # Bound initial socket discovery wait when plugin is not installed/running
+            init_cap = deadline if deadline is not None else (now + DEFAULT_BRIDGE_TIMEOUT)
+            deadline = init_cap
+            time.sleep(max(0.01, wait_cap - now))
+            if time.monotonic() < deadline:
+                continue
+
+        raise TimeoutError("no active Tern `wingman` window socket answered")
 
 
 def inspect_tern(tern_bin: str | None) -> dict[str, Any] | None:
@@ -202,6 +283,16 @@ def inspect_tern(tern_bin: str | None) -> dict[str, Any] | None:
     except Exception:
         pass
     return None
+
+
+def extract_omp_pane_files(inspect_data: dict[str, Any] | None) -> dict[int, str]:
+    """Authoritative map of `pane_id -> resolved omp_session_file` from `tern inspect --json`."""
+    pane_files: dict[int, str] = {}
+    if inspect_data:
+        for p in inspect_data.get("panes", []):
+            if "pane" in p and p.get("omp_session_file"):
+                pane_files[int(p["pane"])] = str(Path(p["omp_session_file"]).resolve())
+    return pane_files
 
 
 def parse_duration_seconds(spec: str | None) -> float | None:
@@ -370,44 +461,103 @@ def extract_content(content: Any) -> tuple[str, list[str], int]:
     return "\n".join(texts), tools, thinking_chars
 
 
+def _pick_unclaimed_omp_in_tab(
+    agents: list[dict[str, Any]],
+    pane_files: dict[int, str],
+    cwd: Path | None,
+) -> int | None:
+    """Select an unbound `omp` pane (verified via `tern inspect`'s `omp_session_file`) in the caller's tab."""
+    unclaimed = [
+        a
+        for a in agents
+        if a.get("same_tab")
+        and a.get("bound_owner") is None
+        and int(a["pane"]) in pane_files
+    ]
+    if not unclaimed:
+        return None
+    if cwd is not None:
+        want = cwd.resolve()
+        for a in unclaimed:
+            try:
+                if Path(str(a.get("cwd", ""))).resolve() == want:
+                    return int(a["pane"])
+            except OSError:
+                pass
+    return int(unclaimed[0]["pane"])
+
+
 def resolve_target_pane_from_status(
     status: dict[str, Any],
     inspect_data: dict[str, Any] | None,
     cwd: Path,
     target_session: str,
     session_path: Path | None,
+    anchor_pane: int | None = None,
 ) -> tuple[int | None, bool]:
-    """Return (target_pane_id, reset_new) based on native `cx.agents:list()` and `tern inspect`."""
-    pane_files: dict[int, str] = {}
-    if inspect_data:
-        for p in inspect_data.get("panes", []):
-            if "pane" in p and p.get("omp_session_file"):
-                pane_files[int(p["pane"])] = str(Path(p["omp_session_file"]).resolve())
+    """Return (target_pane_id, reset_new) from explicit ownership (`bound_pane`) + authoritative `omp_session_file`."""
+    pane_files = extract_omp_pane_files(inspect_data)
+    agents = [
+        a
+        for a in status.get("agents", [])
+        if not a.get("is_self") and (anchor_pane is None or int(a["pane"]) != anchor_pane)
+    ]
+    active_ids = {int(a["pane"]) for a in agents}
 
-    agents = status.get("agents", [])
+    raw_bound = status.get("bound_pane")
+    bound_pane: int | None = None
+    if raw_bound is not None:
+        bp = int(raw_bound)
+        if (anchor_pane is None or bp != anchor_pane) and bp in active_ids:
+            bound_pane = bp
+
     if session_path is not None:
         want = str(session_path.resolve())
         for a in agents:
             pid = int(a["pane"])
             if pane_files.get(pid) == want:
                 return pid, False
+        return None, False
 
-    for a in agents:
-        if not a.get("same_tab"):
-            continue
-        try:
-            same_cwd = Path(str(a.get("cwd", ""))).resolve() == cwd.resolve()
-        except OSError:
-            same_cwd = False
-        if not same_cwd:
-            continue
-        pid = int(a["pane"])
-        if target_session == "same":
-            return pid, False
-        if target_session == "new":
-            return pid, True
+    if target_session == "same":
+        if bound_pane is not None:
+            return bound_pane, False
+        adopted = _pick_unclaimed_omp_in_tab(agents, pane_files, cwd)
+        return (adopted, False) if adopted is not None else (None, False)
+
+    if target_session == "new":
+        if bound_pane is not None:
+            return bound_pane, True
+        return None, False
 
     return None, False
+
+
+def select_wingman_pane_from_status(
+    status: dict[str, Any],
+    inspect_data: dict[str, Any] | None,
+    my_pane: int,
+    cwd: Path | None = None,
+) -> int:
+    """Resolve the caller's wingman pane for lifecycle/layout ops (`interrupt`, `stop`, `pip`, `dock`, `transcript`)."""
+    raw_bound = status.get("bound_pane")
+    if raw_bound is not None and int(raw_bound) != my_pane:
+        return int(raw_bound)
+
+    pane_files = extract_omp_pane_files(inspect_data)
+    agents = [
+        a
+        for a in status.get("agents", [])
+        if not a.get("is_self") and int(a["pane"]) != my_pane
+    ]
+    adopted = _pick_unclaimed_omp_in_tab(agents, pane_files, cwd)
+    if adopted is not None:
+        return adopted
+
+    raise SystemExit(
+        "error: no wingman pane is bound to this pane or open in this tab "
+        "(pass an explicit `<pane>` id from `wingman.py info` to target another pane)"
+    )
 
 
 def cmd_info(args: argparse.Namespace) -> None:
@@ -422,16 +572,12 @@ def cmd_info(args: argparse.Namespace) -> None:
     bridge_status: dict[str, Any] | None = None
     if my_pane is not None:
         try:
-            bridge_status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=2.5)
+            bridge_status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
         except Exception:
             bridge_status = None
 
     inspect_data = inspect_tern(tern_bin) if my_pane else None
-    pane_files = {
-        int(p["pane"]): p.get("omp_session_file")
-        for p in (inspect_data.get("panes", []) if inspect_data else [])
-        if "pane" in p
-    }
+    pane_files = extract_omp_pane_files(inspect_data)
 
     sessions_out = []
     if bucket.is_dir():
@@ -445,14 +591,14 @@ def cmd_info(args: argparse.Namespace) -> None:
         held = check_leases(omp_bin, sids)
         for f, h in headers:
             sid = h.get("id", "")
-            stat = f.stat()
+            st = f.stat()
             host = hosts.get(sid)
             sessions_out.append(
                 {
                     "sessionId": sid,
                     "path": str(f),
-                    "sizeMB": round(stat.st_size / (1024 * 1024), 2),
-                    "mtime": fmt_ts(stat.st_mtime),
+                    "sizeMB": round(st.st_size / (1024 * 1024), 2),
+                    "mtime": fmt_ts(st.st_mtime),
                     "title": h.get("title", ""),
                     "leaseHeld": sid in held,
                     "hostPid": host.get("pid") if host else None,
@@ -468,6 +614,9 @@ def cmd_info(args: argparse.Namespace) -> None:
             agents_out.append(
                 {
                     "pane": pid,
+                    "isSelf": bool(a.get("is_self") or (my_pane is not None and pid == my_pane)),
+                    "isBoundToMe": bool(a.get("is_bound_to_me")),
+                    "boundOwner": a.get("bound_owner"),
                     "sameTab": a.get("same_tab"),
                     "state": a.get("state"),
                     "model": a.get("model"),
@@ -481,6 +630,7 @@ def cmd_info(args: argparse.Namespace) -> None:
         "ompBin": omp_bin,
         "ovnfsBin": ovnfs_bin,
         "ternPane": my_pane,
+        "boundWingmanPane": bridge_status.get("bound_pane") if bridge_status else None,
         "wingmanBridgeReady": bool(bridge_status and bridge_status.get("ok")),
         "floats": bridge_status.get("floats", []) if bridge_status else [],
         "ternAgents": agents_out,
@@ -512,7 +662,7 @@ def cmd_send(args: argparse.Namespace) -> None:
         if my_pane is None:
             raise SystemExit("error: --mode tui requested, but $TERN_PANE is not set")
         try:
-            status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=3.0)
+            status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
         except Exception as exc:
             raise SystemExit(
                 f"error: Tern `wingman` plugin did not answer ({exc}). "
@@ -521,12 +671,12 @@ def cmd_send(args: argparse.Namespace) -> None:
 
         inspect_data = inspect_tern(tern_bin)
         target_pane, reset_new = resolve_target_pane_from_status(
-            status, inspect_data, cwd, args.session, session_path
+            status, inspect_data, cwd, args.session, session_path, anchor_pane=my_pane
         )
 
         if args.session == "same" and target_pane is None:
             raise SystemExit(
-                "error: `same` requested, but no wingman pane is open in this tab for this cwd. "
+                "error: `same` requested, but no wingman pane is bound to this pane or open in this tab. "
                 "Choose `new` for a fresh session, or pass `latest` / an explicit `<sessionId>` from `info`."
             )
 
@@ -549,7 +699,7 @@ def cmd_send(args: argparse.Namespace) -> None:
                     )
 
         cmd_parts = [omp_bin, "--auto-approve", "--cwd", str(cwd)]
-        if target_pane is None and session_path is not None:
+        if (target_pane is None or reset_new) and session_path is not None:
             cmd_parts += ["-r", str(session_path)]
         if args.model:
             cmd_parts += ["--model", args.model]
@@ -566,11 +716,16 @@ def cmd_send(args: argparse.Namespace) -> None:
             "prompt": prompt,
             "pip_corner": args.pip,
         }
-        action_desc = f"pane {target_pane}" if (target_pane and not reset_new) else "new TSP wingman split"
-        print(f"[wingman] Native TSP dispatch ({len(prompt)} chars) -> {action_desc}", file=sys.stderr)
+
+        def _on_ack(pane_id: int) -> None:
+            print(
+                f"[wingman] Native TSP dispatch ({len(prompt)} chars) -> pane {pane_id}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         try:
-            reply = call_bridge(req, timeout=timeout_s)
+            reply = call_bridge(req, timeout=timeout_s, on_ack=_on_ack)
         except TimeoutError:
             print(f"[wingman] Timed out after {args.max_time} waiting for agent turn.", file=sys.stderr)
             raise SystemExit(124)
@@ -625,22 +780,33 @@ def cmd_send(args: argparse.Namespace) -> None:
     raise SystemExit(proc.returncode)
 
 
-def resolve_same_tab_agent_pane(my_pane: int) -> int:
-    status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=3.0)
-    for a in status.get("agents", []):
-        if a.get("same_tab"):
-            return int(a["pane"])
-    if status.get("agents"):
-        return int(status["agents"][0]["pane"])
-    raise SystemExit("error: no active Tern agent pane found")
+def resolve_same_tab_agent_pane(my_pane: int, cwd: Path | None = None) -> int:
+    status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
+    inspect_data = None
+    if status.get("bound_pane") is None:
+        inspect_data = inspect_tern(find_tern_bin())
+    return select_wingman_pane_from_status(status, inspect_data, my_pane, cwd=cwd)
+
+
+def _resolve_explicit_or_bound_pane(args: argparse.Namespace, my_pane: int) -> int:
+    if args.pane and args.pane.isdigit():
+        pane = int(args.pane)
+        if pane == my_pane:
+            raise SystemExit(f"error: refusing to target caller's own pane ({my_pane})")
+        return pane
+    cwd = Path(args.cwd).resolve() if getattr(args, "cwd", None) else None
+    return resolve_same_tab_agent_pane(my_pane, cwd=cwd)
 
 
 def cmd_transcript(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `transcript` requires running inside Tern")
-    pane = int(args.pane) if args.pane and args.pane.isdigit() else resolve_same_tab_agent_pane(my_pane)
-    reply = call_bridge({"op": "transcript", "anchor_pane": my_pane, "target_pane": pane, "last": args.last}, timeout=3.0)
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "transcript", "anchor_pane": my_pane, "target_pane": pane, "last": args.last},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(json.dumps(reply.get("messages", []), ensure_ascii=False, indent=2))
@@ -650,8 +816,11 @@ def cmd_pip(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `pip` requires running inside Tern")
-    pane = int(args.pane) if args.pane and args.pane.isdigit() else resolve_same_tab_agent_pane(my_pane)
-    reply = call_bridge({"op": "pip", "anchor_pane": my_pane, "target_pane": pane, "corner": args.corner}, timeout=3.0)
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "pip", "anchor_pane": my_pane, "target_pane": pane, "corner": args.corner},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(json.dumps({"pane": pane, "floating": args.corner}, indent=2))
@@ -661,8 +830,11 @@ def cmd_dock(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `dock` requires running inside Tern")
-    pane = int(args.pane) if args.pane and args.pane.isdigit() else resolve_same_tab_agent_pane(my_pane)
-    reply = call_bridge({"op": "dock", "anchor_pane": my_pane, "target_pane": pane, "dir": args.dir}, timeout=3.0)
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "dock", "anchor_pane": my_pane, "target_pane": pane, "dir": args.dir},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(json.dumps({"pane": pane, "docked": args.dir}, indent=2))
@@ -672,8 +844,11 @@ def cmd_interrupt(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `interrupt` requires running inside Tern")
-    pane = int(args.pane) if args.pane and args.pane.isdigit() else resolve_same_tab_agent_pane(my_pane)
-    reply = call_bridge({"op": "interrupt", "anchor_pane": my_pane, "target_pane": pane}, timeout=3.0)
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "interrupt", "anchor_pane": my_pane, "target_pane": pane},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(json.dumps({"pane": pane, "interrupted": True}, indent=2))
@@ -683,8 +858,11 @@ def cmd_stop(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `stop` requires running inside Tern")
-    pane = int(args.pane) if args.pane and args.pane.isdigit() else resolve_same_tab_agent_pane(my_pane)
-    reply = call_bridge({"op": "stop", "anchor_pane": my_pane, "target_pane": pane}, timeout=3.0)
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "stop", "anchor_pane": my_pane, "target_pane": pane},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(json.dumps({"pane": pane, "stopped": True}, indent=2))
@@ -761,7 +939,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Wingman: Native Tern TSP (`WindowCx.agents`) & headless worker bridge.")
     sub = p.add_subparsers(dest="subcmd", required=True)
 
-    p_info = sub.add_parser("info", help="List live Tern TSP agents, PiP floats, and recent sessions")
+    p_info = sub.add_parser("info", help="List live Tern TSP agents, ownership bindings, PiP floats, and recent sessions")
     p_info.add_argument("--cwd", default=".", help="Workspace directory")
     p_info.add_argument("--limit", type=int, default=6, help="Max recent sessions to list")
     p_info.set_defaults(func=cmd_info)
@@ -782,26 +960,31 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.set_defaults(func=cmd_send)
 
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")
-    p_tr.add_argument("pane", nargs="?", help="Agent pane id (defaults to same-tab agent)")
+    p_tr.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
     p_tr.add_argument("--last", type=int, default=8, help="Number of recent messages")
+    p_tr.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_tr.set_defaults(func=cmd_transcript)
 
     p_pip = sub.add_parser("pip", help="Float worker pane into Picture-in-Picture corner")
-    p_pip.add_argument("pane", nargs="?", help="Agent pane id (defaults to same-tab agent)")
+    p_pip.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
     p_pip.add_argument("--corner", choices=["tl", "tr", "bl", "br"], default="br")
+    p_pip.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_pip.set_defaults(func=cmd_pip)
 
     p_dock = sub.add_parser("dock", help="Dock floating Picture-in-Picture worker back into split")
-    p_dock.add_argument("pane", nargs="?", help="Agent pane id (defaults to same-tab agent)")
+    p_dock.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
     p_dock.add_argument("--dir", choices=["left", "right", "up", "down"], default="right")
+    p_dock.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_dock.set_defaults(func=cmd_dock)
 
     p_int = sub.add_parser("interrupt", help="Interrupt active turn via `cx.agents:interrupt`")
-    p_int.add_argument("pane", nargs="?", help="Agent pane id (defaults to same-tab agent)")
+    p_int.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    p_int.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_int.set_defaults(func=cmd_interrupt)
 
     p_stop = sub.add_parser("stop", help="Close worker pane and terminate process via `cx.agents:stop`")
-    p_stop.add_argument("pane", nargs="?", help="Agent pane id (defaults to same-tab agent)")
+    p_stop.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    p_stop.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_stop.set_defaults(func=cmd_stop)
 
     p_peek = sub.add_parser("peek", help="O(1) .jsonl tail seek for granular mid-turn tool calls")

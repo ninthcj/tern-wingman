@@ -4,7 +4,8 @@
 
 Installed in Tern (`tern plugin install github.com/ninthcj/tern-wingman`, plugin `id = "wingman"`):
 - **Atomic TSP Delivery (`cx.agents:start` & `cx.agents:ask`)**: Delivers prompts through Tern's native TSP `send` event (queued until `sendable=true`), bypassing PTY line-discipline 4 KB buffers and keystroke emulation completely.
-- **Event-Driven Completion**: Subscribes to `tern.on("agent_finished")` and `tern.on("agent_state")`, replying over authenticated `127.0.0.1` loopback HTTP the instant a turn settles or enters `waiting_input`, carrying `last_message` and `cx.agents:transcript()`.
+- **Event-Driven UNIX Socket Bus (`mux.py` via `tern.process.spawn`)**: Zero filesystem timer polling and zero ephemeral TCP ports; `window.luau` streams JSON-lines over a `0600` `AF_UNIX` socket with native UI VM wakeup (`1–5 ms` even when the Wayland window is occluded) and seamless hot-reload recovery (`_ack` / `_reload` -> `await`).
+- **Explicit Ownership Graph (`bindings_v1` in `tern.kv`)**: Tracks `anchor_pane -> wingman_pane` bijectively so ACP lead agents (`agy`, `claude`, `codex`) never hit themselves or each other's workers, and `same` / `interrupt` / `pip` stay bound even across `ovnfs` checkouts or subdirectory changes.
 - **Non-Intrusive Layout & PiP**: Preserves keyboard focus in the lead agent's pane even across tabs, and supports corner floating (`cx.layout:float`) and docking (`cx.layout:dock`).
 
 ## 2. Zero-Copy Checkouts (`ovnfs`)

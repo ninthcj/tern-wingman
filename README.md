@@ -23,7 +23,8 @@
 Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across 4 KB PTY buffers and steals focus) or polling multi-hundred-MB `.jsonl` logs on disk, `tern-wingman` drives Tern's own **`WindowCx.agents`** engine over the **Tern Surface Protocol (TSP)**:
 
 - **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until `omp` reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
-- **Event-driven completion (`agent_finished` & `agent_state`)** — zero `.jsonl` polling; the Luau window half notifies `wingman.py` over authenticated `127.0.0.1` loopback HTTP the millisecond a turn settles or enters `waiting_input`.
+- **Zero-polling `AF_UNIX` event bus (`tern.process.spawn` + `agent_finished`)** — zero `.jsonl` polling, zero timer directory scans, and zero ephemeral TCP ports; `window.luau` wakes `wingman.py` over a `0600` UNIX domain socket in `2–10 ms` (even when occluded on Wayland) and survives live `tern plugin reload`.
+- **Explicit `anchor → wingman` ownership graph** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs, and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
 - **Non-intrusive Splits & Picture-in-Picture (`--pip br`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), and floats/docks the wingman as a corner PiP overlay on demand.
 - **Mechanism, not policy** — zero prompt rewriting and zero hidden config overrides; the lead agent decides per task whether to open a fresh session (`new`), iterate in place (`same`), resume a specific session, or isolate risky changes in an [`ovnfs`](https://github.com/stencil-hq/ovnfs) copy-on-write checkout.
@@ -32,16 +33,20 @@ Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across
 
 ```mermaid
 sequenceDiagram
-    participant L as Lead Agent (agy / claude / codex / …)
-    participant W as wingman.py (127.0.0.1 Bearer server)
+    participant L as Lead Agent (ACP agy / claude / codex / …)
+    participant W as wingman.py (AF_UNIX client)
+    participant M as mux.py (0600 AF_UNIX <-> stdio)
     participant P as Tern Plugin (window.luau · WindowCx.agents)
     participant O as omp Wingman (Right Split or PiP)
 
     L->>W: wingman.py send <new|same|id> --prompt-file spec.md
-    W->>P: atomic IPC request (.tmp → .json, 0600)
-    P->>O: cx.agents:start / cx.agents:ask (atomic TSP send)
+    W->>M: JSON line over w-<pid>.sock
+    M->>P: native stdout wakeup on UI VM thread
+    P->>O: cx.agents:start / cx.agents:ask + bind(anchor -> wingman)
+    P-->>W: {"_ack": true, "pane": ...}
     O-->>P: tern.on("agent_finished" | "agent_state")
-    P->>W: POST /reply (last_message + TSP transcript)
+    P->>M: child:write(last_message + TSP transcript)
+    M->>W: JSON reply + EOF
     W-->>L: stdout reply + exit status (0=done, 2=waiting_input)
 ```
 

@@ -16,7 +16,8 @@
 ### 核心特性
 
 - **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 `omp` 输入框 `sendable=true` 后单次原子投递。
-- **事件驱动毫秒级唤醒（`agent_finished` & `agent_state`）**：无需轮询几百 MB 的磁盘 `.jsonl` 日志；回合结束、异常退出或卡在 `waiting_input` 时通过本地 `127.0.0.1` 鉴权回调即时唤醒。
+- **零轮询 `AF_UNIX` 原生事件总线（`tern.process.spawn` + `agent_finished`）**：0 磁盘 `.jsonl` 轮询、0 定时器扫目录、0 临时 TCP 端口；通过本地 `0600` UNIX Domain Socket 原生跨线程唤醒 UI 虚拟机（Wayland 后台失焦同样稳定 `2~10 ms` 响应），并支持插件热重载不断连恢复。
+- **显式 `anchor → wingman` 归属绑定表**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机，哪怕切进 `ovnfs` 检出目录或子目录，`same` / `interrupt` / `pip` 依然精准锁定归属面板。
 - **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片。
 - **零抢焦点分屏 & 画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；随时支持 `--pip br` 缩成角落画中画小窗盯盘、`dock` 一键贴回分屏。
 - **纯机制、零越俎代庖**：脚本只做忠实透明管道，不篡改 Prompt、不魔改任何全局扩展；每次派单是用干净新会话（`new`）、原位续跑（`same`）、还是配合 [`ovnfs`](https://github.com/stencil-hq/ovnfs) 开零拷贝写时复制沙箱，完全由主控模型按任务性质自主权衡。
