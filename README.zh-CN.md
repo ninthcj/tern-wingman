@@ -45,7 +45,7 @@ ln -s "$(pwd)/tern-wingman/skills/wingman" ~/.gemini/config/skills/wingman
 
 ## 常用命令（`wingman.py`）
 
-仅依赖 Python 3.10+ 标准库（支持 Linux 与 macOS；不在 Tern 环境内时自动回退至脱离进程组的 `omp -p --wait-async` 无头模式）：
+仅依赖 Python 3.10+ 标准库（跨平台支持 **Linux、macOS 与 Windows**；不在 Tern 环境内时自动回退至独立进程组的 `omp -p --wait-async` 无头模式）：
 
 ```sh
 # 查看当前窗口活跃的 TSP Agents、画中画状态、ovnfs 与最近会话

@@ -1,11 +1,18 @@
 --!strict
 -- Wingman: Bidirectional event-driven WindowCx.agents TSP bridge & ownership graph for coding agents in Tern.
 
+local is_windows = (tern.runtime.os == "windows")
+local SEP = if is_windows then "\\" else "/"
 local runtime_dir = tern.getenv("XDG_RUNTIME_DIR")
-local home_dir = tern.getenv("HOME")
+local home_dir = tern.getenv("HOME") or tern.getenv("USERPROFILE")
+local local_app_data = tern.getenv("LOCALAPPDATA") or tern.getenv("TEMP")
 local daemon_socket = tern.getenv("TERN_DAEMON_SOCKET") or tern.getenv("TERN_PANE_SOCKET")
 
 local function resolve_ipc_dir(): string
+	if is_windows then
+		local base = if local_app_data and local_app_data ~= "" then local_app_data else "C:\\Temp"
+		return base .. "\\tern-wingman"
+	end
 	if runtime_dir and runtime_dir ~= "" and #runtime_dir <= 72 then
 		return runtime_dir .. "/tern-wingman"
 	end
@@ -204,7 +211,10 @@ local function same_daemon(req_socket: any): boolean
 	if daemon_socket and daemon_socket ~= "" then
 		return req_socket == daemon_socket
 	end
-	return type(req_socket) == "string" and string.sub(req_socket, -12) == "/daemon.sock"
+	if type(req_socket) ~= "string" then
+		return false
+	end
+	return string.sub(req_socket, -12) == "/daemon.sock" or string.sub(req_socket, -12) == "\\daemon.sock"
 end
 
 local function send_mux(cid: number, reply: any, keep_open: boolean?)
@@ -1150,6 +1160,20 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 end
 
 local ensure_mux: () -> ()
+local mux_saw_ready = false
+local win_py_launcher_idx = 1
+
+local function build_mux_argv(mux_script: string): { string }
+	if not is_windows then
+		return { "python3", "-u", mux_script, ipc_dir }
+	end
+	if win_py_launcher_idx == 1 then
+		return { "python", "-u", mux_script, ipc_dir }
+	elseif win_py_launcher_idx == 2 then
+		return { "py", "-3", "-u", mux_script, ipc_dir }
+	end
+	return { "python3", "-u", mux_script, ipc_dir }
+end
 
 local function on_mux_stdout(line: string, cx: WindowCx?)
 	if line == "" then
@@ -1160,6 +1184,7 @@ local function on_mux_stdout(line: string, cx: WindowCx?)
 		return
 	end
 	if msg.type == "ready" then
+		mux_saw_ready = true
 		return
 	end
 	local cid = tonumber(msg.id)
@@ -1198,13 +1223,18 @@ ensure_mux = function()
 	if unloading or mux_child ~= nil then
 		return
 	end
-	local mux_script = tern.plugin.dir .. "/mux.py"
+	local mux_script = tern.plugin.dir .. SEP .. "mux.py"
+	mux_saw_ready = false
+	local argv = build_mux_argv(mux_script)
 	local ok_sp, child_or_err = pcall(function()
-		return tern.process.spawn({ "python3", "-u", mux_script, ipc_dir }, {
+		return tern.process.spawn(argv, {
 			split = "lines",
 			stdout = on_mux_stdout,
 			exit = function(_res: SpawnExit, _cx: WindowCx?)
 				mux_child = nil
+				if is_windows and not mux_saw_ready then
+					win_py_launcher_idx = (win_py_launcher_idx % 3) + 1
+				end
 				if not unloading then
 					tern.timer(500, function(_later: WindowCx?)
 						ensure_mux()
@@ -1216,6 +1246,9 @@ ensure_mux = function()
 	if ok_sp then
 		mux_child = child_or_err
 	else
+		if is_windows then
+			win_py_launcher_idx = (win_py_launcher_idx % 3) + 1
+		end
 		tern.log.error("wingman: failed to spawn mux.py:", tostring(child_or_err))
 		if not unloading then
 			tern.timer(2000, function(_later: WindowCx?)

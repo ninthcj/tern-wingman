@@ -163,6 +163,84 @@ class WingmanTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             wingman.select_owner_pane_from_status(status_ambiguous, 105)
 
+    def test_windows_paths_cmdline_and_tcp_token_fallback(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            local_app = Path(tmp) / "AppData" / "Local"
+            tern_dir = local_app / "Programs" / "Tern"
+            omp_dir = local_app / "Tern" / "omp" / "bin"
+            tern_dir.mkdir(parents=True)
+            omp_dir.mkdir(parents=True)
+            (tern_dir / "tern.com").write_bytes(b"MZ")
+            (tern_dir / "tern.exe").write_bytes(b"MZ")
+            (omp_dir / "omp.exe").write_bytes(b"MZ")
+
+            with mock.patch.object(wingman, "IS_WINDOWS", True), mock.patch.dict(
+                wingman.os.environ, {"LOCALAPPDATA": str(local_app), "TERN_EXE": ""}, clear=False
+            ):
+                self.assertEqual(wingman.find_tern_bin(), str(tern_dir / "tern.com"))
+                self.assertEqual(wingman.find_omp_bin(), str((omp_dir / "omp.exe").resolve()))
+                self.assertEqual(wingman.bridge_ipc_dir(), local_app / "tern-wingman")
+                quoted = wingman.format_command_line([r"C:\Program Files\omp\omp.exe", "--cwd", r"D:\My Repo"])
+                self.assertIn('"C:\\Program Files\\omp\\omp.exe"', quoted)
+                self.assertIn('"D:\\My Repo"', quoted)
+
+            # Live loopback test of the authenticated 127.0.0.1 `.tcp` fallback when `socket.AF_UNIX` is absent
+            ipc_tcp = Path(tmp) / "tcp-fallback"
+            mux_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    f"import socket, runpy, sys; delattr(socket, 'AF_UNIX'); sys.argv = [{str(MUX_PATH)!r}, {str(ipc_tcp)!r}]; runpy.run_path({str(MUX_PATH)!r}, run_name='__main__')",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert mux_proc.stdout and mux_proc.stdin
+                ready = json.loads(mux_proc.stdout.readline())
+                self.assertEqual(ready["type"], "ready")
+                self.assertTrue(ready["sock"].endswith(".tcp"))
+
+                # Reject unauthenticated TCP client
+                meta = json.loads(Path(ready["sock"]).read_text(encoding="utf-8"))
+                import socket as pysock
+
+                bad = pysock.create_connection(("127.0.0.1", int(meta["port"])), timeout=2.0)
+                try:
+                    bad.sendall(b'{"op":"status","_token":"wrong"}\n')
+                    bad_reply = json.loads(bad.makefile("r", encoding="utf-8").readline())
+                    self.assertFalse(bad_reply["ok"])
+                    self.assertIn("unauthorized", bad_reply["error"])
+                finally:
+                    bad.close()
+
+                def drive_tcp_mux() -> None:
+                    assert mux_proc.stdout and mux_proc.stdin
+                    msg = json.loads(mux_proc.stdout.readline())
+                    self.assertEqual(msg["req"]["op"], "status")
+                    self.assertNotIn("_token", msg["req"])
+                    mux_proc.stdin.write(json.dumps({"id": msg["id"], "reply": {"ok": True, "mode": "tcp-fallback"}}) + "\n")
+                    mux_proc.stdin.flush()
+
+                threading.Thread(target=drive_tcp_mux, daemon=True).start()
+                with mock.patch.dict(wingman.os.environ, {"XDG_RUNTIME_DIR": ""}, clear=False), mock.patch.object(
+                    wingman, "bridge_ipc_dir", return_value=ipc_tcp
+                ):
+                    res = wingman.call_bridge({"op": "status", "anchor_pane": 1}, timeout=3.0)
+                    self.assertTrue(res["ok"])
+                    self.assertEqual(res["mode"], "tcp-fallback")
+            finally:
+                if mux_proc.poll() is None:
+                    mux_proc.terminate()
+                    mux_proc.wait(timeout=2.0)
+                for s in (mux_proc.stdin, mux_proc.stdout):
+                    if s is not None and not s.closed:
+                        s.close()
+
     def test_mux_unix_socket_multiwindow_ack_and_hot_reload_recovery(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
             old_xdg = os.environ.get("XDG_RUNTIME_DIR")

@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""mux.py — Event-driven AF_UNIX socket <-> stdio JSON-lines bridge for Tern `window.luau`.
+"""mux.py — Cross-platform event-driven socket <-> stdio JSON-lines bridge for Tern `window.luau`.
 
-Spawned once per Tern window via `tern.process.spawn`. Eliminates filesystem timer polling,
-ephemeral loopback TCP servers, and Wayland unfocused-window wakeup workarounds:
-- Incoming client lines on `w-<pid>.sock` emit `{"id": <cid>, "req": <obj>}` on stdout,
-  waking `window.luau`'s `stdout` callback natively on Tern's UI VM thread.
-- Replies written by `window.luau` to stdin (`{"id": <cid>, "reply": <obj>, "keep_open": bool}`)
-  are forwarded straight back down client `<cid>`'s AF_UNIX socket.
-- Client disconnects emit `{"id": <cid>, "disconnected": true}` so `window.luau` drops stale waiters.
-- When `window.luau` unloads or reloads (stdin EOF or SIGTERM/SIGINT), open clients receive
-  `{"_reload": true}` so long-running `dispatch` calls seamlessly re-attach via `op="await"`.
+Works across Linux, macOS, and Windows using only Python 3.10+ standard library:
+- Uses `AF_UNIX` stream sockets (`w-<pid>.sock`) on Linux, macOS, and Windows 10/11+, with an
+  authenticated `127.0.0.1` loopback fallback (`w-<pid>.tcp` + 256-bit token) if `AF_UNIX` is unavailable.
+- Uses `socket.socketpair()` + a lightweight stdin reader thread so `selectors.DefaultSelector()` only
+  ever registers genuine sockets (required by Windows WinSock `SelectSelector` and `signal.set_wakeup_fd`).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
+import secrets
 import selectors
 import signal
 import socket
 import stat
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,12 +36,15 @@ class ClientConn:
 def ensure_secure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
-        raise SystemExit(f"mux: insecure IPC directory {path}")
-    try:
-        os.chmod(path, 0o700)
-    except OSError:
-        pass
+    if stat.S_ISLNK(st.st_mode):
+        raise SystemExit(f"mux: insecure symlink IPC directory {path}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise SystemExit(f"mux: IPC directory {path} not owned by current user")
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
 
 
 def emit(obj: dict[str, Any]) -> None:
@@ -59,23 +61,40 @@ def send_json_line(sock: socket.socket, obj: dict[str, Any]) -> bool:
         return False
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        sys.stderr.write("usage: mux.py <ipc_dir>\n")
-        return 2
+def _cleanup_stale_endpoints(ipc_dir: Path) -> None:
+    if hasattr(socket, "AF_UNIX"):
+        for old in ipc_dir.glob("w-*.sock"):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.05)
+                probe.connect(str(old))
+            except (ConnectionRefusedError, FileNotFoundError):
+                try:
+                    old.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            except OSError:
+                pass
+            finally:
+                probe.close()
 
-    ipc_dir = Path(sys.argv[1])
-    ensure_secure_dir(ipc_dir)
-
-    # Clean up any dead w-*.sock leftovers in ipc_dir
-    for old in ipc_dir.glob("w-*.sock"):
-        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    for old_tcp in ipc_dir.glob("w-*.tcp"):
+        try:
+            meta = json.loads(old_tcp.read_text(encoding="utf-8"))
+            port = int(meta["port"])
+        except Exception:
+            try:
+                old_tcp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            continue
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             probe.settimeout(0.05)
-            probe.connect(str(old))
+            probe.connect(("127.0.0.1", port))
         except ConnectionRefusedError:
             try:
-                old.unlink(missing_ok=True)
+                old_tcp.unlink(missing_ok=True)
             except OSError:
                 pass
         except OSError:
@@ -83,44 +102,154 @@ def main() -> int:
         finally:
             probe.close()
 
-    sock_path = ipc_dir / f"w-{os.getpid()}.sock"
-    try:
-        sock_path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
-    old_umask = os.umask(0o077)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        srv.bind(str(sock_path))
-        os.chmod(sock_path, 0o600)
-    finally:
-        os.umask(old_umask)
+def _bind_server(ipc_dir: Path, pid: int) -> tuple[socket.socket, Path, str | None]:
+    """Bind AF_UNIX `w-<pid>.sock` when supported; fall back to authenticated loopback TCP `w-<pid>.tcp`."""
+    if hasattr(socket, "AF_UNIX"):
+        sock_path = ipc_dir / f"w-{pid}.sock"
+        try:
+            sock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        old_umask = os.umask(0o077) if hasattr(os, "umask") else None
+        srv: socket.socket | None = None
+        try:
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(str(sock_path))
+            if os.name != "nt":
+                try:
+                    os.chmod(sock_path, 0o600)
+                except OSError:
+                    pass
+            srv.listen(64)
+            srv.setblocking(False)
+            return srv, sock_path, None
+        except OSError:
+            if srv is not None:
+                try:
+                    srv.close()
+                except OSError:
+                    pass
+            try:
+                sock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        finally:
+            if old_umask is not None and hasattr(os, "umask"):
+                os.umask(old_umask)
+
+    # Authenticated 127.0.0.1 fallback for environments without AF_UNIX
+    token = secrets.token_hex(32)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
     srv.listen(64)
     srv.setblocking(False)
+    port = int(srv.getsockname()[1])
+    tcp_meta = ipc_dir / f"w-{pid}.tcp"
+    old_umask = os.umask(0o077) if hasattr(os, "umask") else None
+    try:
+        tcp_meta.write_text(json.dumps({"port": port, "token": token}), encoding="utf-8")
+        if os.name != "nt":
+            try:
+                os.chmod(tcp_meta, 0o600)
+            except OSError:
+                pass
+    finally:
+        if old_umask is not None and hasattr(os, "umask"):
+            os.umask(old_umask)
+    return srv, tcp_meta, token
 
-    stdin_fd = sys.stdin.fileno()
-    os.set_blocking(stdin_fd, False)
 
-    wake_r, wake_w = os.pipe()
-    os.set_blocking(wake_r, False)
-    os.set_blocking(wake_w, False)
+def _make_wake_socketpair() -> tuple[socket.socket, socket.socket]:
+    try:
+        r, w = socket.socketpair()
+    except OSError:
+        lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lsock.bind(("127.0.0.1", 0))
+        lsock.listen(1)
+        w = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            w.connect(lsock.getsockname())
+            r, _ = lsock.accept()
+        finally:
+            lsock.close()
+    r.setblocking(False)
+    w.setblocking(False)
+    return r, w
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        sys.stderr.write("usage: mux.py <ipc_dir>\n")
+        return 2
+
+    ipc_dir = Path(sys.argv[1])
+    ensure_secure_dir(ipc_dir)
+    _cleanup_stale_endpoints(ipc_dir)
+
+    pid = os.getpid()
+    srv, endpoint_path, auth_token = _bind_server(ipc_dir, pid)
+
+    wake_r, wake_w = _make_wake_socketpair()
+
+    stdin_q: queue.SimpleQueue[bytes | None] = queue.SimpleQueue()
+
+    def _notify_wake() -> None:
+        try:
+            wake_w.send(b"\x01")
+        except OSError:
+            pass
+
+    def _stdin_reader() -> None:
+        # Use raw `os.read(0, ...)` rather than `sys.stdin.buffer.readline()` so daemon-thread blocking
+        # never holds CPython's `BufferedReader` lock during SIGTERM interpreter finalization.
+        buf = bytearray()
+        while True:
+            try:
+                chunk = os.read(0, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                if buf:
+                    stdin_q.put(bytes(buf))
+                    buf.clear()
+                stdin_q.put(None)
+                _notify_wake()
+                break
+            buf.extend(chunk)
+            woke = False
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[: nl + 1])
+                del buf[: nl + 1]
+                stdin_q.put(line)
+                woke = True
+            if woke:
+                _notify_wake()
+
+    threading.Thread(target=_stdin_reader, name="mux-stdin", daemon=True).start()
 
     sel = selectors.DefaultSelector()
     sel.register(srv, selectors.EVENT_READ, data="accept")
-    sel.register(stdin_fd, selectors.EVENT_READ, data="stdin")
     sel.register(wake_r, selectors.EVENT_READ, data="wake")
 
     clients: dict[int, ClientConn] = {}
     next_cid = 1
-    stdin_buf = bytearray()
     stopping = False
 
     def handle_sig(_signum: int, _frame: Any) -> None:
         nonlocal stopping
         stopping = True
 
-    signal.set_wakeup_fd(wake_w, warn_on_full_buffer=False)
+    has_wakeup_fd = False
+    try:
+        signal.set_wakeup_fd(wake_w.fileno(), warn_on_full_buffer=False)
+        has_wakeup_fd = True
+    except (ValueError, OSError):
+        pass
+
     signal.signal(signal.SIGTERM, handle_sig)
     signal.signal(signal.SIGINT, handle_sig)
 
@@ -139,7 +268,34 @@ def main() -> int:
         if notify_vm and conn.dispatched:
             emit({"id": cid, "disconnected": True})
 
-    emit({"type": "ready", "pid": os.getpid(), "sock": str(sock_path)})
+    def drain_stdin_queue() -> None:
+        nonlocal stopping
+        while True:
+            try:
+                item = stdin_q.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                stopping = True
+                break
+            line = item.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            cid = int(msg.get("id", 0))
+            conn = clients.get(cid)
+            if conn is None:
+                continue
+            reply = msg.get("reply", {"ok": False, "error": "empty reply"})
+            keep_open = bool(msg.get("keep_open", False))
+            ok_send = send_json_line(conn.sock, reply)
+            if not ok_send or not keep_open:
+                close_client(cid, notify_vm=not ok_send and keep_open)
+
+    emit({"type": "ready", "pid": pid, "sock": str(endpoint_path)})
 
     try:
         while not stopping:
@@ -150,19 +306,23 @@ def main() -> int:
 
             for key, _mask in events:
                 if key.data == "wake":
-                    try:
-                        os.read(wake_r, 256)
-                    except OSError:
-                        pass
+                    while True:
+                        try:
+                            if not wake_r.recv(256):
+                                break
+                        except BlockingIOError:
+                            break
+                        except OSError:
+                            break
+                    drain_stdin_queue()
                     if stopping:
                         break
+
                 elif key.data == "accept":
                     while True:
                         try:
                             csock, _ = srv.accept()
-                        except BlockingIOError:
-                            break
-                        except OSError:
+                        except (BlockingIOError, OSError):
                             break
                         csock.setblocking(True)
                         csock.settimeout(2.0)
@@ -171,41 +331,6 @@ def main() -> int:
                         conn = ClientConn(cid=cid, sock=csock)
                         clients[cid] = conn
                         sel.register(csock, selectors.EVENT_READ, data=conn)
-
-                elif key.data == "stdin":
-                    while True:
-                        try:
-                            chunk = os.read(stdin_fd, 65536)
-                        except BlockingIOError:
-                            break
-                        except OSError:
-                            chunk = b""
-                        if not chunk:
-                            stopping = True
-                            break
-                        stdin_buf.extend(chunk)
-
-                    while True:
-                        nl = stdin_buf.find(b"\n")
-                        if nl < 0:
-                            break
-                        line = bytes(stdin_buf[:nl]).decode("utf-8", errors="replace").strip()
-                        del stdin_buf[: nl + 1]
-                        if not line:
-                            continue
-                        try:
-                            msg = json.loads(line)
-                        except Exception:
-                            continue
-                        cid = int(msg.get("id", 0))
-                        conn = clients.get(cid)
-                        if conn is None:
-                            continue
-                        reply = msg.get("reply", {"ok": False, "error": "empty reply"})
-                        keep_open = bool(msg.get("keep_open", False))
-                        ok_send = send_json_line(conn.sock, reply)
-                        if not ok_send or not keep_open:
-                            close_client(cid, notify_vm=not ok_send and keep_open)
 
                 elif isinstance(key.data, ClientConn):
                     conn = key.data
@@ -236,10 +361,19 @@ def main() -> int:
                             send_json_line(conn.sock, {"ok": False, "error": f"invalid JSON request: {exc}"})
                             close_client(conn.cid, notify_vm=False)
                             continue
+                        if auth_token is not None:
+                            if not isinstance(req, dict) or req.pop("_token", None) != auth_token:
+                                send_json_line(conn.sock, {"ok": False, "error": "unauthorized mux client"})
+                                close_client(conn.cid, notify_vm=False)
+                                continue
                         conn.dispatched = True
                         emit({"id": conn.cid, "req": req})
     finally:
-        signal.set_wakeup_fd(-1)
+        if has_wakeup_fd:
+            try:
+                signal.set_wakeup_fd(-1)
+            except (ValueError, OSError):
+                pass
         for cid, conn in list(clients.items()):
             send_json_line(conn.sock, {"_reload": True})
             close_client(cid, notify_vm=False)
@@ -247,17 +381,13 @@ def main() -> int:
             sel.close()
         except Exception:
             pass
-        for fd in (wake_r, wake_w):
+        for s in (wake_r, wake_w, srv):
             try:
-                os.close(fd)
+                s.close()
             except OSError:
                 pass
         try:
-            srv.close()
-        except OSError:
-            pass
-        try:
-            sock_path.unlink(missing_ok=True)
+            endpoint_path.unlink(missing_ok=True)
         except OSError:
             pass
 

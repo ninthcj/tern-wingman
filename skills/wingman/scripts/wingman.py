@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 DEFAULT_BRIDGE_TIMEOUT = 5.0
+IS_WINDOWS = os.name == "nt"
 
 
 def home_dir() -> Path:
@@ -50,27 +51,58 @@ def sessions_root() -> Path:
     return d / "sessions"
 
 
+def _is_executable(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    return True if IS_WINDOWS else os.access(path, os.X_OK)
+
+
+def _subproc_no_window_kwargs() -> dict[str, Any]:
+    if IS_WINDOWS and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def format_command_line(parts: list[str]) -> str:
+    """Format argv into a platform-appropriate command string (Windows CreateProcess vs POSIX shell)."""
+    if IS_WINDOWS:
+        return subprocess.list2cmdline(parts)
+    return shlex.join(parts)
+
+
 def find_omp_bin() -> str:
-    """Locate the active `omp` binary across Linux and macOS."""
+    """Locate the active `omp` binary across Linux, macOS, and Windows."""
     h = home_dir()
-    candidates = [
-        h / ".local" / "share" / "tern" / "omp" / "bin" / "omp",
-        h / "Library" / "Application Support" / "tern" / "omp" / "bin" / "omp",
-        h / ".local" / "bin" / "omp",
-    ]
+    local_app = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else None
+    exe_names = ("omp.exe", "omp.cmd", "omp") if IS_WINDOWS else ("omp",)
+    candidates: list[Path] = []
+    if local_app is not None:
+        for ename in exe_names:
+            candidates.append(local_app / "Tern" / "omp" / "bin" / ename)
+            candidates.append(local_app / "Programs" / "omp" / ename)
+    candidates.extend(
+        [
+            h / ".local" / "share" / "tern" / "omp" / "bin" / "omp",
+            h / "Library" / "Application Support" / "tern" / "omp" / "bin" / "omp",
+            h / ".local" / "bin" / ("omp.exe" if IS_WINDOWS else "omp"),
+        ]
+    )
     for c in candidates:
-        if c.exists() and os.access(c, os.X_OK):
+        if _is_executable(c):
             return str(c.resolve())
     found = shutil.which("omp")
     if found:
         return found
-    for versions_dir in (
+    version_dirs = [
         h / ".local" / "share" / "tern" / "omp" / "versions",
         h / "Library" / "Application Support" / "tern" / "omp" / "versions",
-    ):
+    ]
+    if local_app is not None:
+        version_dirs.insert(0, local_app / "Tern" / "omp" / "versions")
+    for versions_dir in version_dirs:
         if versions_dir.is_dir():
             vers = sorted(
-                (p for p in versions_dir.iterdir() if p.is_file() and os.access(p, os.X_OK)),
+                (p for p in versions_dir.iterdir() if _is_executable(p)),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
@@ -80,32 +112,48 @@ def find_omp_bin() -> str:
 
 
 def find_tern_bin() -> str | None:
-    """Locate the `tern` CLI binary across Linux and macOS."""
+    """Locate the `tern` CLI binary across Linux, macOS, and Windows (`tern.com` preferred on Windows)."""
     env_exe = os.environ.get("TERN_EXE")
     h = home_dir()
-    candidates = [
-        Path(env_exe) if env_exe else None,
-        h / ".local" / "bin" / "tern",
-        Path("/Applications/Tern.app/Contents/MacOS/tern"),
-        Path("/opt/homebrew/bin/tern"),
-        Path("/usr/local/bin/tern"),
-    ]
+    local_app = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else None
+    candidates: list[Path | None] = [Path(env_exe) if env_exe else None]
+    if local_app is not None:
+        candidates.extend(
+            [
+                local_app / "Programs" / "Tern" / "tern.com",
+                local_app / "Programs" / "Tern" / "tern.exe",
+            ]
+        )
+    candidates.extend(
+        [
+            h / ".local" / "bin" / ("tern.exe" if IS_WINDOWS else "tern"),
+            Path("/Applications/Tern.app/Contents/MacOS/tern"),
+            Path("/opt/homebrew/bin/tern"),
+            Path("/usr/local/bin/tern"),
+        ]
+    )
     for c in candidates:
-        if c is not None and c.exists() and os.access(c, os.X_OK):
+        if c is not None and _is_executable(c):
             return str(c)
-    return shutil.which("tern")
+    return shutil.which("tern.com") if IS_WINDOWS and shutil.which("tern.com") else shutil.which("tern")
 
 
 def find_ovnfs_bin() -> str | None:
-    """Locate Stencil's `ovnfs` binary if installed."""
+    """Locate Stencil's `ovnfs` binary across Linux, macOS, and Windows if installed."""
     h = home_dir()
-    candidates = [
-        h / ".local" / "share" / "tern" / "ovnfs" / "bin" / "ovnfs",
-        h / "Library" / "Application Support" / "tern" / "ovnfs" / "bin" / "ovnfs",
-        h / ".local" / "bin" / "ovnfs",
-    ]
+    local_app = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else None
+    candidates: list[Path] = []
+    if local_app is not None:
+        candidates.append(local_app / "Tern" / "ovnfs" / "bin" / "ovnfs.exe")
+    candidates.extend(
+        [
+            h / ".local" / "share" / "tern" / "ovnfs" / "bin" / "ovnfs",
+            h / "Library" / "Application Support" / "tern" / "ovnfs" / "bin" / "ovnfs",
+            h / ".local" / "bin" / ("ovnfs.exe" if IS_WINDOWS else "ovnfs"),
+        ]
+    )
     for c in candidates:
-        if c.exists() and os.access(c, os.X_OK):
+        if _is_executable(c):
             return str(c)
     return shutil.which("ovnfs")
 
@@ -116,25 +164,33 @@ def current_tern_pane() -> int | None:
 
 
 def bridge_ipc_dir() -> Path:
-    """Resolve the secure AF_UNIX socket directory shared with `window.luau` (kept <= 72 chars for sun_path)."""
-    rt = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if rt and len(rt) <= 72:
-        d = Path(rt) / "tern-wingman"
+    """Resolve the secure IPC directory shared with `window.luau` across Linux, macOS, and Windows."""
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("TEMP") or r"C:\Temp"
+        d = Path(base) / "tern-wingman"
     else:
-        fallback = home_dir() / ".cache" / "tern-wingman"
-        if len(str(fallback)) <= 72:
-            d = fallback
+        rt = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+        if rt and len(rt) <= 72:
+            d = Path(rt) / "tern-wingman"
         else:
-            user = os.environ.get("USER") or str(os.getuid())
-            d = Path(f"/tmp/tern-wingman-{user}")
+            fallback = home_dir() / ".cache" / "tern-wingman"
+            if len(str(fallback)) <= 72:
+                d = fallback
+            else:
+                uid_str = str(os.getuid()) if hasattr(os, "getuid") else "user"
+                user = os.environ.get("USER") or uid_str
+                d = Path(f"/tmp/tern-wingman-{user}")
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
     st = os.lstat(d)
-    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
-        raise SystemExit(f"error: insecure IPC directory {d}")
-    try:
-        os.chmod(d, 0o700)
-    except OSError:
-        pass
+    if stat.S_ISLNK(st.st_mode):
+        raise SystemExit(f"error: insecure symlink IPC directory {d}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise SystemExit(f"error: IPC directory {d} not owned by current user")
+    if not IS_WINDOWS:
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
     return d
 
 
@@ -185,21 +241,40 @@ def call_bridge(
     notified_ack = False
 
     while True:
-        sock_files = sorted(ipc.glob("w-*.sock"))
+        endpoints: list[tuple[str, Path]] = []
+        if hasattr(socket, "AF_UNIX"):
+            endpoints.extend(("unix", p) for p in sorted(ipc.glob("w-*.sock")))
+        endpoints.extend(("tcp", p) for p in sorted(ipc.glob("w-*.tcp")))
         need_reload_retry = False
 
-        for sp in sock_files:
+        for kind, sp in endpoints:
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"timed out after {timeout}s waiting for Tern wingman plugin")
 
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wire_payload = dict(cur_payload)
+            if kind == "unix":
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                target_addr: Any = str(sp)
+            else:
+                try:
+                    meta = json.loads(sp.read_text(encoding="utf-8"))
+                    target_addr = ("127.0.0.1", int(meta["port"]))
+                    wire_payload["_token"] = str(meta["token"])
+                except Exception:
+                    try:
+                        sp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    continue
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
             try:
                 connect_timeout = 1.0
                 if deadline is not None:
                     connect_timeout = max(0.05, min(1.0, deadline - time.monotonic()))
                 sock.settimeout(connect_timeout)
                 try:
-                    sock.connect(str(sp))
+                    sock.connect(target_addr)
                 except (ConnectionRefusedError, FileNotFoundError):
                     try:
                         sp.unlink(missing_ok=True)
@@ -209,7 +284,7 @@ def call_bridge(
                 except OSError:
                     continue
 
-                wire = (json.dumps(cur_payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                wire = (json.dumps(wire_payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
                 sock.sendall(wire)
 
                 buf = bytearray()
@@ -256,7 +331,7 @@ def call_bridge(
         # If no active mux socket answered yet (e.g. plugin is mid-reload), retry briefly up to 1.5s / deadline
         now = time.monotonic()
         wait_cap = min(deadline, now + 0.15) if deadline is not None else (now + 0.15)
-        if not sock_files and (deadline is None or now + 0.05 < deadline):
+        if not endpoints and (deadline is None or now + 0.05 < deadline):
             # Bound initial socket discovery wait when plugin is not installed/running
             init_cap = deadline if deadline is not None else (now + DEFAULT_BRIDGE_TIMEOUT)
             deadline = init_cap
@@ -277,6 +352,7 @@ def inspect_tern(tern_bin: str | None) -> dict[str, Any] | None:
             text=True,
             timeout=5,
             check=False,
+            **_subproc_no_window_kwargs(),
         )
         if proc.returncode == 0 and proc.stdout.strip():
             return json.loads(proc.stdout)
@@ -314,7 +390,7 @@ def encode_cwd_bucket(cwd: Path) -> str:
         return f"-{parts}" if parts else "-"
     except ValueError:
         pass
-    encoded = str(real).strip("/").replace("/", "-")
+    encoded = re.sub(r"[:\\/]+", "-", str(real)).strip("-")
     return f"--{encoded}--"
 
 
@@ -348,7 +424,13 @@ def read_session_header(path: Path) -> dict[str, Any]:
 
 
 def get_collab_hosts(omp_bin: str) -> dict[str, dict[str, Any]]:
-    proc = subprocess.run([omp_bin, "collab", "list", "--json"], capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        [omp_bin, "collab", "list", "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+        **_subproc_no_window_kwargs(),
+    )
     if proc.returncode != 0 or not proc.stdout.strip():
         return {}
     try:
@@ -366,6 +448,7 @@ def check_leases(omp_bin: str, session_ids: list[str]) -> set[str]:
         capture_output=True,
         text=True,
         check=False,
+        **_subproc_no_window_kwargs(),
     )
     if proc.returncode != 0 or not proc.stdout.strip():
         return set()
@@ -753,7 +836,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             "reset_new": reset_new,
             "queue": not args.no_queue,
             "cwd": str(cwd),
-            "command": shlex.join(cmd_parts),
+            "command": format_command_line(cmd_parts),
             "prompt": prompt,
             "pip_corner": args.pip,
         }
@@ -823,7 +906,15 @@ def cmd_send(args: argparse.Namespace) -> None:
         cmd += ["--max-time", args.max_time]
     cmd += ["--", prompt]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    popen_kwargs: dict[str, Any] = {}
+    if IS_WINDOWS:
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if flags:
+            popen_kwargs["creationflags"] = flags
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **popen_kwargs)
     stdout, stderr = proc.communicate()
     if stderr:
         print(stderr, file=sys.stderr, end="")

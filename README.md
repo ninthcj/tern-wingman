@@ -87,7 +87,7 @@ tern plugin list
 
 ## CLI Reference (`wingman.py`)
 
-`wingman.py` requires only Python 3.10+ standard library (Linux & macOS). Outside Tern (or with `--mode headless`), `send` automatically falls back to detached `omp -p --wait-async --auto-approve`.
+`wingman.py` requires only Python 3.10+ standard library (**Linux, macOS & Windows**). Outside Tern (or with `--mode headless`), `send` automatically falls back to detached `omp -p --wait-async --auto-approve`.
 
 ```sh
 # Inspect live Tern TSP agents, PiP floats, ovnfs availability, and recent sessions
