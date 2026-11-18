@@ -37,7 +37,7 @@ type WaitEntry = {
 }
 
 type QueuedDispatch = {
-	cid: number,
+	cid: number?,
 	anchor: number,
 	prompt: string,
 	pip_corner: string?,
@@ -343,14 +343,18 @@ local function promote_next_queued(cx: WindowCx, pane_id: number)
 		cx.agents:ask(pane_id, item.prompt)
 	end)
 	if not ok_ask then
-		send_mux(item.cid, {
-			ok = false,
-			pane = pane_id,
-			status = "failed",
-			error = "queued cx.agents:ask failed: " .. tostring(err_ask),
-			last_message = "",
-			transcript = tern.json.array(),
-		}, false)
+		if item.cid ~= nil then
+			send_mux(item.cid, {
+				ok = false,
+				pane = pane_id,
+				status = "failed",
+				error = "queued cx.agents:ask failed: " .. tostring(err_ask),
+				last_message = "",
+				transcript = tern.json.array(),
+			}, false)
+		else
+			deliver_to_owner(cx, item.anchor, pane_id, "auto-callback · failed", "queued cx.agents:ask failed: " .. tostring(err_ask))
+		end
 		promote_next_queued(cx, pane_id)
 		return
 	end
@@ -361,17 +365,21 @@ local function promote_next_queued(cx: WindowCx, pane_id: number)
 			cx.layout:float(pane_id, item.anchor, item.pip_corner, { focus = false })
 		end)
 	end
-	unsolicited_working[pane_id] = false
 	reported_in_turn[pane_id] = false
-	pending_waits[pane_id] = {
-		cids = { item.cid },
-		started_ms = tern.now(),
-		saw_working = false,
-		idle_since = nil,
-		pending_prompt = nil,
-		ask_deadline = nil,
-	}
-	ensure_watchdog()
+	if item.cid ~= nil then
+		unsolicited_working[pane_id] = false
+		pending_waits[pane_id] = {
+			cids = { item.cid },
+			started_ms = tern.now(),
+			saw_working = false,
+			idle_since = nil,
+			pending_prompt = nil,
+			ask_deadline = nil,
+		}
+		ensure_watchdog()
+	else
+		unsolicited_working[pane_id] = true
+	end
 end
 
 local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_msg: string?)
@@ -383,16 +391,24 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 	unsolicited_working[pane_id] = false
 	reported_in_turn[pane_id] = false
 	local last_msg, transcript = collect_turn_output(cx, pane_id)
-	local payload = {
-		ok = (status == "done" or status == "idle"),
-		pane = pane_id,
-		status = status,
-		error = err_msg,
-		last_message = last_msg or "",
-		transcript = transcript,
-	}
-	for _, cid in ipairs(w.cids) do
-		send_mux(cid, payload, false)
+	if #w.cids == 0 then
+		local owner = owner_of_pane(cx, pane_id)
+		if owner ~= nil then
+			local body = err_msg or last_msg or ("(Wingman turn ended with " .. status .. ")")
+			deliver_to_owner(cx, owner, pane_id, "auto-callback · " .. status, body)
+		end
+	else
+		local payload = {
+			ok = (status == "done" or status == "idle"),
+			pane = pane_id,
+			status = status,
+			error = err_msg,
+			last_message = last_msg or "",
+			transcript = transcript,
+		}
+		for _, cid in ipairs(w.cids) do
+			send_mux(cid, payload, false)
+		end
 	end
 	if status == "done" or status == "idle" then
 		promote_next_queued(cx, pane_id)
@@ -401,14 +417,16 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 		if q then
 			queued_dispatches[pane_id] = nil
 			for _, item in ipairs(q) do
-				send_mux(item.cid, {
-					ok = false,
-					pane = pane_id,
-					status = status,
-					error = err_msg or ("queued dispatch aborted: " .. status),
-					last_message = last_msg or "",
-					transcript = transcript,
-				}, false)
+				if item.cid ~= nil then
+					send_mux(item.cid, {
+						ok = false,
+						pane = pane_id,
+						status = status,
+						error = err_msg or ("queued dispatch aborted: " .. status),
+						last_message = last_msg or "",
+						transcript = transcript,
+					}, false)
+				end
 			end
 		end
 	end
@@ -470,6 +488,11 @@ local function watchdog_step(cx: WindowCx?)
 					end)
 					if ok_ask then
 						w.pending_prompt = nil
+						if #w.cids == 0 then
+							pending_waits[pane_id] = nil
+							unsolicited_working[pane_id] = true
+							reported_in_turn[pane_id] = false
+						end
 					end
 				end
 				if w.pending_prompt ~= nil and w.ask_deadline and now > w.ask_deadline then
@@ -512,14 +535,16 @@ local function watchdog_step(cx: WindowCx?)
 					queued_dispatches[pane_id] = nil
 					if q then
 						for _, item in ipairs(q) do
-							send_mux(item.cid, {
-								ok = false,
-								pane = pane_id,
-								status = "closed",
-								error = "Agent pane disappeared",
-								last_message = "",
-								transcript = tern.json.array(),
-							}, false)
+							if item.cid ~= nil then
+								send_mux(item.cid, {
+									ok = false,
+									pane = pane_id,
+									status = "closed",
+									error = "Agent pane disappeared",
+									last_message = "",
+									transcript = tern.json.array(),
+								}, false)
+							end
 						end
 					end
 				elseif ainfo and ainfo.state == "idle" then
@@ -569,6 +594,11 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 			end)
 			if ok_ask then
 				w.pending_prompt = nil
+				if #w.cids == 0 then
+					pending_waits[ev.pane] = nil
+					unsolicited_working[ev.pane] = true
+					reported_in_turn[ev.pane] = false
+				end
 			end
 			return
 		end
@@ -610,35 +640,14 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		return
 	end
 
-	-- 3. Queued `send` dispatches promote in FIFO order
-	if queued_dispatches[ev.pane] then
-		if ev.result == "done" then
-			promote_next_queued(cx, ev.pane)
-		else
-			local q = queued_dispatches[ev.pane]
-			queued_dispatches[ev.pane] = nil
-			if q then
-				for _, item in ipairs(q) do
-					send_mux(item.cid, {
-						ok = false,
-						pane = ev.pane,
-						status = ev.result,
-						error = "Previous turn ended with " .. ev.result,
-						last_message = "",
-						transcript = tern.json.array(),
-					}, false)
-				end
-			end
-		end
-		return
-	end
-
-	-- 4. Unsolicited wingman turn completion (e.g. omp background chain finished while owner agy was idle)
-	if unsolicited_working[ev.pane] then
+	-- 3. If the completed turn was an async/unsolicited turn, push its completion to `owner` FIRST (before promoting next queued item!)
+	local was_unsolicited = unsolicited_working[ev.pane] == true
+	if was_unsolicited then
 		unsolicited_working[ev.pane] = false
 		local already_reported = reported_in_turn[ev.pane] == true
 		reported_in_turn[ev.pane] = false
 		local owner = owner_of_pane(cx, ev.pane)
+		local has_next_q = queued_dispatches[ev.pane] ~= nil and #queued_dispatches[ev.pane] > 0 and ev.result == "done"
 		if
 			owner ~= nil
 			and not already_reported
@@ -649,9 +658,40 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 			local body = if last_msg and last_msg ~= ""
 				then last_msg
 				else string.format("(Wingman turn finished with status: %s)", ev.result)
-			deliver_to_owner(cx, owner, ev.pane, "auto-callback · " .. ev.result, body)
+			local tag = if has_next_q
+				then string.format("auto-callback · %s · promoting next queued task", ev.result)
+				else ("auto-callback · " .. ev.result)
+			deliver_to_owner(cx, owner, ev.pane, tag, body)
 		end
-		-- If the worker stayed continuously `working` (e.g. an omp background job will trigger another turn without dipping to `idle`), keep tracking
+	end
+
+	-- 4. Queued `send` dispatches promote in FIFO order
+	if queued_dispatches[ev.pane] then
+		if ev.result == "done" then
+			promote_next_queued(cx, ev.pane)
+		else
+			local q = queued_dispatches[ev.pane]
+			queued_dispatches[ev.pane] = nil
+			if q then
+				for _, item in ipairs(q) do
+					if item.cid ~= nil then
+						send_mux(item.cid, {
+							ok = false,
+							pane = ev.pane,
+							status = ev.result,
+							error = "Previous turn ended with " .. ev.result,
+							last_message = "",
+							transcript = tern.json.array(),
+						}, false)
+					end
+				end
+			end
+		end
+		return
+	end
+
+	-- 5. If the worker stayed continuously `working` (e.g. an omp background job will trigger another turn without dipping to `idle`), keep tracking
+	if was_unsolicited then
 		local finished_pane = ev.pane
 		tern.timer(250, function(later_cx: WindowCx?)
 			if not later_cx then
@@ -679,32 +719,40 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 		queued_dispatches[ev.pane] = nil
 		if q then
 			for _, item in ipairs(q) do
-				send_mux(item.cid, {
-					ok = false,
-					pane = ev.pane,
-					status = "closed",
-					error = "Agent pane was closed",
-					last_message = "",
-					transcript = tern.json.array(),
-				}, false)
+				if item.cid ~= nil then
+					send_mux(item.cid, {
+						ok = false,
+						pane = ev.pane,
+						status = "closed",
+						error = "Agent pane was closed",
+						last_message = "",
+						transcript = tern.json.array(),
+					}, false)
+				end
 			end
 		end
 	end
 end)
 
-local function register_waiter(pane_id: number, cid: number, pending_prompt: string?)
+local function register_waiter(pane_id: number, cid: number?, pending_prompt: string?)
 	unsolicited_working[pane_id] = false
 	reported_in_turn[pane_id] = false
 	local existing = pending_waits[pane_id]
 	if existing then
-		table.insert(existing.cids, cid)
+		if cid ~= nil then
+			table.insert(existing.cids, cid)
+		end
 		if pending_prompt ~= nil then
 			existing.pending_prompt = pending_prompt
 			existing.ask_deadline = tern.now() + 20000
 		end
 	else
+		local cids_list: { number } = {}
+		if cid ~= nil then
+			table.insert(cids_list, cid)
+		end
 		pending_waits[pane_id] = {
-			cids = { cid },
+			cids = cids_list,
 			started_ms = tern.now(),
 			saw_working = false,
 			idle_since = nil,
@@ -945,22 +993,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			end
 			local removed = table.remove(q, idx) :: QueuedDispatch
 			cancelled = 1
-			send_mux(removed.cid, {
-				ok = false,
-				pane = tp,
-				status = "cancelled",
-				error = "Cancelled from queue via unqueue",
-				last_message = "",
-				transcript = tern.json.array(),
-			}, false)
-			if #q == 0 then
-				queued_dispatches[tp] = nil
-			end
-		else
-			queued_dispatches[tp] = nil
-			for _, item in ipairs(q) do
-				cancelled += 1
-				send_mux(item.cid, {
+			if removed.cid ~= nil then
+				send_mux(removed.cid, {
 					ok = false,
 					pane = tp,
 					status = "cancelled",
@@ -968,6 +1002,24 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 					last_message = "",
 					transcript = tern.json.array(),
 				}, false)
+			end
+			if #q == 0 then
+				queued_dispatches[tp] = nil
+			end
+		else
+			queued_dispatches[tp] = nil
+			for _, item in ipairs(q) do
+				cancelled += 1
+				if item.cid ~= nil then
+					send_mux(item.cid, {
+						ok = false,
+						pane = tp,
+						status = "cancelled",
+						error = "Cancelled from queue via unqueue",
+						last_message = "",
+						transcript = tern.json.array(),
+					}, false)
+				end
 			end
 		end
 		local rem = if queued_dispatches[tp] then #queued_dispatches[tp] else 0
@@ -1059,8 +1111,15 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		local target_pane: number? = if req.target_pane ~= nil and req.target_pane ~= tern.json.null then tonumber(req.target_pane) else nil
 		local reset_new = req.reset_new == true
 		local pip_corner = req.pip_corner
+		local async_cb = req.async_callback == true
 
-		if type(req.auto_callback) == "boolean" then
+		if async_cb then
+			-- Async ACP callback mode requires auto-callback to be active on `anchor` so completion returns via `cx.agents:ask`
+			if owner_auto_callback[anchor] == false then
+				owner_auto_callback[anchor] = true
+				save_callback_cfg()
+			end
+		elseif type(req.auto_callback) == "boolean" then
 			owner_auto_callback[anchor] = req.auto_callback
 			save_callback_cfg()
 		end
@@ -1097,12 +1156,16 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				end
 				local corner_str: string? = if type(pip_corner) == "string" and pip_corner ~= "" then pip_corner else nil
 				table.insert(q, {
-					cid = cid,
+					cid = if async_cb then nil else cid,
 					anchor = anchor,
 					prompt = prompt,
 					pip_corner = corner_str,
 				})
-				send_mux(cid, { _ack = true, pane = target_pane, queued = true, position = #q }, true)
+				if async_cb then
+					send_mux(cid, { ok = true, async_callback = true, pane = target_pane, queued = true, position = #q }, false)
+				else
+					send_mux(cid, { _ack = true, pane = target_pane, queued = true, position = #q }, true)
+				end
 				ensure_watchdog()
 				return
 			end
@@ -1149,6 +1212,17 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			pcall(function()
 				cx.layout:float(final_pane, anchor, pip_corner, { focus = false })
 			end)
+		end
+
+		if async_cb then
+			if pending_bootstrap_prompt ~= nil then
+				register_waiter(final_pane, nil, pending_bootstrap_prompt)
+			else
+				unsolicited_working[final_pane] = true
+				reported_in_turn[final_pane] = false
+			end
+			send_mux(cid, { ok = true, async_callback = true, pane = final_pane, queued = false, position = 0 }, false)
+			return
 		end
 
 		send_mux(cid, { _ack = true, pane = final_pane }, true)

@@ -677,6 +677,18 @@ def select_owner_pane_from_status(
     )
 
 
+def is_caller_acp_agent(
+    status: dict[str, Any],
+    inspect_data: dict[str, Any] | None,
+    my_pane: int,
+) -> bool:
+    """True when `my_pane` is a Tern ACP chat pane (e.g. `agy`, `claude`, `codex`) rather than a plain shell or `omp`."""
+    pane_files = extract_omp_pane_files(inspect_data)
+    if my_pane in pane_files:
+        return False
+    return any(int(a["pane"]) == my_pane for a in status.get("agents", []))
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     omp_bin = find_omp_bin()
     tern_bin = find_tern_bin()
@@ -796,6 +808,9 @@ def cmd_send(args: argparse.Namespace) -> None:
         target_pane, reset_new = resolve_target_pane_from_status(
             status, inspect_data, cwd, args.session, session_path, anchor_pane=my_pane
         )
+        use_async_cb = (args.delivery == "async") or (
+            args.delivery == "auto" and is_caller_acp_agent(status, inspect_data, my_pane)
+        )
 
         if args.session == "same" and target_pane is None:
             raise SystemExit(
@@ -835,6 +850,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             "target_pane": target_pane,
             "reset_new": reset_new,
             "queue": not args.no_queue,
+            "async_callback": use_async_cb,
             "cwd": str(cwd),
             "command": format_command_line(cmd_parts),
             "prompt": prompt,
@@ -860,9 +876,9 @@ def cmd_send(args: argparse.Namespace) -> None:
                 )
 
         try:
-            reply = call_bridge(req, timeout=timeout_s, on_ack=_on_ack)
+            reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT if use_async_cb else timeout_s, on_ack=_on_ack)
         except TimeoutError:
-            print(f"[wingman] Timed out after {args.max_time} waiting for agent turn.", file=sys.stderr)
+            print(f"[wingman] Timed out after {args.max_time or DEFAULT_BRIDGE_TIMEOUT} waiting for wingman bridge.", file=sys.stderr)
             raise SystemExit(124)
 
         if not reply.get("ok"):
@@ -872,6 +888,23 @@ def cmd_send(args: argparse.Namespace) -> None:
             if reply.get("last_message"):
                 print(reply["last_message"])
             raise SystemExit(2 if st == "waiting_input" else 1)
+
+        if reply.get("async_callback"):
+            dispatched_pane = int(reply["pane"])
+            if reply.get("queued"):
+                pos = int(reply.get("position") or 1)
+                print(
+                    f"[wingman] Queued (#{pos}, {len(prompt)} chars) onto wingman pane {dispatched_pane} (async ACP callback armed).\n"
+                    f"When pane {dispatched_pane} finishes this turn, Tern will automatically submit `[Wingman auto-callback · pane {dispatched_pane}]` "
+                    "into your chat composer as a visible turn. Do NOT poll or sleep; end your turn now and wait for the callback."
+                )
+            else:
+                print(
+                    f"[wingman] Dispatched ({len(prompt)} chars) onto wingman pane {dispatched_pane} (async ACP callback armed).\n"
+                    f"When pane {dispatched_pane} finishes, Tern will automatically submit `[Wingman auto-callback · pane {dispatched_pane}]` "
+                    "into your chat composer as a visible turn. Do NOT poll or sleep; end your turn now and wait for the callback."
+                )
+            raise SystemExit(0)
 
         if reply.get("last_message"):
             print(reply["last_message"])
@@ -1211,6 +1244,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--takeover-idle", action="store_true")
     p_send.add_argument("--allow-fork", action="store_true")
     p_send.add_argument("--no-queue", action="store_true", help="Fail immediately if target wingman pane is busy instead of queueing natively")
+    deliv_grp = p_send.add_mutually_exclusive_group()
+    deliv_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately after TSP dispatch and deliver reply via `cx.agents:ask` callback (default for Tern ACP callers)")
+    deliv_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block synchronously until wingman turn finishes (default for shell/non-ACP callers)")
     cb_grp = p_send.add_mutually_exclusive_group()
     cb_grp.add_argument("--auto-callback", dest="auto_callback", action="store_true", default=None, help="Enable unsolicited worker->owner auto-callback (default: on)")
     cb_grp.add_argument("--no-auto-callback", dest="auto_callback", action="store_false", help="Disable unsolicited worker->owner auto-callback for this binding")

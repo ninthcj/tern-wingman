@@ -115,6 +115,9 @@ class WingmanTests(unittest.TestCase):
         self.assertEqual(ns_unq.position, 2)
         ns_send = parser.parse_args(["send", "same", "--prompt", "hi", "--no-queue"])
         self.assertTrue(ns_send.no_queue)
+        self.assertEqual(ns_send.delivery, "auto")
+        self.assertEqual(parser.parse_args(["send", "same", "--prompt", "hi", "--async"]).delivery, "async")
+        self.assertEqual(parser.parse_args(["send", "same", "--prompt", "hi", "--wait"]).delivery, "wait")
         self.assertIsNone(ns_send.auto_callback)
         ns_send_cb_off = parser.parse_args(["send", "same", "--prompt", "hi", "--no-auto-callback"])
         self.assertFalse(ns_send_cb_off.auto_callback)
@@ -162,6 +165,19 @@ class WingmanTests(unittest.TestCase):
         }
         with self.assertRaises(SystemExit):
             wingman.select_owner_pane_from_status(status_ambiguous, 105)
+
+        # 4. `is_caller_acp_agent` distinguishes Tern ACP panes (`agy`/`claude`) from plain shells and `omp` panes
+        inspect_sample = {
+            "panes": [
+                {"pane": 50, "omp_session_file": None},  # plain zsh shell (not in status.agents)
+                {"pane": 100, "omp_session_file": None},  # ACP agy pane (in status.agents, no omp_session_file)
+                {"pane": 105, "omp_session_file": "/tmp/s105.jsonl"},  # omp worker pane
+            ]
+        }
+        status_sample = {"agents": [{"pane": 100}, {"pane": 105}]}
+        self.assertFalse(wingman.is_caller_acp_agent(status_sample, inspect_sample, 50))
+        self.assertTrue(wingman.is_caller_acp_agent(status_sample, inspect_sample, 100))
+        self.assertFalse(wingman.is_caller_acp_agent(status_sample, inspect_sample, 105))
 
     def test_windows_paths_cmdline_and_tcp_token_fallback(self) -> None:
         from unittest import mock
