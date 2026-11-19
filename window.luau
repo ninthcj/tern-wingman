@@ -528,8 +528,10 @@ local function build_waiting_summary(cx: WindowCx, pane_id: number): (string, st
 	end
 	table.insert(parts, string.format("Interactive surface (%s · root %s):\n%s", tostring(role or "unknown"), tostring(root_id or "-"), surface_text))
 	table.insert(parts, string.format(
-		"Inspect: `wingman.py surface --pane %d [--json]`. Answer: `wingman.py event --pane %d '<json-event>' ...` "
-			.. "(e.g. '{\"ev\":\"action\",\"id\":\"<root_id>\",\"act\":\"pick:0:0\"}' '{\"ev\":\"action\",\"id\":\"<submit_id>\",\"act\":\"submit\"}'). "
+		"Inspect: `wingman.py surface --pane %d [--json]`. Answer via `wingman.py event --pane %d '<json-event>' ...`:\n"
+			.. "- Pick option & submit: `'{\"ev\":\"action\",\"id\":\"ui\",\"act\":\"pick:0:0\"}' '{\"ev\":\"action\",\"id\":\"ui.actions/submit\",\"act\":\"submit\"}'`\n"
+			.. "- Open folded field / fill `Other…` or text input: `open:<idx>` -> `{\"ev\":\"select\",\"id\":\"<list_id>\",\"item\":\"other\"}` -> check `<input_id>` via `surface` -> `{\"ev\":\"edit\",\"id\":\"<input_id>\",\"from\":0,\"to\":0,\"text\":\"...\",\"cursor\":<utf16_len>,\"len\":0}`\n"
+			.. "- Add option note: `{\"ev\":\"action\",\"id\":\"<item_id>\",\"act\":\"note\"}` -> `edit` `<editor_id>` -> `{\"ev\":\"action\",\"id\":\"ui.actions/save-note\",\"act\":\"save-note\"}`\n"
 			.. "Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.",
 		pane_id, pane_id
 	))

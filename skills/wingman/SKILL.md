@@ -33,7 +33,15 @@ python3 "$WINGMAN_PY" peek [latest|sessionId] --cwd /path/to/project
 
 # Answer a worker blocked on `ask`/approval (`waiting_input`) via native TSP
 python3 "$WINGMAN_PY" surface --pane <id> [--json] [--all] [--root <nodeId>]
-python3 "$WINGMAN_PY" event --pane <id> '{"ev":"action","id":"<id>","act":"pick:0:0"}' '{"ev":"action","id":"<submit_id>","act":"submit"}'
+# 1) Pick option(s) & submit (`pick:<fieldIdx>:<optIdx>` works even on folded fields; toggles checkboxes):
+python3 "$WINGMAN_PY" event --pane <id> '{"ev":"action","id":"ui","act":"pick:0:0"}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'
+# 2) Fill free-text `Other…` (or text `<input>`/`<textarea>`): open field -> select `other` -> inspect `<input_id>` via `surface` -> `edit` (UTF-16 lengths):
+python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"action","id":"ui","act":"open:1"}'
+python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"select","id":"ui.body/g1/q1/f1","item":"other"}'
+python3 "$WINGMAN_PY" event --pane <id> '{"ev":"edit","id":"<input_id>","from":0,"to":0,"text":"Custom answer","cursor":13,"len":0}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'
+# 3) Attach an option `Note`: open field -> `act:"note"` on option item -> inspect `<editor_id>` via `surface` -> `edit` + `save-note`:
+python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"action","id":"ui.body/g0/q0/f0/o0","act":"note"}'
+python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"edit","id":"<editor_id>","from":0,"to":0,"text":"Extra constraint","cursor":16,"len":0}' '{"ev":"action","id":"ui.actions/save-note","act":"save-note"}'
 
 # Layout, bidirectional reporting & lifecycle controls
 python3 "$WINGMAN_PY" report --prompt "Summary or question for bound supervisor" [--kind final|progress|question]
