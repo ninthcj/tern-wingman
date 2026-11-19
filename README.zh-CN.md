@@ -41,6 +41,8 @@ Antigravity 或本地源码开发链接方式：
 git clone https://github.com/ninthcj/tern-wingman.git
 tern plugin link ./tern-wingman
 ln -s "$(pwd)/tern-wingman/skills/wingman" ~/.gemini/config/skills/wingman
+# 可选（推荐）：暴露全局 `wingman` 命令，Agent 无需拼接脚本路径
+ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wingman
 ```
 
 ## 常用命令（`wingman.py`）

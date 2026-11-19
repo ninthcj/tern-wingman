@@ -74,6 +74,9 @@ tern plugin link ./tern-wingman
 ln -s "$(pwd)/tern-wingman/skills/wingman" ~/.gemini/config/skills/wingman
 # or:
 ln -s "$(pwd)/tern-wingman/skills/wingman" ~/.agents/skills/wingman
+
+# Optional (recommended): put `wingman` directly on PATH for one-word CLI calls:
+ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wingman
 ```
 
 Verify the plugin is `ready`:

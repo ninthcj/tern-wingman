@@ -6,63 +6,58 @@ description: >-
   worker split or PiP float in Tern, or running changes in `ovnfs` copy-on-write checkouts.
 ---
 
-# Wingman (Native Tern TSP Side-Pane & PiP Bridge)
+# Wingman
 
-[wingman.py](./scripts/wingman.py) (resolve path relative to this `SKILL.md`) drives a live `omp` wingman inside Tern via `WindowCx.agents` over TSP (`cx.agents:start` / `cx.agents:ask` atomic send + `agent_finished` event wakeup — no PTY paste emulation, no `.jsonl` polling, no focus stealing). Outside Tern (or with `--mode headless`), it runs `omp -p --wait-async`.
+Drive a live `omp` worker in Tern over native TSP (`WindowCx.agents`) or headless `omp -p` outside Tern.
 
-## Commands
+**Invocation**: run `wingman <cmd> ...` if on `PATH`, otherwise `python3 <this-skill-dir>/scripts/wingman.py <cmd> ...`. The CLI reference below is complete—invoke directly without inspecting script source.
+
+## CLI Reference
 
 ```bash
-# Let WINGMAN_PY="<directory-of-this-SKILL.md>/scripts/wingman.py"
+# Inspect live Tern agents, bindings, floats, ovnfs availability, and recent sessions
+wingman info [--cwd DIR] [--limit 6]
 
-# Inspect live Tern TSP agents, PiP floats, ovnfs availability, and persisted sessions
-python3 "$WINGMAN_PY" info --cwd /path/to/project
+# Dispatch a prompt to a worker
+#   target: new (fresh session) | same (bound/tab worker) | latest | <sessionId/path>
+#   prompt: -m TEXT | --prompt TEXT | --prompt-file FILE (use '-' to pipe stdin)
+wingman send <new|same|latest|sessionId> (-m TEXT | --prompt-file FILE|-) \
+  [--cwd DIR] [--pip tl|tr|bl|br] [--model M] [--thinking L] [--max-time 30m] \
+  [--mode auto|tui|headless] [--no-queue] [--async | --wait] \
+  [--auto-callback | --no-auto-callback] [--takeover-idle] [--allow-fork]
 
-# Dispatch a prompt
-# Target argument:
-#   new          -> fresh session
-#   same         -> active wingman pane in the current tab
-#   <sessionId>  -> persisted session by ID/path (or `latest`)
-python3 "$WINGMAN_PY" send <new|same|sessionId> \
-  --cwd /path/to/project \
-  --prompt-file /path/to/prompt.md
+# Read structured TSP chat transcript from Tern memory, or tail-peek .jsonl
+wingman transcript [pane | --pane ID] [--last 8] [--cwd DIR]
+wingman peek [latest|sessionId] [--cwd DIR] [--bytes 65536] [--lines 25]
 
-# Read structured TSP chat messages & tool cards from Tern memory, or tail-peek .jsonl
-python3 "$WINGMAN_PY" transcript --last 6
-python3 "$WINGMAN_PY" peek [latest|sessionId] --cwd /path/to/project
+# Recover a worker stalled on `F5 to retry` via native `/retry`
+wingman retry [pane | --pane ID] [--cwd DIR] [--async | --wait] [--max-time 30m]
 
-# Retry a worker turn that failed/aborted (`F5 to retry`) via native `/retry`; --async for ACP callers, --wait for shells (auto)
-python3 "$WINGMAN_PY" retry --pane <id> [--async | --wait] [--max-time 30m]
+# Inspect & answer a worker blocked on `ask`/approval (`waiting_input`)
+wingman surface [pane | --pane ID] [--cwd DIR] [--root NODE_ID] [--all] [--json]
+wingman event [--pane ID] [--cwd DIR] [--no-rearm] '<json-event>' ...
 
-# Answer a worker blocked on `ask`/approval (`waiting_input`) via native TSP
-python3 "$WINGMAN_PY" surface --pane <id> [--json] [--all] [--root <nodeId>]
-# 1) Pick option(s) & submit (`pick:<fieldIdx>:<optIdx>` works even on folded fields; toggles checkboxes):
-python3 "$WINGMAN_PY" event --pane <id> '{"ev":"action","id":"ui","act":"pick:0:0"}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'
-# 2) Fill free-text `Other…` (or text `<input>`/`<textarea>`): open field -> select `other` -> inspect `<input_id>` via `surface` -> `edit` (UTF-16 lengths):
-python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"action","id":"ui","act":"open:1"}'
-python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"select","id":"ui.body/g1/q1/f1","item":"other"}'
-python3 "$WINGMAN_PY" event --pane <id> '{"ev":"edit","id":"<input_id>","from":0,"to":0,"text":"Custom answer","cursor":13,"len":0}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'
-# 3) Attach an option `Note`: open field -> `act:"note"` on option item -> inspect `<editor_id>` via `surface` -> `edit` + `save-note`:
-python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"action","id":"ui.body/g0/q0/f0/o0","act":"note"}'
-python3 "$WINGMAN_PY" event --pane <id> --no-rearm '{"ev":"edit","id":"<editor_id>","from":0,"to":0,"text":"Extra constraint","cursor":16,"len":0}' '{"ev":"action","id":"ui.actions/save-note","act":"save-note"}'
+# Worker -> supervisor reverse push (run from inside the worker pane)
+wingman report (-m TEXT | --prompt-file FILE|-) [--kind final|progress|question] [--pane OWNER_ID]
 
-# Layout, bidirectional reporting & lifecycle controls
-python3 "$WINGMAN_PY" report --prompt "Summary or question for bound supervisor" [--kind final|progress|question]
-python3 "$WINGMAN_PY" callback [status|on|off|reset] [--global]
-python3 "$WINGMAN_PY" pip --corner br
-python3 "$WINGMAN_PY" dock --dir right
-python3 "$WINGMAN_PY" interrupt
-python3 "$WINGMAN_PY" unqueue [--position 1]
-python3 "$WINGMAN_PY" stop
+# Layout & lifecycle (all accept optional [pane | --pane ID] [--cwd DIR])
+wingman pip [--corner br|bl|tr|tl]
+wingman dock [--dir right|left|up|down]
+wingman interrupt
+wingman unqueue [--position N]
+wingman stop
+wingman callback [status|on|off|reset] [--global] [--pane OWNER_ID]
 ```
 
-## Notes
+## Runtime Behavior
 
-- **`waiting_input` escalation**: when a bound `omp` worker hits an `ask` card/approval/hook prompt, the supervisor receives `[Wingman waiting_input · pane <id>]` with the card text, its TSP node ids, and usage hints (deduped per card). `send` to a `waiting_input` pane is refused; inspect with `surface`, answer or cancel with `event` (auto-callback re-arms for the resumed turn unless `--no-rearm`). Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.
-- **Fault escalation**: when a bound worker's turn fails (API/SSE error) or aborts mid-stream (`F5 to retry`, e.g. `Streaming edit preview failed`), the supervisor receives `[Wingman fault · retryable · pane <id>]` with the exact error/abort text (deduped per fault). Run `retry --pane <id>` for transient stream/network/edit-preview glitches (at most 2-3 times); consult the user on persistent quota/auth/config errors.
-- Calling `send same` while the wingman pane is `working` natively queues the prompt inside Tern's `window.luau` and promotes it automatically on `agent_finished` (pass `--no-queue` to fail fast instead).
-- **ACP UI Sync & Bidirectional Push (`--async` default for ACP callers)**:
-  - When called from a Tern ACP pane (`agy`, `claude`, `codex`), `send` automatically returns immediately after dispatching/queueing (`async ACP callback` mode; pass `--wait` only to force blocking stdout wait). When `omp` finishes, `window.luau` submits `[Wingman auto-callback · pane <id>]` directly into the supervisor's composer via `cx.agents:ask` (`session/prompt`), keeping Tern's live chat UI 100% synchronized instead of running inside an unrendered background bash wakeup.
-  - **Proactive `report`**: From inside the wingman pane, run `wingman.py report -m "..."` (`--kind progress` for mid-turn updates, `--kind final` or `question` for completion/escalation) to push directly up to `boundOwner` without blocking.
-- When `ovnfsBin` is present in `info`, zero-copy Copy-on-Write checkouts are available via `ovnfs new <dir>`, `ovnfs diff <checkout>`, `ovnfs apply <checkout>`, and `ovnfs rm <checkout>`.
-- For TSP bridge details, Tern native blocks (`tern open --preview`, `tern browser`), and stateful RPC mode, see [internals.md](./references/internals.md).
+- **Async default in Tern ACP panes** (`agy`, `claude`, `codex`): `send` and `retry` return immediately after dispatch and Tern submits `[Wingman auto-callback · pane <id>]` back into your composer when the worker finishes. Do not poll or sleep; pass `--wait` only to force blocking stdout.
+- **Native queueing**: `send same` while the worker is `working` queues inside Tern and promotes automatically on finish (`--no-queue` fails fast; `unqueue` cancels).
+- **`[Wingman waiting_input · pane <id>]`**: `send` onto a `waiting_input` pane is refused. Inspect with `surface`, answer with `event` (auto-rearms callback unless `--no-rearm`; simple option pick: `'{"ev":"action","id":"ui","act":"pick:0:0"}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'`). Decide technical/architectural questions yourself; consult the user on product/scope/cost trade-offs.
+- **`[Wingman fault · retryable · pane <id>]`**: worker exhausted internal recovery and is waiting on `F5 to retry`. Run `retry --pane <id>` for transient stream/network/edit-preview glitches (up to 2–3 tries); consult the user on persistent quota/auth/config errors.
+- **Zero-copy checkouts**: when `ovnfsBin` is present in `info`, use `ovnfs new|diff|apply|rm`.
+
+## On-Demand References (read only when needed)
+
+- `references/interactive.md`: multi-step TSP `event` JSON recipes for filling free-text `Other…` inputs or attaching option `Note`s.
+- `references/internals.md`: Tern plugin architecture, `ovnfs` workflow, and Tern native workspace blocks.

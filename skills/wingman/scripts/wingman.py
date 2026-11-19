@@ -775,6 +775,16 @@ def cmd_info(args: argparse.Namespace) -> None:
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+def _read_prompt_input(prompt: str | None, prompt_file: str | None, label: str = "prompt") -> str:
+    if prompt_file:
+        text = sys.stdin.read() if prompt_file == "-" else Path(prompt_file).read_text(encoding="utf-8")
+    else:
+        text = prompt or ""
+    if not text.strip():
+        raise SystemExit(f"error: {label} is empty")
+    return text.strip()
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     """Deliver prompt via native Tern TSP `cx.agents` (`wingman` plugin) or headless `-p` fallback."""
     omp_bin = find_omp_bin()
@@ -782,12 +792,7 @@ def cmd_send(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     cwd = Path(args.cwd).resolve()
 
-    prompt = args.prompt
-    if args.prompt_file:
-        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
-    if not prompt or not prompt.strip():
-        raise SystemExit("error: prompt is empty")
-    prompt = prompt.strip()
+    prompt = _read_prompt_input(args.prompt, args.prompt_file, label="prompt")
 
     session_path = resolve_session(args.session, cwd, allow_missing=True)
     timeout_s = parse_duration_seconds(args.max_time)
@@ -965,8 +970,11 @@ def resolve_same_tab_agent_pane(my_pane: int, cwd: Path | None = None) -> int:
 
 
 def _resolve_explicit_or_bound_pane(args: argparse.Namespace, my_pane: int) -> int:
-    if args.pane and args.pane.isdigit():
-        pane = int(args.pane)
+    raw = getattr(args, "pane_flag", None) or getattr(args, "pane", None)
+    if raw is not None and str(raw).strip():
+        if not str(raw).isdigit():
+            raise SystemExit(f"error: invalid pane id: {raw!r}")
+        pane = int(raw)
         if pane == my_pane:
             raise SystemExit(f"error: refusing to target caller's own pane ({my_pane})")
         return pane
@@ -1077,7 +1085,6 @@ def cmd_surface(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `surface` requires running inside Tern")
-    args.pane = args.pane or args.pane_flag
     pane = _resolve_explicit_or_bound_pane(args, my_pane)
     req: dict[str, Any] = {
         "op": "surface",
@@ -1127,7 +1134,6 @@ def cmd_retry(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `retry` requires running inside Tern")
-    args.pane = args.pane_flag or args.pane
     pane = _resolve_explicit_or_bound_pane(args, my_pane)
     use_async = args.delivery == "async"
     if args.delivery == "auto":
@@ -1165,12 +1171,7 @@ def cmd_report(args: argparse.Namespace) -> None:
     if my_pane is None:
         raise SystemExit("error: `report` requires running inside Tern")
 
-    prompt = args.prompt
-    if args.prompt_file:
-        prompt = Path(args.prompt_file).read_text(encoding="utf-8")
-    if not prompt or not prompt.strip():
-        raise SystemExit("error: report prompt is empty")
-    prompt = prompt.strip()
+    prompt = _read_prompt_input(args.prompt, args.prompt_file, label="report prompt")
 
     explicit_owner: int | None = None
     if args.pane:
@@ -1308,6 +1309,12 @@ def cmd_peek(args: argparse.Namespace) -> None:
         print(ev)
 
 
+def _add_pane_args(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    subparser.add_argument("--pane", dest="pane_flag", help="Agent pane id (alternative to positional)")
+    subparser.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Wingman: Native Tern TSP (`WindowCx.agents`) & headless worker bridge.")
     sub = p.add_subparsers(dest="subcmd", required=True)
@@ -1320,8 +1327,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_send = sub.add_parser("send", help="Atomic TSP dispatch (`cx.agents:start/ask`) + event-driven wait")
     p_send.add_argument("session", help="Explicit target: 'new', 'same', or <sessionId/path>")
     grp = p_send.add_mutually_exclusive_group(required=True)
-    grp.add_argument("--prompt", help="Prompt text")
-    grp.add_argument("--prompt-file", help="Path to prompt file")
+    grp.add_argument("--prompt", "--message", "-m", dest="prompt", help="Prompt text")
+    grp.add_argument("--prompt-file", help="Path to prompt file (or '-' for stdin)")
     p_send.add_argument("--cwd", default=".", help="Workspace directory")
     p_send.add_argument("--pip", choices=["tl", "tr", "bl", "br"], help="Float worker as Picture-in-Picture corner")
     p_send.add_argument("--mode", choices=["auto", "tui", "headless"], default="auto")
@@ -1342,7 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep = sub.add_parser("report", help="Push a report/progress/question from a wingman pane back up to its bound supervisor")
     rep_grp = p_rep.add_mutually_exclusive_group(required=True)
     rep_grp.add_argument("--prompt", "--message", "-m", dest="prompt", help="Report message text")
-    rep_grp.add_argument("--prompt-file", help="Path to report markdown/text file")
+    rep_grp.add_argument("--prompt-file", help="Path to report markdown/text file (or '-' for stdin)")
     p_rep.add_argument("--kind", choices=["final", "progress", "question"], default="final", help="Report kind (`progress` keeps end-of-turn auto-callback active)")
     p_rep.add_argument("--pane", help="Optional explicit supervisor/owner pane id (defaults to caller's boundOwner)")
     p_rep.set_defaults(func=cmd_report)
@@ -1354,43 +1361,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_cb.set_defaults(func=cmd_callback)
 
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")
-    p_tr.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    _add_pane_args(p_tr)
     p_tr.add_argument("--last", type=int, default=8, help="Number of recent messages")
-    p_tr.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_tr.set_defaults(func=cmd_transcript)
 
     p_pip = sub.add_parser("pip", help="Float worker pane into Picture-in-Picture corner")
-    p_pip.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    _add_pane_args(p_pip)
     p_pip.add_argument("--corner", choices=["tl", "tr", "bl", "br"], default="br")
-    p_pip.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_pip.set_defaults(func=cmd_pip)
 
     p_dock = sub.add_parser("dock", help="Dock floating Picture-in-Picture worker back into split")
-    p_dock.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    _add_pane_args(p_dock)
     p_dock.add_argument("--dir", choices=["left", "right", "up", "down"], default="right")
-    p_dock.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_dock.set_defaults(func=cmd_dock)
 
     p_int = sub.add_parser("interrupt", help="Interrupt active turn via `cx.agents:interrupt`")
-    p_int.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
-    p_int.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    _add_pane_args(p_int)
     p_int.set_defaults(func=cmd_interrupt)
 
     p_unq = sub.add_parser("unqueue", help="Cancel queued (not-yet-sent) prompts waiting on a busy wingman pane")
-    p_unq.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    _add_pane_args(p_unq)
     p_unq.add_argument("--position", type=int, help="Optional 1-based queue slot to cancel (default: cancel all)")
-    p_unq.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_unq.set_defaults(func=cmd_unqueue)
 
     p_stop = sub.add_parser("stop", help="Close worker pane and terminate process via `cx.agents:stop`")
-    p_stop.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
-    p_stop.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    _add_pane_args(p_stop)
     p_stop.set_defaults(func=cmd_stop)
 
     p_surf = sub.add_parser("surface", help="Inspect worker TSP surface (auto-scoped to pending ask/approval card)")
-    p_surf.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
-    p_surf.add_argument("--pane", dest="pane_flag", help="Agent pane id (alternative to positional)")
-    p_surf.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    _add_pane_args(p_surf)
     p_surf.add_argument("--root", help="Explicit TSP node id to scope to")
     p_surf.add_argument("--all", action="store_true", help="Whole surface instead of auto-scoping to the interactive node")
     p_surf.add_argument("--json", action="store_true", help="Return structured node table instead of text")
@@ -1404,9 +1403,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.set_defaults(func=cmd_event)
 
     p_retry = sub.add_parser("retry", help="Retry a failed/aborted worker turn via native `/retry` (same as F5)")
-    p_retry.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
-    p_retry.add_argument("--pane", dest="pane_flag", help="Agent pane id (alternative to positional)")
-    p_retry.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    _add_pane_args(p_retry)
     p_retry.add_argument("--max-time", help="Optional max wait in --wait mode (e.g. 30m)")
     retry_grp = p_retry.add_mutually_exclusive_group()
     retry_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately; result arrives via auto-callback (default for Tern ACP callers)")

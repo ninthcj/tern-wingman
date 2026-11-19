@@ -107,22 +107,29 @@ class WingmanTests(unittest.TestCase):
             wingman.select_wingman_pane_from_status(only_acp, inspect_data, 100, cwd=cwd)
 
     def test_cli_control_subcommands_accept_cwd(self) -> None:
+        import io
+        from unittest import mock
+
         parser = wingman.build_parser()
-        for sub in ("interrupt", "unqueue", "stop", "pip", "dock", "transcript"):
-            ns = parser.parse_args([sub, "--cwd", "/tmp/demo-repo"])
+        for sub in ("interrupt", "unqueue", "stop", "pip", "dock", "transcript", "surface", "retry"):
+            ns = parser.parse_args([sub, "--cwd", "/tmp/demo-repo", "--pane", "321"])
             self.assertEqual(ns.cwd, "/tmp/demo-repo")
+            self.assertEqual(ns.pane_flag, "321")
         ns_unq = parser.parse_args(["unqueue", "--position", "2"])
         self.assertEqual(ns_unq.position, 2)
-        ns_send = parser.parse_args(["send", "same", "--prompt", "hi", "--no-queue"])
+        ns_send = parser.parse_args(["send", "same", "-m", "hi", "--no-queue"])
+        self.assertEqual(ns_send.prompt, "hi")
         self.assertTrue(ns_send.no_queue)
         self.assertEqual(ns_send.delivery, "auto")
-        self.assertEqual(parser.parse_args(["send", "same", "--prompt", "hi", "--async"]).delivery, "async")
+        self.assertEqual(parser.parse_args(["send", "same", "--message", "hi", "--async"]).delivery, "async")
         self.assertEqual(parser.parse_args(["send", "same", "--prompt", "hi", "--wait"]).delivery, "wait")
         self.assertIsNone(ns_send.auto_callback)
         ns_send_cb_off = parser.parse_args(["send", "same", "--prompt", "hi", "--no-auto-callback"])
         self.assertFalse(ns_send_cb_off.auto_callback)
         ns_send_cb_on = parser.parse_args(["send", "same", "--prompt", "hi", "--auto-callback"])
         self.assertTrue(ns_send_cb_on.auto_callback)
+        with mock.patch.object(wingman.sys, "stdin", io.StringIO("  from stdin  \n")):
+            self.assertEqual(wingman._read_prompt_input(None, "-"), "from stdin")
         ns_rep = parser.parse_args(["report", "-m", "done!", "--kind", "progress", "--pane", "100"])
         self.assertEqual(ns_rep.prompt, "done!")
         self.assertEqual(ns_rep.kind, "progress")
