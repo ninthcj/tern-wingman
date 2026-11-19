@@ -185,6 +185,45 @@ class WingmanTests(unittest.TestCase):
         self.assertFalse(calls[1]["rearm"])
         self.assertEqual(len(calls), 2)
 
+    def test_retry_cli_async_for_acp_and_wait_for_shell(self) -> None:
+        from unittest import mock
+
+        parser = wingman.build_parser()
+        calls: list[dict] = []
+        acp_status = {"agents": [{"pane": 100}, {"pane": 200}]}
+
+        def fake_bridge(req, timeout=None, on_ack=None):
+            calls.append({**req, "_timeout": timeout})
+            if req["op"] == "status":
+                return acp_status
+            if req["async_callback"]:
+                return {"ok": True, "async_callback": True, "pane": 200, "retried": True}
+            if on_ack:
+                on_ack({"_ack": True, "pane": 200})
+            return {"ok": True, "pane": 200, "status": "done", "last_message": "fixed"}
+
+        with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(
+            wingman, "call_bridge", fake_bridge
+        ), mock.patch.object(wingman, "inspect_tern", lambda _b: None), mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            # ACP caller (pane 100 is an agent) -> auto async
+            ns = parser.parse_args(["retry", "--pane", "200"])
+            with self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+            self.assertEqual(cm.exception.code, 0)
+            # Shell caller -> auto wait (blocks with --max-time)
+            acp_status = {"agents": [{"pane": 200}]}
+            ns = parser.parse_args(["retry", "200", "--max-time", "2m"])
+            ns.func(ns)
+            # Explicit --wait skips status lookup
+            ns = parser.parse_args(["retry", "--pane", "200", "--wait"])
+            ns.func(ns)
+
+        retries = [c for c in calls if c["op"] == "retry"]
+        self.assertEqual([c["target_pane"] for c in retries], [200, 200, 200])
+        self.assertEqual([c["async_callback"] for c in retries], [True, False, False])
+        self.assertEqual(retries[1]["_timeout"], 120.0)
+        self.assertEqual(sum(1 for c in calls if c["op"] == "status"), 2)
+
     def test_select_owner_pane_from_status_reverse_lookup(self) -> None:
         # 1. Explicit `owner_pane` from bindings_v1 works even across ovnfs checkouts & multiple agents in tab
         status_bound = {

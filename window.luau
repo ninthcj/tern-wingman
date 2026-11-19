@@ -56,8 +56,10 @@ local queued_callbacks: { [number]: { string } } = {}
 local unsolicited_working: { [number]: boolean } = {}
 -- Tracks whether a wingman pane already called `report` (`kind ~= "progress"`) during the current turn
 local reported_in_turn: { [number]: boolean } = {}
--- Dedup key of the last `waiting_input` escalation pushed to the owner, per wingman pane (persisted)
+-- Dedup key of the last `waiting_input` or `fault` escalation pushed to the owner, per wingman pane (persisted)
 local notified_waiting: { [number]: string } = {}
+-- Panes intentionally interrupted via `wingman.py interrupt` (suppresses fault escalation until next turn)
+local manual_interrupt: { [number]: boolean } = {}
 
 -- Auto-callback policy (default ON; supports global default + per-owner overrides)
 local default_auto_callback = true
@@ -559,6 +561,103 @@ local function notify_waiting_input(cx: WindowCx, worker_pane: number)
 	end)
 end
 
+local function node_text(node: any): string
+	local lines: { string } = {}
+	walk_nodes(node, 0, function(n: any): boolean
+		local p = n.p
+		if type(p) == "table" then
+			for _, field in ipairs({ "text", "spans", "label", "detail", "value" }) do
+				local s = spans_to_text(p[field])
+				if s ~= "" then
+					table.insert(lines, s)
+				end
+			end
+		end
+		return #lines >= 60
+	end)
+	return table.concat(lines, "\n")
+end
+
+local function inspect_fault_surface(cx: WindowCx, pane_id: number): (boolean, string?, string?)
+	local ok_tree, tree = pcall(function()
+		return cx.session:surface(pane_id, { as = "table", nodes = 1500 })
+	end)
+	if not ok_tree or type(tree) ~= "table" then
+		return false, nil, nil
+	end
+	local has_retry_hint = false
+	local has_retry_error = false
+	local banner_text: string? = nil
+	local abort_text: string? = nil
+	local error_text: string? = nil
+	walk_nodes(tree.dock, 0, function(n: any): boolean
+		local role = type(n.p) == "table" and n.p.role or nil
+		if role == "omp.hint.retry" then
+			has_retry_hint = true
+		elseif role == "omp.errorBanner" then
+			banner_text = node_text(n)
+		end
+		return false
+	end)
+	local main_c = tree.main and tree.main.c
+	local tail = if type(main_c) == "table" and #main_c > 0 then main_c[#main_c] else nil
+	walk_nodes(tail, 0, function(n: any): boolean
+		local role = type(n.p) == "table" and n.p.role or nil
+		if role == "omp.error" then
+			has_retry_error = true
+			error_text = node_text(n)
+			return true
+		elseif role == "omp.assistant.abort" then
+			abort_text = node_text(n)
+			return true
+		end
+		return false
+	end)
+	-- Strictly require a genuine takeover-needed state (`F5 to retry` in dock or `omp.error` Retry card at tail).
+	-- Plain user `Esc` aborts (`omp.assistant.abort` without `omp.hint.retry`) and non-blocking warnings are ignored.
+	if not has_retry_hint and not has_retry_error then
+		return false, nil, nil
+	end
+	local parts: { string } = {}
+	if error_text and error_text ~= "" then
+		table.insert(parts, error_text)
+	end
+	if abort_text and abort_text ~= "" then
+		table.insert(parts, abort_text)
+	end
+	if banner_text and banner_text ~= "" then
+		table.insert(parts, banner_text)
+	end
+	local summary = table.concat(parts, "\n")
+	if summary == "" then
+		summary = "(omp stopped and is waiting on `F5 to retry`)"
+	end
+	return true, "fault:" .. tostring(tail and tail.id or "dock") .. ":" .. string.sub(summary, 1, 120), summary
+end
+
+local function deliver_fault_if_needed(cx: WindowCx, worker_pane: number, fallback_reason: string?): boolean
+	local owner = owner_of_pane(cx, worker_pane)
+	if owner == nil or not is_auto_callback_enabled(owner) then
+		return false
+	end
+	local has_fault, key, summary = inspect_fault_surface(cx, worker_pane)
+	if not has_fault then
+		if fallback_reason == nil then
+			return false
+		end
+		key, summary = "fault:" .. fallback_reason, fallback_reason
+	end
+	if notified_waiting[worker_pane] == key then
+		return false
+	end
+	notified_waiting[worker_pane] = key :: string
+	save_waiting()
+	local body = tostring(summary)
+		.. "\n\nRecover: run `wingman.py retry --pane " .. worker_pane .. "` (sends native `/retry`, equivalent to F5) for transient stream/network/edit-preview glitches (up to 2-3 retries), or consult the user if it is a persistent quota/auth/config error."
+	deliver_to_owner(cx, owner, worker_pane, "fault · retryable", body)
+	return true
+end
+
 local function promote_next_queued(cx: WindowCx, pane_id: number)
 	local q = queued_dispatches[pane_id]
 	if not q or #q == 0 then
@@ -815,12 +914,40 @@ local function seed_inflight_unsolicited_turns(cx: WindowCx)
 			end
 		elseif a.state == "waiting_input" and pending_waits[a.pane] == nil and owner_of_pane(cx, a.pane) ~= nil then
 			notify_waiting_input(cx, a.pane)
+		elseif a.state == "idle" and pending_waits[a.pane] == nil and owner_of_pane(cx, a.pane) ~= nil then
+			if inspect_fault_surface(cx, a.pane) then
+				deliver_fault_if_needed(cx, a.pane, nil)
+			end
 		end
 	end
 end
 
+-- `working -> idle` without `agent_finished`: wait 1500ms so omp's own internal auto-recovery
+-- (`Streaming edit preview failed` attempts 1..2, etc.) finishes undisturbed; escalate ONLY if omp
+-- stays stalled in `idle` with an active `F5 to retry` / `omp.error` takeover prompt.
+local function settle_stalled_fault(cx: WindowCx, pane: number)
+	tern.timer(1500, function(later_cx: WindowCx?)
+		local lcx = later_cx or cx
+		if manual_interrupt[pane] then
+			return
+		end
+		local ainfo = find_agent_info(lcx, pane)
+		if not ainfo or ainfo.state ~= "idle" or pending_waits[pane] ~= nil then
+			return
+		end
+		if inspect_fault_surface(lcx, pane) then
+			unsolicited_working[pane] = false
+			reported_in_turn[pane] = false
+			deliver_fault_if_needed(lcx, pane, nil)
+		end
+	end)
+end
+
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
-	if ev.new ~= "waiting_input" then
+	if ev.new == "working" then
+		manual_interrupt[ev.pane] = nil
+		clear_waiting(ev.pane)
+	elseif ev.new ~= "waiting_input" and not string.find(notified_waiting[ev.pane] or "", "^fault:") then
 		clear_waiting(ev.pane)
 	end
 	local w = pending_waits[ev.pane]
@@ -863,13 +990,18 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 			unsolicited_working[ev.pane] = true
 			reported_in_turn[ev.pane] = false
 		end
-	elseif ev.new == "idle" and queued_callbacks[ev.pane] ~= nil and queued_dispatches[ev.pane] == nil then
+	elseif ev.old == "working" and ev.new == "idle" and owner_of_pane(cx, ev.pane) ~= nil then
+		settle_stalled_fault(cx, ev.pane)
+	end
+	if ev.new == "idle" and queued_callbacks[ev.pane] ~= nil and queued_dispatches[ev.pane] == nil then
 		flush_queued_callbacks(cx, ev.pane)
 	end
 end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
-	clear_waiting(ev.pane)
+	if ev.result == "done" then
+		clear_waiting(ev.pane)
+	end
 	-- 1. If this pane is an owner with pending wingman callbacks, flush them as soon as its turn finishes cleanly
 	if queued_callbacks[ev.pane] ~= nil and ev.result == "done" and queued_dispatches[ev.pane] == nil then
 		flush_queued_callbacks(cx, ev.pane)
@@ -887,6 +1019,20 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 
 	-- 3. If the completed turn was an async/unsolicited turn, push its completion to `owner` FIRST (before promoting next queued item!)
 	local was_unsolicited = unsolicited_working[ev.pane] == true
+	if (ev.result == "failed" or ev.result == "exited") and not manual_interrupt[ev.pane] and owner_of_pane(cx, ev.pane) ~= nil then
+		-- Failed/exited turns (including across plugin reload) report the native error surface + retry hint once TSP settles.
+		unsolicited_working[ev.pane] = false
+		reported_in_turn[ev.pane] = false
+		was_unsolicited = false
+		local failed_pane = ev.pane
+		local failed_res = ev.result
+		tern.timer(150, function(later_cx: WindowCx?)
+			local lcx = later_cx or cx
+			if not manual_interrupt[failed_pane] then
+				deliver_fault_if_needed(lcx, failed_pane, "Agent turn ended with " .. failed_res)
+			end
+		end)
+	end
 	if was_unsolicited then
 		unsolicited_working[ev.pane] = false
 		local already_reported = reported_in_turn[ev.pane] == true
@@ -1211,6 +1357,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = "refusing to interrupt anchor_pane (caller agent itself)" }, false)
 			return
 		end
+		manual_interrupt[tp] = true
+		unsolicited_working[tp] = false
 		local ok_i, err_i = pcall(function()
 			cx.agents:interrupt(tp)
 		end)
@@ -1270,6 +1418,44 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		end
 		local rem = if queued_dispatches[tp] then #queued_dispatches[tp] else 0
 		send_mux(cid, { ok = true, pane = tp, cancelled = cancelled, remaining = rem }, false)
+		return
+	end
+
+	if op == "retry" then
+		local tp = tonumber(req.target_pane) :: number
+		if anchor and tp == anchor then
+			send_mux(cid, { ok = false, error = "refusing to retry anchor_pane (caller agent itself)" }, false)
+			return
+		end
+		local ainfo = find_agent_info(cx, tp)
+		if ainfo and (ainfo.state == "working" or ainfo.state == "waiting_input") then
+			send_mux(cid, { ok = false, pane = tp, state = ainfo.state, error = "target pane is " .. ainfo.state .. " (not idle/failed)" }, false)
+			return
+		end
+		local ok_r, err_r = pcall(function()
+			cx.agents:ask(tp, "/retry")
+		end)
+		if not ok_r then
+			send_mux(cid, { ok = false, pane = tp, error = "cx.agents:ask /retry failed: " .. tostring(err_r) }, false)
+			return
+		end
+		clear_waiting(tp)
+		manual_interrupt[tp] = nil
+		if anchor then
+			bind_wingman(anchor, tp)
+		end
+		if req.async_callback == true then
+			if anchor and owner_auto_callback[anchor] == false then
+				owner_auto_callback[anchor] = true
+				save_callback_cfg()
+			end
+			unsolicited_working[tp] = true
+			reported_in_turn[tp] = false
+			send_mux(cid, { ok = true, async_callback = true, pane = tp, retried = true }, false)
+		else
+			send_mux(cid, { _ack = true, pane = tp }, true)
+			register_waiter(tp, cid, nil)
+		end
 		return
 	end
 

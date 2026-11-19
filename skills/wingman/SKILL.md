@@ -31,6 +31,9 @@ python3 "$WINGMAN_PY" send <new|same|sessionId> \
 python3 "$WINGMAN_PY" transcript --last 6
 python3 "$WINGMAN_PY" peek [latest|sessionId] --cwd /path/to/project
 
+# Retry a worker turn that failed/aborted (`F5 to retry`) via native `/retry`; --async for ACP callers, --wait for shells (auto)
+python3 "$WINGMAN_PY" retry --pane <id> [--async | --wait] [--max-time 30m]
+
 # Answer a worker blocked on `ask`/approval (`waiting_input`) via native TSP
 python3 "$WINGMAN_PY" surface --pane <id> [--json] [--all] [--root <nodeId>]
 # 1) Pick option(s) & submit (`pick:<fieldIdx>:<optIdx>` works even on folded fields; toggles checkboxes):
@@ -56,6 +59,7 @@ python3 "$WINGMAN_PY" stop
 ## Notes
 
 - **`waiting_input` escalation**: when a bound `omp` worker hits an `ask` card/approval/hook prompt, the supervisor receives `[Wingman waiting_input · pane <id>]` with the card text, its TSP node ids, and usage hints (deduped per card). `send` to a `waiting_input` pane is refused; inspect with `surface`, answer or cancel with `event` (auto-callback re-arms for the resumed turn unless `--no-rearm`). Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.
+- **Fault escalation**: when a bound worker's turn fails (API/SSE error) or aborts mid-stream (`F5 to retry`, e.g. `Streaming edit preview failed`), the supervisor receives `[Wingman fault · retryable · pane <id>]` with the exact error/abort text (deduped per fault). Run `retry --pane <id>` for transient stream/network/edit-preview glitches (at most 2-3 times); consult the user on persistent quota/auth/config errors.
 - Calling `send same` while the wingman pane is `working` natively queues the prompt inside Tern's `window.luau` and promotes it automatically on `agent_finished` (pass `--no-queue` to fail fast instead).
 - **ACP UI Sync & Bidirectional Push (`--async` default for ACP callers)**:
   - When called from a Tern ACP pane (`agy`, `claude`, `codex`), `send` automatically returns immediately after dispatching/queueing (`async ACP callback` mode; pass `--wait` only to force blocking stdout wait). When `omp` finishes, `window.luau` submits `[Wingman auto-callback · pane <id>]` directly into the supervisor's composer via `cx.agents:ask` (`session/prompt`), keeping Tern's live chat UI 100% synchronized instead of running inside an unrendered background bash wakeup.

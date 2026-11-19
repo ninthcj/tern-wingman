@@ -1122,6 +1122,43 @@ def cmd_event(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+def cmd_retry(args: argparse.Namespace) -> None:
+    """Retry a failed/aborted worker turn via native `/retry` (`cx.agents:ask`, identical to F5)."""
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `retry` requires running inside Tern")
+    args.pane = args.pane_flag or args.pane
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    use_async = args.delivery == "async"
+    if args.delivery == "auto":
+        status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
+        use_async = is_caller_acp_agent(status, inspect_tern(find_tern_bin()), my_pane)
+    req = {"op": "retry", "anchor_pane": my_pane, "target_pane": pane, "async_callback": use_async}
+    try:
+        reply = call_bridge(
+            req,
+            timeout=DEFAULT_BRIDGE_TIMEOUT if use_async else parse_duration_seconds(args.max_time),
+            on_ack=lambda f: print(f"[wingman] Native /retry -> pane {f['pane']}", file=sys.stderr, flush=True),
+        )
+    except TimeoutError:
+        print(f"[wingman] Timed out after {args.max_time} waiting for retried turn.", file=sys.stderr)
+        raise SystemExit(124)
+    if not reply.get("ok"):
+        st = reply.get("status") or reply.get("state") or "failed"
+        print(f"[wingman] Retry on pane {pane} ended with status={st}: {reply.get('error') or st}", file=sys.stderr)
+        if reply.get("last_message"):
+            print(reply["last_message"])
+        raise SystemExit(2 if st == "waiting_input" else 1)
+    if reply.get("async_callback"):
+        print(
+            f"[wingman] Sent native /retry to pane {pane} (async ACP callback armed). "
+            "Do NOT poll or sleep; end your turn now and wait for the callback."
+        )
+        raise SystemExit(0)
+    if reply.get("last_message"):
+        print(reply["last_message"])
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Push a report/progress/question from a wingman pane back up to its bound supervisor (`boundOwner`)."""
     my_pane = current_tern_pane()
@@ -1365,6 +1402,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--no-rearm", action="store_true", help="Do not re-arm auto-callback for the resumed worker turn")
     p_ev.add_argument("events", nargs="+", help="JSON event object(s), e.g. '{\"ev\":\"action\",\"id\":\"n1\",\"act\":\"submit\"}'")
     p_ev.set_defaults(func=cmd_event)
+
+    p_retry = sub.add_parser("retry", help="Retry a failed/aborted worker turn via native `/retry` (same as F5)")
+    p_retry.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    p_retry.add_argument("--pane", dest="pane_flag", help="Agent pane id (alternative to positional)")
+    p_retry.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    p_retry.add_argument("--max-time", help="Optional max wait in --wait mode (e.g. 30m)")
+    retry_grp = p_retry.add_mutually_exclusive_group()
+    retry_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately; result arrives via auto-callback (default for Tern ACP callers)")
+    retry_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block until the retried turn finishes (default for shell callers)")
+    p_retry.set_defaults(func=cmd_retry)
 
     p_peek = sub.add_parser("peek", help="O(1) .jsonl tail seek for granular mid-turn tool calls")
     p_peek.add_argument("session", nargs="?", default="latest")

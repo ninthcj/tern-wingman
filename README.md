@@ -106,6 +106,8 @@ python3 skills/wingman/scripts/wingman.py transcript --last 6
 # Worker blocked on ask/approval (waiting_input): inspect the card, then answer via TSP events
 python3 skills/wingman/scripts/wingman.py surface --pane <id> [--json]
 python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id":"<id>","act":"pick:0:0"}' '{"ev":"action","id":"<submit_id>","act":"submit"}'
+# Worker turn failed/aborted (supervisor gets `[Wingman fault · retryable · pane <id>]`): native `/retry`, same as F5
+python3 skills/wingman/scripts/wingman.py retry --pane <id>
 
 # Float to PiP, dock back into split, interrupt Ctrl-C, cancel queued prompts, or close worker
 python3 skills/wingman/scripts/wingman.py pip --corner br
