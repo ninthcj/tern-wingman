@@ -26,6 +26,7 @@ end
 local ipc_dir = resolve_ipc_dir()
 local KV_BINDINGS = "bindings_v1"
 local KV_CALLBACK_CFG = "auto_callback_v1"
+local KV_WAITING = "notified_waiting_v1"
 
 type WaitEntry = {
 	cids: { number },
@@ -55,6 +56,8 @@ local queued_callbacks: { [number]: { string } } = {}
 local unsolicited_working: { [number]: boolean } = {}
 -- Tracks whether a wingman pane already called `report` (`kind ~= "progress"`) during the current turn
 local reported_in_turn: { [number]: boolean } = {}
+-- Dedup key of the last `waiting_input` escalation pushed to the owner, per wingman pane (persisted)
+local notified_waiting: { [number]: string } = {}
 
 -- Auto-callback policy (default ON; supports global default + per-owner overrides)
 local default_auto_callback = true
@@ -123,6 +126,35 @@ local function load_callback_cfg()
 	end
 end
 
+local function save_waiting()
+	local ser: { [string]: string } = {}
+	for pid, key in pairs(notified_waiting) do
+		ser[tostring(pid)] = key
+	end
+	pcall(function()
+		tern.kv.set(KV_WAITING, if next(ser) ~= nil then ser else nil)
+	end)
+end
+
+local function load_waiting()
+	local ok, raw = pcall(tern.kv.get, KV_WAITING)
+	if ok and type(raw) == "table" then
+		for k, v in pairs(raw) do
+			local pid = tonumber(k)
+			if pid and type(v) == "string" then
+				notified_waiting[pid] = v
+			end
+		end
+	end
+end
+
+local function clear_waiting(pane_id: number)
+	if notified_waiting[pane_id] ~= nil then
+		notified_waiting[pane_id] = nil
+		save_waiting()
+	end
+end
+
 local function is_auto_callback_enabled(owner_pane: number?): boolean
 	if owner_pane ~= nil and owner_auto_callback[owner_pane] ~= nil then
 		return owner_auto_callback[owner_pane] :: boolean
@@ -150,6 +182,16 @@ local function prune_bindings(cx: WindowCx)
 	end
 	if cb_dirty then
 		save_callback_cfg()
+	end
+	local w_dirty = false
+	for pid, _ in pairs(notified_waiting) do
+		if cx.session:pane(pid) == nil then
+			notified_waiting[pid] = nil
+			w_dirty = true
+		end
+	end
+	if w_dirty then
+		save_waiting()
 	end
 end
 
@@ -328,6 +370,193 @@ local function deliver_to_owner(
 	return false, true, #existing_q
 end
 
+local INTERACTIVE_ROLES = {
+	["omp.ask.card"] = true,
+	["omp.editor.ask.approval"] = true,
+	["omp.overlay.hook-input"] = true,
+	["omp.overlay.hook-select"] = true,
+}
+local WIRE_KINDS = { button = true, list = true, input = true, editor = true, el = true }
+
+local function walk_nodes(node: any, depth: number, visit: (any) -> boolean): boolean
+	if type(node) ~= "table" or depth > 16 then
+		return false
+	end
+	if visit(node) then
+		return true
+	end
+	local children = node.c
+	if type(children) == "table" then
+		for _, child in ipairs(children) do
+			if type(child) == "table" and walk_nodes(child, depth + 1, visit) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function find_interactive_root(tree: any): (string?, string?)
+	if type(tree) ~= "table" then
+		return nil, nil
+	end
+	local found_id: string?, found_role: string? = nil, nil
+	local function visit(n: any): boolean
+		local p = n.p
+		if type(p) == "table" and INTERACTIVE_ROLES[p.role] and n.id ~= nil then
+			found_id, found_role = tostring(n.id), p.role
+			return true
+		end
+		return false
+	end
+	for _, key in ipairs({ "layer", "main", "dock" }) do
+		if walk_nodes(tree[key], 0, visit) then
+			break
+		end
+	end
+	return found_id, found_role
+end
+
+local function spans_to_text(v: any): string
+	if type(v) == "string" then
+		return v
+	elseif type(v) == "table" then
+		if type(v.t) == "string" then
+			return v.t
+		end
+		local buf: { string } = {}
+		for _, item in ipairs(v) do
+			if type(item) == "string" then
+				table.insert(buf, item)
+			elseif type(item) == "table" and type(item.t) == "string" then
+				table.insert(buf, item.t)
+			end
+		end
+		return table.concat(buf, "")
+	end
+	return ""
+end
+
+local function format_tsp_subtree(node: any, indent: string, out: { string }, depth: number)
+	if type(node) ~= "table" or depth > 16 or #out >= 400 then
+		return
+	end
+	local id = if node.id ~= nil then tostring(node.id) else "-"
+	local kind = if node.k ~= nil then tostring(node.k) else "node"
+	local p = node.p
+	local tags: { string } = {}
+	local text_parts: { string } = {}
+	if type(p) == "table" then
+		if p.tone == "accent" or p.on == true or p.icon == "check" then
+			table.insert(tags, "selected")
+		end
+		if type(p.actions) == "table" and type(p.actions.click) == "string" then
+			table.insert(tags, "click=" .. p.actions.click)
+		end
+		for _, field in ipairs({ "text", "spans", "label", "detail", "value" }) do
+			local s = spans_to_text(p[field])
+			if s ~= "" then
+				table.insert(text_parts, s)
+			end
+		end
+	end
+	local meta = if #tags > 0 then " [" .. table.concat(tags, ", ") .. "]" else ""
+	local content = if #text_parts > 0 then ": " .. table.concat(text_parts, " — ") else ""
+	table.insert(out, string.format("%s%s %s%s%s", indent, id, kind, meta, content))
+	local children = node.c
+	if type(children) == "table" then
+		for _, child in ipairs(children) do
+			format_tsp_subtree(child, indent .. "  ", out, depth + 1)
+		end
+	end
+end
+
+local function find_node_by_id(tree: any, target_id: string): any
+	local hit: any = nil
+	for _, key in ipairs({ "layer", "main", "dock" }) do
+		if walk_nodes(tree[key], 0, function(n: any): boolean
+			if n.id ~= nil and tostring(n.id) == target_id then
+				hit = n
+				return true
+			end
+			return false
+		end) then
+			break
+		end
+	end
+	return hit
+end
+
+local function build_waiting_summary(cx: WindowCx, pane_id: number): (string, string)
+	local ok_tree, tree = pcall(function()
+		return cx.session:surface(pane_id, { as = "table", nodes = 1500 })
+	end)
+	local root_id, role = nil, nil
+	local surface_text = ""
+	if ok_tree and type(tree) == "table" then
+		root_id, role = find_interactive_root(tree)
+		local target_node = if root_id ~= nil then find_node_by_id(tree, root_id) else nil
+		if target_node ~= nil then
+			local lines: { string } = {}
+			format_tsp_subtree(target_node, "", lines, 0)
+			surface_text = table.concat(lines, "\n")
+		end
+	end
+	if surface_text == "" then
+		local ok_txt, txt = pcall(function()
+			return cx.session:surface(pane_id, { as = "text", root = root_id, max_chars = 12000 })
+		end)
+		surface_text = if ok_txt and txt ~= nil then tostring(txt) else "(surface unavailable)"
+	end
+	local parts: { string } = {}
+	local ok_tr, msgs = pcall(function()
+		return cx.agents:transcript(pane_id, { last = 2 })
+	end)
+	if ok_tr and type(msgs) == "table" then
+		for i = #msgs, 1, -1 do
+			local m = msgs[i]
+			if m.role == "assistant" then
+				if type(m.text) == "string" and m.text ~= "" and not string.find(surface_text, m.text, 1, true) then
+					table.insert(parts, "Last assistant message:\n" .. string.sub(m.text, 1, 1000))
+				end
+				if type(m.tools) == "table" and #m.tools > 0 then
+					table.insert(parts, "Tool call metadata:\n" .. string.sub(tern.json.encode(m.tools), 1, 4000))
+				end
+				break
+			end
+		end
+	end
+	table.insert(parts, string.format("Interactive surface (%s · root %s):\n%s", tostring(role or "unknown"), tostring(root_id or "-"), surface_text))
+	table.insert(parts, string.format(
+		"Inspect: `wingman.py surface --pane %d [--json]`. Answer: `wingman.py event --pane %d '<json-event>' ...` "
+			.. "(e.g. '{\"ev\":\"action\",\"id\":\"<root_id>\",\"act\":\"pick:0:0\"}' '{\"ev\":\"action\",\"id\":\"<submit_id>\",\"act\":\"submit\"}'). "
+			.. "Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.",
+		pane_id, pane_id
+	))
+	return tostring(role or "waiting") .. ":" .. tostring(root_id or "root"), table.concat(parts, "\n\n")
+end
+
+local function notify_waiting_input(cx: WindowCx, worker_pane: number)
+	tern.timer(120, function(later_cx: WindowCx?)
+		local lcx = later_cx or cx
+		local ainfo = find_agent_info(lcx, worker_pane)
+		if not ainfo or ainfo.state ~= "waiting_input" or pending_waits[worker_pane] ~= nil then
+			return
+		end
+		local owner = owner_of_pane(lcx, worker_pane)
+		if owner == nil or not is_auto_callback_enabled(owner) then
+			return
+		end
+		local key, body = build_waiting_summary(lcx, worker_pane)
+		if notified_waiting[worker_pane] == key then
+			return
+		end
+		notified_waiting[worker_pane] = key
+		save_waiting()
+		deliver_to_owner(lcx, owner, worker_pane, "waiting_input", body)
+	end)
+end
+
 local function promote_next_queued(cx: WindowCx, pane_id: number)
 	local q = queued_dispatches[pane_id]
 	if not q or #q == 0 then
@@ -393,7 +622,9 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 	local last_msg, transcript = collect_turn_output(cx, pane_id)
 	if #w.cids == 0 then
 		local owner = owner_of_pane(cx, pane_id)
-		if owner ~= nil then
+		if status == "waiting_input" then
+			notify_waiting_input(cx, pane_id)
+		elseif owner ~= nil then
 			local body = err_msg or last_msg or ("(Wingman turn ended with " .. status .. ")")
 			deliver_to_owner(cx, owner, pane_id, "auto-callback · " .. status, body)
 		end
@@ -580,11 +811,16 @@ local function seed_inflight_unsolicited_turns(cx: WindowCx)
 			if owner_of_pane(cx, a.pane) ~= nil then
 				unsolicited_working[a.pane] = true
 			end
+		elseif a.state == "waiting_input" and pending_waits[a.pane] == nil and owner_of_pane(cx, a.pane) ~= nil then
+			notify_waiting_input(cx, a.pane)
 		end
 	end
 end
 
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
+	if ev.new ~= "waiting_input" then
+		clear_waiting(ev.pane)
+	end
 	local w = pending_waits[ev.pane]
 	if w then
 		if w.pending_prompt ~= nil then
@@ -614,7 +850,13 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 	end
 
 	-- Track unsolicited turns on bound wingman panes (e.g. omp background job starting a new turn)
-	if ev.new == "working" and ev.old ~= "working" and queued_dispatches[ev.pane] == nil then
+	if ev.new == "waiting_input" then
+		if owner_of_pane(cx, ev.pane) ~= nil then
+			notify_waiting_input(cx, ev.pane)
+		end
+	elseif ev.old == "waiting_input" and ev.new == "working" and owner_of_pane(cx, ev.pane) ~= nil then
+		unsolicited_working[ev.pane] = true
+	elseif ev.new == "working" and ev.old ~= "working" and queued_dispatches[ev.pane] == nil then
 		if owner_of_pane(cx, ev.pane) ~= nil then
 			unsolicited_working[ev.pane] = true
 			reported_in_turn[ev.pane] = false
@@ -625,6 +867,7 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
+	clear_waiting(ev.pane)
 	-- 1. If this pane is an owner with pending wingman callbacks, flush them as soon as its turn finishes cleanly
 	if queued_callbacks[ev.pane] ~= nil and ev.result == "done" and queued_dispatches[ev.pane] == nil then
 		flush_queued_callbacks(cx, ev.pane)
@@ -709,6 +952,7 @@ end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	unbind_pane(ev.pane)
+	clear_waiting(ev.pane)
 	unsolicited_working[ev.pane] = nil
 	reported_in_turn[ev.pane] = nil
 	queued_callbacks[ev.pane] = nil
@@ -1034,6 +1278,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			return
 		end
 		unbind_pane(tp)
+		clear_waiting(tp)
 		unsolicited_working[tp] = nil
 		reported_in_turn[tp] = nil
 		local ok_s, err_s = pcall(function()
@@ -1053,6 +1298,100 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		else
 			send_mux(cid, { ok = true, messages = tern.json.array(msgs) }, false)
 		end
+		return
+	end
+
+	if op == "surface" then
+		local tp = tonumber(req.target_pane) :: number
+		local root: any = if req.root ~= tern.json.null then req.root else nil
+		local auto_root = req.auto_root == true
+		local want_as = req.as or "text"
+		local i_root, i_role = nil, nil
+		local ok_tree, tree = pcall(function()
+			return cx.session:surface(tp, {
+				as = "table",
+				root = if not auto_root then root else nil,
+				depth = req.depth,
+				nodes = req.nodes or 1500,
+			})
+		end)
+		if not ok_tree then
+			send_mux(cid, { ok = false, pane = tp, error = tostring(tree) }, false)
+			return
+		end
+		if auto_root and type(tree) == "table" then
+			i_root, i_role = find_interactive_root(tree)
+			if root == nil then
+				root = i_root
+			end
+		end
+		if want_as == "table" then
+			local out_tree = tree
+			if root ~= nil and type(tree) == "table" then
+				local sub = find_node_by_id(tree, tostring(root))
+				if sub ~= nil then
+					out_tree = sub
+				end
+			end
+			send_mux(cid, { ok = true, pane = tp, root = root, interactive_root = i_root, interactive_role = i_role, surface = out_tree }, false)
+			return
+		end
+		local lines: { string } = {}
+		if type(tree) == "table" then
+			if root ~= nil then
+				local sub = find_node_by_id(tree, tostring(root))
+				if sub ~= nil then
+					format_tsp_subtree(sub, "", lines, 0)
+				end
+			else
+				for _, region in ipairs({ "layer", "main", "dock" }) do
+					if type(tree[region]) == "table" then
+						format_tsp_subtree(tree[region], "", lines, 0)
+					end
+				end
+			end
+		end
+		send_mux(cid, {
+			ok = true,
+			pane = tp,
+			root = root,
+			interactive_root = i_root,
+			interactive_role = i_role,
+			surface = table.concat(lines, "\n"),
+		}, false)
+		return
+	end
+
+	if op == "event" then
+		local tp = tonumber(req.target_pane)
+		if not tp or (anchor and tp == anchor) then
+			send_mux(cid, { ok = false, error = "invalid target_pane for event (refusing caller's own pane)" }, false)
+			return
+		end
+		local events: any = if type(req.events) == "table" then req.events elseif type(req.ev) == "table" then { req.ev } else {}
+		local results = {}
+		local all_ok = #events > 0
+		for i, ev in ipairs(events) do
+			local ok_e, res_e = pcall(function()
+				return cx.session:event(tp :: number, ev)
+			end)
+			all_ok = all_ok and ok_e
+			table.insert(results, { index = i, ok = ok_e, error = if ok_e then nil else tostring(res_e), result = if ok_e then res_e else nil })
+		end
+		if req.rearm ~= false then
+			clear_waiting(tp)
+			if anchor then
+				bind_wingman(anchor, tp)
+			end
+			unsolicited_working[tp] = true
+			reported_in_turn[tp] = false
+		end
+		send_mux(cid, {
+			ok = all_ok,
+			pane = tp,
+			error = if #events == 0 then "no events given" else nil,
+			results = tern.json.array(results),
+		}, false)
 		return
 	end
 
@@ -1133,6 +1472,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			unbind_pane(target_pane)
 			unsolicited_working[target_pane] = nil
 			reported_in_turn[target_pane] = nil
+			clear_waiting(target_pane :: number)
 			pcall(function()
 				cx.agents:stop(target_pane :: number)
 			end)
@@ -1143,6 +1483,15 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 
 		if target_pane then
 			local ainfo = find_agent_info(cx, target_pane)
+			if ainfo and ainfo.state == "waiting_input" then
+				send_mux(cid, {
+					ok = false,
+					status = "waiting_input",
+					pane = target_pane,
+					error = "target wingman pane is waiting_input; inspect via `wingman.py surface` and answer/cancel via `wingman.py event` instead of `send`",
+				}, false)
+				return
+			end
 			if ainfo and ainfo.state == "working" then
 				if req.queue == false then
 					send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
@@ -1361,6 +1710,7 @@ local function start(cx: WindowCx?)
 		started = true
 		load_bindings()
 		load_callback_cfg()
+		load_waiting()
 		ensure_mux()
 	end
 	if cx then

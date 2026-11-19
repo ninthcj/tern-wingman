@@ -131,6 +131,60 @@ class WingmanTests(unittest.TestCase):
         self.assertEqual(ns_cb.mode, "off")
         self.assertTrue(ns_cb.global_scope)
 
+    def test_surface_cli_builds_auto_root_request(self) -> None:
+        from unittest import mock
+
+        parser = wingman.build_parser()
+        calls: list[dict] = []
+
+        def fake_bridge(req, timeout=None):
+            calls.append(req)
+            return {"ok": True, "root": "n7", "interactive_role": "omp.ask.card", "surface": "Pick one"}
+
+        with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(wingman, "call_bridge", fake_bridge):
+            with mock.patch("sys.stdout"):
+                ns = parser.parse_args(["surface", "--pane", "200"])
+                ns.func(ns)
+                ns = parser.parse_args(["surface", "200", "--all", "--json", "--root", "x1"])
+                ns.func(ns)
+        self.assertEqual(calls[0], {"op": "surface", "anchor_pane": 100, "target_pane": 200, "as": "text", "auto_root": True})
+        self.assertEqual(calls[1]["as"], "table")
+        self.assertFalse(calls[1]["auto_root"])
+        self.assertEqual(calls[1]["root"], "x1")
+        with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), self.assertRaises(SystemExit):
+            ns = parser.parse_args(["surface", "100"])
+            ns.func(ns)
+
+    def test_event_cli_parses_events_and_rearm(self) -> None:
+        from unittest import mock
+
+        parser = wingman.build_parser()
+        calls: list[dict] = []
+        replies = [{"ok": True, "results": []}, {"ok": False, "error": "boom"}]
+
+        def fake_bridge(req, timeout=None):
+            calls.append(req)
+            return replies[len(calls) - 1]
+
+        a = '{"ev":"action","id":"n1","act":"pick:0:0"}'
+        b = '{"ev":"action","id":"n2","act":"submit"}'
+        with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(wingman, "call_bridge", fake_bridge):
+            with mock.patch("sys.stdout"):
+                ns = parser.parse_args(["event", "--pane", "200", a, b])
+                ns.func(ns)
+                ns = parser.parse_args(["event", "--pane", "200", "--no-rearm", b])
+                with self.assertRaises(SystemExit):
+                    ns.func(ns)
+            with self.assertRaises(SystemExit):
+                ns = parser.parse_args(["event", "--pane", "200", "not-json"])
+                ns.func(ns)
+        self.assertEqual(calls[0]["op"], "event")
+        self.assertEqual(calls[0]["target_pane"], 200)
+        self.assertEqual(calls[0]["events"], [json.loads(a), json.loads(b)])
+        self.assertTrue(calls[0]["rearm"])
+        self.assertFalse(calls[1]["rearm"])
+        self.assertEqual(len(calls), 2)
+
     def test_select_owner_pane_from_status_reverse_lookup(self) -> None:
         # 1. Explicit `owner_pane` from bindings_v1 works even across ovnfs checkouts & multiple agents in tab
         status_bound = {

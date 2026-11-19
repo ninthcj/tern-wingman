@@ -31,6 +31,10 @@ python3 "$WINGMAN_PY" send <new|same|sessionId> \
 python3 "$WINGMAN_PY" transcript --last 6
 python3 "$WINGMAN_PY" peek [latest|sessionId] --cwd /path/to/project
 
+# Answer a worker blocked on `ask`/approval (`waiting_input`) via native TSP
+python3 "$WINGMAN_PY" surface --pane <id> [--json] [--all] [--root <nodeId>]
+python3 "$WINGMAN_PY" event --pane <id> '{"ev":"action","id":"<id>","act":"pick:0:0"}' '{"ev":"action","id":"<submit_id>","act":"submit"}'
+
 # Layout, bidirectional reporting & lifecycle controls
 python3 "$WINGMAN_PY" report --prompt "Summary or question for bound supervisor" [--kind final|progress|question]
 python3 "$WINGMAN_PY" callback [status|on|off|reset] [--global]
@@ -43,7 +47,7 @@ python3 "$WINGMAN_PY" stop
 
 ## Notes
 
-- Interactive `ask` calls inside `omp` pause the turn with `waiting_input` (exit code `2`) until answered by the user.
+- **`waiting_input` escalation**: when a bound `omp` worker hits an `ask` card/approval/hook prompt, the supervisor receives `[Wingman waiting_input · pane <id>]` with the card text, its TSP node ids, and usage hints (deduped per card). `send` to a `waiting_input` pane is refused; inspect with `surface`, answer or cancel with `event` (auto-callback re-arms for the resumed turn unless `--no-rearm`). Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.
 - Calling `send same` while the wingman pane is `working` natively queues the prompt inside Tern's `window.luau` and promotes it automatically on `agent_finished` (pass `--no-queue` to fail fast instead).
 - **ACP UI Sync & Bidirectional Push (`--async` default for ACP callers)**:
   - When called from a Tern ACP pane (`agy`, `claude`, `codex`), `send` automatically returns immediately after dispatching/queueing (`async ACP callback` mode; pass `--wait` only to force blocking stdout wait). When `omp` finishes, `window.luau` submits `[Wingman auto-callback · pane <id>]` directly into the supervisor's composer via `cx.agents:ask` (`session/prompt`), keeping Tern's live chat UI 100% synchronized instead of running inside an unrendered background bash wakeup.

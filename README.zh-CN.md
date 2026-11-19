@@ -58,6 +58,9 @@ python3 skills/wingman/scripts/wingman.py send new \
 
 # 直接从 Tern 内存读取结构化消息与工具卡片
 python3 skills/wingman/scripts/wingman.py transcript --last 6
+# 僚机卡在 ask/审批（waiting_input）：主控会自动收到卡片内容与节点 id；查看并通过 TSP 事件作答
+python3 skills/wingman/scripts/wingman.py surface --pane <id> [--json]
+python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id":"<id>","act":"pick:0:0"}' '{"ev":"action","id":"<submit_id>","act":"submit"}'
 
 # 画中画悬浮 / 贴回分屏 / 中断当前回合 / 撤回排队任务 / 关闭分屏
 python3 skills/wingman/scripts/wingman.py pip --corner br

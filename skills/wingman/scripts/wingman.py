@@ -1072,6 +1072,56 @@ def cmd_stop(args: argparse.Namespace) -> None:
     print(json.dumps({"pane": pane, "stopped": True}, indent=2))
 
 
+def cmd_surface(args: argparse.Namespace) -> None:
+    """Read a worker pane's TSP surface (`cx.session:surface`), auto-scoped to an interactive ask/approval node."""
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `surface` requires running inside Tern")
+    args.pane = args.pane or args.pane_flag
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    req: dict[str, Any] = {
+        "op": "surface",
+        "anchor_pane": my_pane,
+        "target_pane": pane,
+        "as": "table" if args.json else "text",
+        "auto_root": not args.all,
+    }
+    if args.root:
+        req["root"] = args.root
+    reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT)
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    if args.json:
+        print(json.dumps(reply, ensure_ascii=False, indent=2))
+        return
+    print(f"[pane {pane} · root {reply.get('root') or '-'} · role {reply.get('interactive_role') or '-'}]")
+    print(reply.get("surface") or "")
+
+
+def cmd_event(args: argparse.Namespace) -> None:
+    """Deliver 1+ TSP events (`cx.session:event`) to a worker pane, e.g. to answer an `ask` card."""
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `event` requires running inside Tern")
+    events: list[Any] = []
+    for raw in args.events:
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"error: invalid event JSON {raw!r}: {exc}") from exc
+        if not isinstance(ev, dict):
+            raise SystemExit(f"error: event must be a JSON object: {raw!r}")
+        events.append(ev)
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "event", "anchor_pane": my_pane, "target_pane": pane, "events": events, "rearm": not args.no_rearm},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
+    print(json.dumps(reply, ensure_ascii=False, indent=2))
+    if not reply.get("ok"):
+        raise SystemExit(1)
+
+
 def cmd_report(args: argparse.Namespace) -> None:
     """Push a report/progress/question from a wingman pane back up to its bound supervisor (`boundOwner`)."""
     my_pane = current_tern_pane()
@@ -1299,6 +1349,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_stop.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
     p_stop.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
     p_stop.set_defaults(func=cmd_stop)
+
+    p_surf = sub.add_parser("surface", help="Inspect worker TSP surface (auto-scoped to pending ask/approval card)")
+    p_surf.add_argument("pane", nargs="?", help="Agent pane id (defaults to caller's bound wingman)")
+    p_surf.add_argument("--pane", dest="pane_flag", help="Agent pane id (alternative to positional)")
+    p_surf.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    p_surf.add_argument("--root", help="Explicit TSP node id to scope to")
+    p_surf.add_argument("--all", action="store_true", help="Whole surface instead of auto-scoping to the interactive node")
+    p_surf.add_argument("--json", action="store_true", help="Return structured node table instead of text")
+    p_surf.set_defaults(func=cmd_surface)
+
+    p_ev = sub.add_parser("event", help="Send TSP events to worker pane (answer/cancel ask cards) via `cx.session:event`")
+    p_ev.add_argument("--pane", help="Agent pane id (defaults to caller's bound wingman)")
+    p_ev.add_argument("--cwd", help="Optional workspace directory to disambiguate unbound worker pane")
+    p_ev.add_argument("--no-rearm", action="store_true", help="Do not re-arm auto-callback for the resumed worker turn")
+    p_ev.add_argument("events", nargs="+", help="JSON event object(s), e.g. '{\"ev\":\"action\",\"id\":\"n1\",\"act\":\"submit\"}'")
+    p_ev.set_defaults(func=cmd_event)
 
     p_peek = sub.add_parser("peek", help="O(1) .jsonl tail seek for granular mid-turn tool calls")
     p_peek.add_argument("session", nargs="?", default="latest")

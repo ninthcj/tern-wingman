@@ -1,6 +1,6 @@
 schema = 1
 id = "wingman"
 name = "Wingman"
-version = "0.3.0"
+version = "0.4.0"
 description = "Bidirectional WindowCx.agents TSP bridge letting supervisor agents (agy, claude) spawn, steer, PiP-float, and receive async callbacks from side-pane omp workers."
 window = "window.luau"
