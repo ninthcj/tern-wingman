@@ -1014,6 +1014,8 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         fixture = (ROOT_DIR / "tests" / "ownership_fixture.luau").read_text(encoding="utf-8")
         window = (ROOT_DIR / "window.luau").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmp:
+            for module in ("state.luau", "tsp.luau"):
+                shutil.copy(ROOT_DIR / module, Path(tmp) / module)
             script = Path(tmp) / "ownership_fixture_run.luau"
             script.write_text(fixture.replace("-- @WINDOW_PLUGIN@", window), encoding="utf-8")
             proc = subprocess.run([luau, str(script)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)

@@ -1,6 +1,9 @@
 --!strict
 -- Wingman: Bidirectional event-driven WindowCx.agents TSP bridge & ownership graph for coding agents in Tern.
 
+local tsp = require("./tsp")
+local ownership = require("./state")
+
 local is_windows = (tern.runtime.os == "windows")
 local SEP = if is_windows then "\\" else "/"
 local runtime_dir = tern.getenv("XDG_RUNTIME_DIR")
@@ -24,10 +27,6 @@ local function resolve_ipc_dir(): string
 end
 
 local ipc_dir = resolve_ipc_dir()
-local KV_OWNERS = "owners_v1"
-local KV_LEGACY_BINDINGS = "bindings_v1"
-local KV_CALLBACK_CFG = "auto_callback_v1"
-local KV_WAITING = "notified_waiting_v1"
 
 -- Live panel (radar.luau): optional UI over this control plane. A load error must never take the plugin down.
 local radar_loaded, radar = pcall(function()
@@ -44,6 +43,8 @@ local function notify_radar()
 	end
 end
 
+local state = ownership.new({ kv = tern.kv, log = tern.log, notify = notify_radar })
+
 type WaitEntry = {
 	cids: { number },
 	started_ms: number,
@@ -57,20 +58,6 @@ type QueuedDispatch = {
 	prompt: string,
 }
 
--- Each worker has one owner; an owner can supervise any number of workers.
-local owners: { [number]: number } = {}
-
-local function ownership_cycle(anchor: number, worker: number): string?
-	local ancestor: number? = anchor
-	while ancestor ~= nil do
-		if ancestor == worker then
-			return string.format("refusing to bind pane %d to pane %d: ownership cycle", worker, anchor)
-		end
-		ancestor = owners[ancestor]
-	end
-	return nil
-end
-
 -- Active in-flight turn waits keyed by wingman pane_id
 local pending_waits: { [number]: WaitEntry } = {}
 -- Native per-pane FIFO dispatch queue when target_pane is busy (`working`)
@@ -81,213 +68,12 @@ local queued_callbacks: { [number]: { string } } = {}
 local unsolicited_working: { [number]: boolean } = {}
 -- Tracks whether a wingman pane already called `report` (`kind ~= "progress"`) during the current turn
 local reported_in_turn: { [number]: boolean } = {}
--- Dedup key of the last `waiting_input` or `fault` escalation pushed to the owner, per wingman pane (persisted)
-local notified_waiting: { [number]: string } = {}
 -- Panes intentionally interrupted via `wingman.py interrupt` (suppresses fault escalation until next turn)
 local manual_interrupt: { [number]: boolean } = {}
-
--- Auto-callback policy (default ON; supports global default + per-owner overrides)
-local default_auto_callback = true
-local owner_auto_callback: { [number]: boolean } = {}
 
 local mux_child: Child? = nil
 local unloading = false
 local watchdog_armed = false
-
-local function save_owners(): boolean
-	local serialized: { [string]: number } = {}
-	for worker, owner in owners do
-		serialized[tostring(worker)] = owner
-	end
-	local ok, err = pcall(function(): any
-		tern.kv.set(KV_OWNERS, serialized)
-		return nil
-	end)
-	if not ok then
-		tern.log.warn("wingman: could not persist owners:", tostring(err))
-	end
-	notify_radar()
-	return ok
-end
-
-local function load_owners()
-	local ok, raw = pcall(tern.kv.get, KV_OWNERS)
-	if not ok then
-		tern.log.warn("wingman: could not read owners:", tostring(raw))
-		return
-	end
-	local legacy = raw == nil
-	if legacy then
-		ok, raw = pcall(tern.kv.get, KV_LEGACY_BINDINGS)
-		if not ok then
-			tern.log.warn("wingman: could not read legacy bindings:", tostring(raw))
-			return
-		end
-	end
-	if type(raw) == "table" then
-		local candidates: { [number]: number } = {}
-		local workers: { number } = {}
-		for k, v in raw do
-			local key, value = tonumber(k), tonumber(v)
-			if key and value then
-				local worker, owner = if legacy then value else key, if legacy then key else value
-				local previous = candidates[worker]
-				if previous == nil then
-					table.insert(workers, worker)
-					candidates[worker] = owner
-				elseif owner < previous then
-					candidates[worker] = owner
-				end
-			end
-		end
-		-- Older versions could persist cycles. Keep valid edges in stable pane order.
-		table.sort(workers)
-		local repaired = false
-		for _, worker in workers do
-			local owner = candidates[worker]
-			if ownership_cycle(owner, worker) then
-				repaired = true
-			else
-				owners[worker] = owner
-			end
-		end
-		if (legacy or repaired) and save_owners() and legacy then
-			pcall(tern.kv.set, KV_LEGACY_BINDINGS, nil)
-		end
-	end
-end
-
-local function save_callback_cfg()
-	local overrides: { [string]: boolean } = {}
-	for aid, val in pairs(owner_auto_callback) do
-		overrides[tostring(aid)] = val
-	end
-	pcall(function()
-		tern.kv.set(KV_CALLBACK_CFG, {
-			default = default_auto_callback,
-			owners = overrides,
-		})
-	end)
-end
-
-local function load_callback_cfg()
-	local ok, raw = pcall(tern.kv.get, KV_CALLBACK_CFG)
-	if ok and type(raw) == "table" then
-		if type(raw.default) == "boolean" then
-			default_auto_callback = raw.default
-		end
-		if type(raw.owners) == "table" then
-			for k, v in pairs(raw.owners) do
-				local aid = tonumber(k)
-				if aid and type(v) == "boolean" then
-					owner_auto_callback[aid] = v
-				end
-			end
-		end
-	end
-end
-
-local function save_waiting()
-	local ser: { [string]: string } = {}
-	for pid, key in pairs(notified_waiting) do
-		ser[tostring(pid)] = key
-	end
-	pcall(function()
-		tern.kv.set(KV_WAITING, if next(ser) ~= nil then ser else nil)
-	end)
-	notify_radar()
-end
-
-local function load_waiting()
-	local ok, raw = pcall(tern.kv.get, KV_WAITING)
-	if ok and type(raw) == "table" then
-		for k, v in pairs(raw) do
-			local pid = tonumber(k)
-			if pid and type(v) == "string" then
-				notified_waiting[pid] = v
-			end
-		end
-	end
-end
-
-local function clear_waiting(pane_id: number)
-	if notified_waiting[pane_id] ~= nil then
-		notified_waiting[pane_id] = nil
-		save_waiting()
-	end
-end
-
-local function is_auto_callback_enabled(owner_pane: number?): boolean
-	if owner_pane ~= nil and owner_auto_callback[owner_pane] ~= nil then
-		return owner_auto_callback[owner_pane] :: boolean
-	end
-	return default_auto_callback
-end
-
-local function prune_notifications(cx: WindowCx)
-	local cb_dirty = false
-	for aid, _ in pairs(owner_auto_callback) do
-		if cx.session:pane(aid) == nil then
-			owner_auto_callback[aid] = nil
-			cb_dirty = true
-		end
-	end
-	if cb_dirty then
-		save_callback_cfg()
-	end
-	local w_dirty = false
-	for pid, _ in pairs(notified_waiting) do
-		if cx.session:pane(pid) == nil then
-			notified_waiting[pid] = nil
-			w_dirty = true
-		end
-	end
-	if w_dirty then
-		save_waiting()
-	end
-end
-
-local function bound_workers(cx: WindowCx, anchor: number): { number }
-	local workers: { number } = {}
-	for worker, owner in owners do
-		if owner == anchor and cx.session:pane(worker) ~= nil then
-			table.insert(workers, worker)
-		end
-	end
-	table.sort(workers)
-	return workers
-end
-
-local function owner_of_pane(cx: WindowCx, pane_id: number): number?
-	local owner = owners[pane_id]
-	return if owner ~= nil and cx.session:pane(owner) ~= nil then owner else nil
-end
-
-local function bind_wingman(anchor: number, worker: number)
-	-- Callers preflight existing panes before changing layout or sending a turn. A fresh pane has no edges.
-	if owners[worker] ~= anchor then
-		owners[worker] = anchor
-		save_owners()
-	end
-end
-
-local function unbind_pane(pane_id: number)
-	local dirty = owners[pane_id] ~= nil
-	owners[pane_id] = nil
-	for worker, owner in owners do
-		if owner == pane_id then
-			owners[worker] = nil
-			dirty = true
-		end
-	end
-	if dirty then
-		save_owners()
-	end
-	if owner_auto_callback[pane_id] ~= nil then
-		owner_auto_callback[pane_id] = nil
-		save_callback_cfg()
-	end
-end
 
 local function same_daemon(req_socket: any): boolean
 	if req_socket == nil or req_socket == tern.json.null or req_socket == "" then
@@ -326,13 +112,6 @@ local function find_agent_info(cx: WindowCx, pane_id: number): AgentBlock?
 	return nil
 end
 
-local function strip_turn_footer(text: string): string
-	-- Trim Tern/omp UI footer chrome like "\n·\n6m44s · 445 tok · $0.06 this turn" or "\n19s · 202K tok this turn"
-	local cleaned = string.gsub(text, "\n·\n[^\n]* this turn%s*$", "")
-	cleaned = string.gsub(cleaned, "\n[^\n]* this turn%s*$", "")
-	return cleaned
-end
-
 local function collect_turn_output(cx: WindowCx, pane_id: number): (string?, any)
 	local info = find_agent_info(cx, pane_id)
 	local raw_last: any = info and info.last_message or nil
@@ -350,7 +129,7 @@ local function collect_turn_output(cx: WindowCx, pane_id: number): (string?, any
 		end
 	end
 	if last_msg and last_msg ~= "" then
-		last_msg = strip_turn_footer(last_msg)
+		last_msg = tsp.strip_turn_footer(last_msg)
 	end
 	return last_msg, transcript
 end
@@ -388,22 +167,6 @@ end
 
 local CALLBACK_BODY_MAX_BYTES = 3600
 
-local function clip_utf8_bytes(s: string, max_bytes: number): string
-	if #s <= max_bytes then
-		return s
-	end
-	local cut = max_bytes
-	-- Walk back past any UTF-8 continuation bytes (0x80..0xBF) so we never split a multi-byte character.
-	while cut > 0 do
-		local b = string.byte(s, cut + 1)
-		if b == nil or b < 0x80 or b >= 0xC0 then
-			break
-		end
-		cut -= 1
-	end
-	return string.sub(s, 1, cut)
-end
-
 local function deliver_to_owner(
 	cx: WindowCx,
 	owner_pane: number,
@@ -413,7 +176,7 @@ local function deliver_to_owner(
 ): (boolean, boolean, number)
 	local delivered_body = body
 	if #delivered_body > CALLBACK_BODY_MAX_BYTES then
-		delivered_body = clip_utf8_bytes(delivered_body, CALLBACK_BODY_MAX_BYTES)
+		delivered_body = tsp.clip_utf8_bytes(delivered_body, CALLBACK_BODY_MAX_BYTES)
 			.. string.format(
 				"\n\n… (truncated from %d bytes; run `wingman transcript --pane %d --last 2` for full output)",
 				#body,
@@ -440,175 +203,6 @@ local function deliver_to_owner(
 	return false, true, #existing_q
 end
 
-local INTERACTIVE_ROLES = {
-	["omp.ask.card"] = true,
-	["omp.editor.ask.approval"] = true,
-	["omp.overlay.hook-input"] = true,
-	["omp.overlay.hook-select"] = true,
-}
-
-local function walk_nodes(node: any, depth: number, visit: (any) -> boolean): boolean
-	if type(node) ~= "table" or depth > 16 then
-		return false
-	end
-	if visit(node) then
-		return true
-	end
-	local children = node.c
-	if type(children) == "table" then
-		for _, child in ipairs(children) do
-			if type(child) == "table" and walk_nodes(child, depth + 1, visit) then
-				return true
-			end
-		end
-	end
-	return false
-end
-
-local function find_interactive_root(tree: any): (string?, string?)
-	if type(tree) ~= "table" then
-		return nil, nil
-	end
-	local found_id: string?, found_role: string? = nil, nil
-	local function visit(n: any): boolean
-		local p = n.p
-		if type(p) == "table" and INTERACTIVE_ROLES[p.role] and n.id ~= nil then
-			found_id, found_role = tostring(n.id), p.role
-			return true
-		end
-		return false
-	end
-	for _, key in ipairs({ "layer", "main", "dock" }) do
-		if walk_nodes(tree[key], 0, visit) then
-			break
-		end
-	end
-	return found_id, found_role
-end
-
-local function spans_to_text(v: any): string
-	if type(v) == "string" then
-		return v
-	elseif type(v) == "table" then
-		if type(v.t) == "string" then
-			return v.t
-		end
-		local buf: { string } = {}
-		for _, item in ipairs(v) do
-			if type(item) == "string" then
-				table.insert(buf, item)
-			elseif type(item) == "table" and type(item.t) == "string" then
-				table.insert(buf, item.t)
-			end
-		end
-		return table.concat(buf, "")
-	end
-	return ""
-end
-
-local function format_tsp_subtree(node: any, indent: string, out: { string }, depth: number)
-	if type(node) ~= "table" or depth > 16 or #out >= 400 then
-		return
-	end
-	local id = if node.id ~= nil then tostring(node.id) else "-"
-	local kind = if node.k ~= nil then tostring(node.k) else "node"
-	local p = node.p
-	local tags: { string } = {}
-	local text_parts: { string } = {}
-	if type(p) == "table" then
-		if p.tone == "accent" or p.on == true or p.icon == "check" then
-			table.insert(tags, "selected")
-		end
-		if type(p.actions) == "table" and type(p.actions.click) == "string" then
-			table.insert(tags, "click=" .. p.actions.click)
-		end
-		for _, field in ipairs({ "text", "spans", "label", "detail", "value" }) do
-			local s = spans_to_text(p[field])
-			if s ~= "" then
-				table.insert(text_parts, s)
-			end
-		end
-	end
-	local meta = if #tags > 0 then " [" .. table.concat(tags, ", ") .. "]" else ""
-	local content = if #text_parts > 0 then ": " .. table.concat(text_parts, " — ") else ""
-	table.insert(out, string.format("%s%s %s%s%s", indent, id, kind, meta, content))
-	local children = node.c
-	if type(children) == "table" then
-		for _, child in ipairs(children) do
-			format_tsp_subtree(child, indent .. "  ", out, depth + 1)
-		end
-	end
-end
-
-local function find_node_by_id(tree: any, target_id: string): any
-	local hit: any = nil
-	for _, key in ipairs({ "layer", "main", "dock" }) do
-		if walk_nodes(tree[key], 0, function(n: any): boolean
-			if n.id ~= nil and tostring(n.id) == target_id then
-				hit = n
-				return true
-			end
-			return false
-		end) then
-			break
-		end
-	end
-	return hit
-end
-
-local function build_waiting_summary(cx: WindowCx, pane_id: number): (string, string)
-	local ok_tree, tree = pcall(function()
-		return cx.session:surface(pane_id, { as = "table", nodes = 1500 })
-	end)
-	local root_id, role = nil, nil
-	local surface_text = ""
-	if ok_tree and type(tree) == "table" then
-		root_id, role = find_interactive_root(tree)
-		local target_node = if root_id ~= nil then find_node_by_id(tree, root_id) else nil
-		if target_node == nil and type(tree.layer) == "table" then
-			-- Generic fallback for non-omp ACP approval/dialog overlays rendered in the TSP `layer` region.
-			target_node = tree.layer
-			root_id = if target_node.id ~= nil then tostring(target_node.id) else "layer"
-			role = if type(target_node.p) == "table" and type(target_node.p.role) == "string"
-				then target_node.p.role
-				else "layer"
-		end
-		if target_node ~= nil then
-			local lines: { string } = {}
-			format_tsp_subtree(target_node, "", lines, 0)
-			surface_text = table.concat(lines, "\n")
-		end
-	end
-	if surface_text == "" then
-		local ok_txt, txt = pcall(function()
-			return cx.session:surface(pane_id, { as = "text", root = root_id, max_chars = 12000 })
-		end)
-		surface_text = if ok_txt and txt ~= nil then tostring(txt) else "(surface unavailable)"
-	end
-	local parts: { string } = {}
-	local ok_tr, msgs = pcall(function()
-		return cx.agents:transcript(pane_id, { last = 2 })
-	end)
-	if ok_tr and type(msgs) == "table" then
-		for i = #msgs, 1, -1 do
-			local m = msgs[i]
-			if m.role == "assistant" then
-				if type(m.text) == "string" and m.text ~= "" and not string.find(surface_text, m.text, 1, true) then
-					table.insert(parts, "Last assistant message:\n" .. string.sub(m.text, 1, 1000))
-				end
-				break
-			end
-		end
-	end
-	table.insert(parts, string.format("Interactive surface (%s · root %s):\n%s", tostring(role or "unknown"), tostring(root_id or "-"), surface_text))
-	table.insert(parts, string.format(
-		"Inspect: `wingman surface --pane %d`. Answer via `wingman event --pane %d '<json-event>' ...` (see `wingman` skill for multi-step/Other recipes). "
-			.. "Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.",
-		pane_id, pane_id
-	))
-	return tostring(role or "waiting") .. ":" .. tostring(root_id or "root"), table.concat(parts, "\n\n")
-end
-
 local function notify_waiting_input(cx: WindowCx, worker_pane: number)
 	tern.timer(120, function(later_cx: WindowCx?)
 		local lcx = later_cx or cx
@@ -616,111 +210,33 @@ local function notify_waiting_input(cx: WindowCx, worker_pane: number)
 		if not ainfo or ainfo.state ~= "waiting_input" or pending_waits[worker_pane] ~= nil then
 			return
 		end
-		local owner = owner_of_pane(lcx, worker_pane)
-		if owner == nil or not is_auto_callback_enabled(owner) then
+		local owner = state.owner_of_pane(lcx, worker_pane)
+		if owner == nil or not state.is_auto_callback_enabled(owner) then
 			return
 		end
-		local key, body = build_waiting_summary(lcx, worker_pane)
-		if notified_waiting[worker_pane] == key then
+		local key, body = tsp.build_waiting_summary(lcx, worker_pane)
+		if not state.record_waiting(worker_pane, key) then
 			return
 		end
-		notified_waiting[worker_pane] = key
-		save_waiting()
 		deliver_to_owner(lcx, owner, worker_pane, "waiting_input", body)
 	end)
 end
 
-local function node_text(node: any): string
-	local lines: { string } = {}
-	walk_nodes(node, 0, function(n: any): boolean
-		local p = n.p
-		if type(p) == "table" then
-			for _, field in ipairs({ "text", "spans", "label", "detail", "value" }) do
-				local s = spans_to_text(p[field])
-				if s ~= "" then
-					table.insert(lines, s)
-				end
-			end
-		end
-		return #lines >= 60
-	end)
-	return table.concat(lines, "\n")
-end
-
-local function inspect_fault_surface(cx: WindowCx, pane_id: number): (boolean, string?, string?)
-	local ok_tree, tree = pcall(function()
-		return cx.session:surface(pane_id, { as = "table", nodes = 1500 })
-	end)
-	if not ok_tree or type(tree) ~= "table" then
-		return false, nil, nil
-	end
-	local has_retry_hint = false
-	local has_retry_error = false
-	local banner_text: string? = nil
-	local abort_text: string? = nil
-	local error_text: string? = nil
-	walk_nodes(tree.dock, 0, function(n: any): boolean
-		local role = type(n.p) == "table" and n.p.role or nil
-		if role == "omp.hint.retry" then
-			has_retry_hint = true
-		elseif role == "omp.errorBanner" then
-			banner_text = node_text(n)
-		end
-		return false
-	end)
-	local main_c = tree.main and tree.main.c
-	local tail = if type(main_c) == "table" and #main_c > 0 then main_c[#main_c] else nil
-	walk_nodes(tail, 0, function(n: any): boolean
-		local role = type(n.p) == "table" and n.p.role or nil
-		if role == "omp.error" then
-			has_retry_error = true
-			error_text = node_text(n)
-			return true
-		elseif role == "omp.assistant.abort" then
-			abort_text = node_text(n)
-			return true
-		end
-		return false
-	end)
-	-- Strictly require a genuine takeover-needed state (`F5 to retry` in dock or `omp.error` Retry card at tail).
-	-- Plain user `Esc` aborts (`omp.assistant.abort` without `omp.hint.retry`) and non-blocking warnings are ignored.
-	if not has_retry_hint and not has_retry_error then
-		return false, nil, nil
-	end
-	local parts: { string } = {}
-	if error_text and error_text ~= "" then
-		table.insert(parts, error_text)
-	end
-	if abort_text and abort_text ~= "" then
-		table.insert(parts, abort_text)
-	end
-	if banner_text and banner_text ~= "" then
-		table.insert(parts, banner_text)
-	end
-	local summary = table.concat(parts, "\n")
-	if summary == "" then
-		summary = "(omp stopped and is waiting on `F5 to retry`)"
-	end
-	return true, "fault:" .. tostring(tail and tail.id or "dock") .. ":" .. string.sub(summary, 1, 120), summary
-end
-
 local function deliver_fault_if_needed(cx: WindowCx, worker_pane: number, fallback_reason: string?): boolean
-	local owner = owner_of_pane(cx, worker_pane)
-	if owner == nil or not is_auto_callback_enabled(owner) then
+	local owner = state.owner_of_pane(cx, worker_pane)
+	if owner == nil or not state.is_auto_callback_enabled(owner) then
 		return false
 	end
-	local has_fault, key, summary = inspect_fault_surface(cx, worker_pane)
+	local has_fault, key, summary = tsp.inspect_fault_surface(cx, worker_pane)
 	if not has_fault then
 		if fallback_reason == nil then
 			return false
 		end
 		key, summary = "fault:" .. fallback_reason, fallback_reason
 	end
-	if notified_waiting[worker_pane] == key then
+	if not state.record_waiting(worker_pane, key :: string) then
 		return false
 	end
-	notified_waiting[worker_pane] = key :: string
-	save_waiting()
 	local body = tostring(summary)
 		.. "\n\nRecover: run `wingman retry --pane " .. worker_pane .. "` (sends native `/retry`, equivalent to F5) for transient stream/network/edit-preview glitches (up to 2-3 retries), or consult the user if it is a persistent quota/auth/config error."
 	deliver_to_owner(cx, owner, worker_pane, "fault · retryable", body)
@@ -783,7 +299,7 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 	reported_in_turn[pane_id] = false
 	local last_msg, transcript = collect_turn_output(cx, pane_id)
 	if #w.cids == 0 then
-		local owner = owner_of_pane(cx, pane_id)
+		local owner = state.owner_of_pane(cx, pane_id)
 		if status == "waiting_input" then
 			notify_waiting_input(cx, pane_id)
 		elseif owner ~= nil then
@@ -948,16 +464,16 @@ ensure_watchdog = function()
 end
 
 local function seed_inflight_unsolicited_turns(cx: WindowCx)
-	prune_notifications(cx)
+	state.prune_notifications(cx)
 	for _, a in ipairs(cx.agents:list()) do
 		if a.state == "working" and pending_waits[a.pane] == nil and queued_dispatches[a.pane] == nil then
-			if owner_of_pane(cx, a.pane) ~= nil then
+			if state.owner_of_pane(cx, a.pane) ~= nil then
 				unsolicited_working[a.pane] = true
 			end
-		elseif a.state == "waiting_input" and pending_waits[a.pane] == nil and owner_of_pane(cx, a.pane) ~= nil then
+		elseif a.state == "waiting_input" and pending_waits[a.pane] == nil and state.owner_of_pane(cx, a.pane) ~= nil then
 			notify_waiting_input(cx, a.pane)
-		elseif a.state == "idle" and pending_waits[a.pane] == nil and owner_of_pane(cx, a.pane) ~= nil then
-			if inspect_fault_surface(cx, a.pane) then
+		elseif a.state == "idle" and pending_waits[a.pane] == nil and state.owner_of_pane(cx, a.pane) ~= nil then
+			if tsp.inspect_fault_surface(cx, a.pane) then
 				deliver_fault_if_needed(cx, a.pane, nil)
 			end
 		end
@@ -977,7 +493,7 @@ local function settle_stalled_fault(cx: WindowCx, pane: number)
 		if not ainfo or ainfo.state ~= "idle" or pending_waits[pane] ~= nil then
 			return
 		end
-		if inspect_fault_surface(lcx, pane) then
+		if tsp.inspect_fault_surface(lcx, pane) then
 			unsolicited_working[pane] = false
 			reported_in_turn[pane] = false
 			deliver_fault_if_needed(lcx, pane, nil)
@@ -988,9 +504,9 @@ end
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 	if ev.new == "working" then
 		manual_interrupt[ev.pane] = nil
-		clear_waiting(ev.pane)
-	elseif ev.new ~= "waiting_input" and not string.find(notified_waiting[ev.pane] or "", "^fault:") then
-		clear_waiting(ev.pane)
+		state.clear_waiting(ev.pane)
+	elseif ev.new ~= "waiting_input" and not string.find(state.waiting_key(ev.pane) or "", "^fault:") then
+		state.clear_waiting(ev.pane)
 	end
 	local w = pending_waits[ev.pane]
 	if w then
@@ -1007,17 +523,17 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 
 	-- Track unsolicited turns on bound wingman panes (e.g. omp background job starting a new turn)
 	if ev.new == "waiting_input" then
-		if owner_of_pane(cx, ev.pane) ~= nil then
+		if state.owner_of_pane(cx, ev.pane) ~= nil then
 			notify_waiting_input(cx, ev.pane)
 		end
-	elseif ev.old == "waiting_input" and ev.new == "working" and owner_of_pane(cx, ev.pane) ~= nil then
+	elseif ev.old == "waiting_input" and ev.new == "working" and state.owner_of_pane(cx, ev.pane) ~= nil then
 		unsolicited_working[ev.pane] = true
 	elseif ev.new == "working" and ev.old ~= "working" and queued_dispatches[ev.pane] == nil then
-		if owner_of_pane(cx, ev.pane) ~= nil then
+		if state.owner_of_pane(cx, ev.pane) ~= nil then
 			unsolicited_working[ev.pane] = true
 			reported_in_turn[ev.pane] = false
 		end
-	elseif ev.old == "working" and ev.new == "idle" and owner_of_pane(cx, ev.pane) ~= nil then
+	elseif ev.old == "working" and ev.new == "idle" and state.owner_of_pane(cx, ev.pane) ~= nil then
 		settle_stalled_fault(cx, ev.pane)
 	end
 	if ev.new == "idle" and queued_callbacks[ev.pane] ~= nil and queued_dispatches[ev.pane] == nil then
@@ -1027,7 +543,7 @@ end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	if ev.result == "done" then
-		clear_waiting(ev.pane)
+		state.clear_waiting(ev.pane)
 	end
 	-- 1. If this pane is an owner with pending wingman callbacks, flush them as soon as its turn finishes cleanly
 	if queued_callbacks[ev.pane] ~= nil and ev.result == "done" and queued_dispatches[ev.pane] == nil then
@@ -1043,7 +559,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 
 	-- 3. If the completed turn was an async/unsolicited turn, push its completion to `owner` FIRST (before promoting next queued item!)
 	local was_unsolicited = unsolicited_working[ev.pane] == true
-	if (ev.result == "failed" or ev.result == "exited") and not manual_interrupt[ev.pane] and owner_of_pane(cx, ev.pane) ~= nil then
+	if (ev.result == "failed" or ev.result == "exited") and not manual_interrupt[ev.pane] and state.owner_of_pane(cx, ev.pane) ~= nil then
 		-- Failed/exited turns (including across plugin reload) report the native error surface + retry hint once TSP settles.
 		unsolicited_working[ev.pane] = false
 		reported_in_turn[ev.pane] = false
@@ -1061,12 +577,12 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		unsolicited_working[ev.pane] = false
 		local already_reported = reported_in_turn[ev.pane] == true
 		reported_in_turn[ev.pane] = false
-		local owner = owner_of_pane(cx, ev.pane)
+		local owner = state.owner_of_pane(cx, ev.pane)
 		local has_next_q = queued_dispatches[ev.pane] ~= nil and #queued_dispatches[ev.pane] > 0 and ev.result == "done"
 		if
 			owner ~= nil
 			and not already_reported
-			and is_auto_callback_enabled(owner)
+			and state.is_auto_callback_enabled(owner)
 			and (ev.result == "done" or ev.result == "failed" or ev.result == "exited")
 		then
 			local last_msg, _ = collect_turn_output(cx, ev.pane)
@@ -1114,7 +630,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 			end
 			if pending_waits[finished_pane] == nil and queued_dispatches[finished_pane] == nil then
 				local ainfo = find_agent_info(later_cx, finished_pane)
-				if ainfo and ainfo.state == "working" and owner_of_pane(later_cx, finished_pane) ~= nil then
+				if ainfo and ainfo.state == "working" and state.owner_of_pane(later_cx, finished_pane) ~= nil then
 					unsolicited_working[finished_pane] = true
 				end
 			end
@@ -1123,8 +639,8 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
-	unbind_pane(ev.pane)
-	clear_waiting(ev.pane)
+	state.unbind_pane(ev.pane)
+	state.clear_waiting(ev.pane)
 	unsolicited_working[ev.pane] = nil
 	reported_in_turn[ev.pane] = nil
 	queued_callbacks[ev.pane] = nil
@@ -1173,7 +689,7 @@ local function resolve_report_owner(cx: WindowCx, worker_pane: number, explicit_
 		end
 		return explicit_target, nil
 	end
-	local bound_owner = owner_of_pane(cx, worker_pane)
+	local bound_owner = state.owner_of_pane(cx, worker_pane)
 	if bound_owner ~= nil then
 		return bound_owner, nil
 	end
@@ -1251,7 +767,7 @@ local function retry_pane(cx: WindowCx, tp: number): (boolean, string?, string?)
 	if not ok_r then
 		return false, "cx.agents:ask /retry failed: " .. tostring(err_r), nil
 	end
-	clear_waiting(tp)
+	state.clear_waiting(tp)
 	manual_interrupt[tp] = nil
 	return true, nil, nil
 end
@@ -1274,7 +790,7 @@ local function down_target(cx: WindowCx, anchor: number, moving: number?): numbe
 		end
 		local pane = node.pane
 		if pane then
-			return if pane ~= moving and owners[pane] == anchor then pane else nil
+			return if pane ~= moving and state.raw_owner(pane) == anchor then pane else nil
 		end
 		return last_worker(node[2]) or last_worker(node[1])
 	end
@@ -1296,25 +812,66 @@ local function down_target(cx: WindowCx, anchor: number, moving: number?): numbe
 	return worker or anchor
 end
 
+-- Readable glance size for floating wingman panes (share of the owner frame; Tern clamps to bounds).
+local WORKER_PIP_SIZE = { 0.44, 0.46 }
+
+local function float_worker(cx: WindowCx, pane: number, over: number?, corner: Corner?): (boolean, string?)
+	return cx.layout:float(pane, over, corner or "br", { focus = false, size = WORKER_PIP_SIZE })
+end
+
+-- Choose a tiled slot beside `anchor` without crushing `anchor`: stack `"down"` under an existing
+-- right-column worker when one already exists, otherwise split `"right"` beside `anchor`.
+local function tiled_slot(cx: WindowCx, anchor: number, moving: number?): (number, Dir)
+	local existing = down_target(cx, anchor, moving)
+	if existing ~= anchor then
+		return existing, "down"
+	end
+	return anchor, "right"
+end
+
+local function dock_worker(cx: WindowCx, pane: number, over: number?, dir: Dir?): (boolean, string?)
+	if over ~= nil and (dir == nil or dir == "right") then
+		local slot_target, slot_dir = tiled_slot(cx, over, pane)
+		return cx.layout:dock(pane, slot_target, slot_dir, { focus = false })
+	end
+	return cx.layout:dock(pane, over, dir or "right", { focus = false })
+end
+
 local function park_pane(cx: WindowCx, pane: number): (boolean, string?)
 	return cx.layout:park(pane)
 end
 
 local function unpark_pane(cx: WindowCx, pane: number): (boolean, string?)
-	return cx.layout:unpark(pane, { focus = false })
+	local ok, err = cx.layout:unpark(pane, { focus = false })
+	if not ok then
+		return false, err
+	end
+	-- Keep unparked workers beside their owner (never splitting a focused Wingman Live sidebar).
+	local owner = state.owner_of_pane(cx, pane)
+	if owner ~= nil and cx.session:tab_of(owner) == cx.session:tab_of(pane) then
+		local slot_target, slot_dir = tiled_slot(cx, owner, pane)
+		if slot_target ~= pane then
+			cx.layout:move(pane, slot_target, slot_dir, { focus = false })
+		end
+	end
+	return true, nil
 end
 
 local function place_worker(cx: WindowCx, pane: number, anchor: number, form: WorkerLayout, corner: Corner): (boolean, string?)
 	if form == "pip" then
-		return cx.layout:float(pane, anchor, corner, { focus = false })
+		return float_worker(cx, pane, anchor, corner)
 	elseif form == "park" then
 		return park_pane(cx, pane)
 	elseif form == "tab" then
 		local tab, err = cx.layout:move_to_new_tab(pane, nil, { focus = false })
 		return tab ~= nil, err
 	end
-	local target = if form == "down" then down_target(cx, anchor, pane) else anchor
-	local dir: Dir = if form == "down" then "down" else "right"
+	local target: number, dir: Dir
+	if form == "down" then
+		target, dir = down_target(cx, anchor, pane), "down"
+	else
+		target, dir = tiled_slot(cx, anchor, pane)
+	end
 	local info = cx.session:pane(pane)
 	if info and info.floating then
 		return cx.layout:dock(pane, target, dir, { focus = false })
@@ -1329,8 +886,15 @@ local function spawn_worker(cx: WindowCx, anchor: number, form: WorkerLayout, cw
 	if form == "tab" then
 		pane = cx.layout:new_tab(launch, { focus = false })
 	else
-		local target = if form == "down" then down_target(cx, anchor, nil) else anchor
-		pane = cx.layout:split(target, if form == "down" then "down" else "right", launch, { focus = false })
+		local target: number, dir: Dir
+		if form == "down" then
+			target, dir = down_target(cx, anchor, nil), "down"
+		elseif form == "split" then
+			target, dir = tiled_slot(cx, anchor, nil)
+		else
+			target, dir = anchor, "right"
+		end
+		pane = cx.layout:split(target, dir, launch, { focus = false })
 	end
 	if not pane then
 		return nil, "could not open wingman with layout " .. form
@@ -1353,7 +917,7 @@ local function select_worker(cx: WindowCx, anchor: number?, value: any, cwd: any
 		end
 		return pane, nil
 	end
-	local workers: { number } = if anchor then bound_workers(cx, anchor) else {}
+	local workers: { number } = if anchor then state.workers_of_owner(cx, anchor) else {}
 	if #workers == 1 then
 		return workers[1], nil
 	elseif #workers == 0 then
@@ -1387,7 +951,7 @@ local function stop_worker(cx: WindowCx, pane: number): (boolean, string?)
 		cx.agents:stop(pane)
 	end)
 	if ok then
-		unbind_pane(pane)
+		state.unbind_pane(pane)
 	end
 	return ok, if ok then nil else tostring(err)
 end
@@ -1409,7 +973,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			return
 		end
 		if anchor and (op == "pip" or op == "dock" or op == "retry" or op == "await" or (op == "event" and req.rearm ~= false)) then
-			local cycle = ownership_cycle(anchor, target)
+			local cycle = state.ownership_cycle(anchor, target)
 			if cycle then
 				send_mux(cid, { ok = false, error = cycle }, false)
 				return
@@ -1420,8 +984,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 	if op == "status" then
 		seed_inflight_unsolicited_turns(cx)
 		local my_tab = if anchor then cx.session:tab_of(anchor) else nil
-		local bound_panes = if anchor then bound_workers(cx, anchor) else {}
-		local my_owner = if anchor then owner_of_pane(cx, anchor) else nil
+		local bound_panes = if anchor then state.workers_of_owner(cx, anchor) else {}
+		local my_owner = if anchor then state.owner_of_pane(cx, anchor) else nil
 		local floats = tern.json.array()
 		if my_tab then
 			local lay = cx.session:layout(my_tab)
@@ -1433,7 +997,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		for _, a in ipairs(cx.agents:list()) do
 			local info = cx.session:pane(a.pane)
 			local atab = if info then info.tab else nil
-			local owner = owner_of_pane(cx, a.pane)
+			local owner = state.owner_of_pane(cx, a.pane)
 			local q = queued_dispatches[a.pane]
 			local q_count = if q then #q else 0
 			local q_preview: string? = nil
@@ -1451,7 +1015,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				parked = info ~= nil and info.parked == true,
 				floating = info ~= nil and info.floating == true,
 				bound_owner = owner,
-				auto_callback = if owner ~= nil then is_auto_callback_enabled(owner) else is_auto_callback_enabled(a.pane),
+				auto_callback = if owner ~= nil then state.is_auto_callback_enabled(owner) else state.is_auto_callback_enabled(a.pane),
 				queued_count = q_count,
 				queued_preview = q_preview,
 				queued_callbacks_count = cb_q_count,
@@ -1470,8 +1034,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			bound_panes = tern.json.array(bound_panes),
 			bound_pane = if #bound_panes == 1 then bound_panes[1] else nil,
 			owner_pane = my_owner,
-			auto_callback = is_auto_callback_enabled(anchor),
-			default_auto_callback = default_auto_callback,
+			auto_callback = state.is_auto_callback_enabled(anchor),
+			default_auto_callback = state.default_auto_callback(),
 			agents = tern.json.array(out),
 			floats = floats,
 		}, false)
@@ -1523,53 +1087,49 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		local target_owner: number? = if req.owner_pane ~= nil and req.owner_pane ~= tern.json.null
 			then tonumber(req.owner_pane)
 			else anchor
-		if target_owner ~= nil and #bound_workers(cx, target_owner) == 0 then
-			local maybe_owner = owner_of_pane(cx, target_owner)
+		if target_owner ~= nil and #state.workers_of_owner(cx, target_owner) == 0 then
+			local maybe_owner = state.owner_of_pane(cx, target_owner)
 			if maybe_owner ~= nil then
 				target_owner = maybe_owner
 			end
 		end
 		if mode == "on" or mode == "off" then
 			local val = (mode == "on")
-			if scope == "global" or target_owner == nil then
-				default_auto_callback = val
-			else
-				owner_auto_callback[target_owner] = val
-			end
-			save_callback_cfg()
+			state.set_callback(if scope == "global" then nil else target_owner, val)
 		elseif mode == "reset" then
 			if scope == "global" then
-				default_auto_callback = true
-				owner_auto_callback = {}
-			elseif target_owner ~= nil then
-				owner_auto_callback[target_owner] = nil
+				state.reset_callbacks()
+			else
+				state.reset_callback(target_owner)
 			end
-			save_callback_cfg()
 		end
 		send_mux(cid, {
 			ok = true,
 			owner_pane = target_owner,
-			enabled = is_auto_callback_enabled(target_owner),
-			default_enabled = default_auto_callback,
+			enabled = state.is_auto_callback_enabled(target_owner),
+			default_enabled = state.default_auto_callback(),
 		}, false)
 		return
 	end
 
 	if op == "pip" or op == "dock" or op == "park" or op == "unpark" then
 		local tp = target :: number
-		local over = owner_of_pane(cx, tp) or anchor
+		local over = state.owner_of_pane(cx, tp) or anchor
 		local ok: boolean, err: string?
 		if op == "pip" then
-			ok, err = cx.layout:float(tp, over, corner_of(req.corner) or "br", { focus = false })
+			ok, err = float_worker(cx, tp, over, corner_of(req.corner))
 		elseif op == "dock" then
-			ok, err = cx.layout:dock(tp, over, req.dir or "right", { focus = false })
+			local d: Dir? = if req.dir == "left" or req.dir == "right" or req.dir == "up" or req.dir == "down"
+				then req.dir
+				else nil
+			ok, err = dock_worker(cx, tp, over, d)
 		elseif op == "park" then
 			ok, err = park_pane(cx, tp)
 		else
 			ok, err = unpark_pane(cx, tp)
 		end
-		if ok and anchor and not owner_of_pane(cx, tp) and (op == "pip" or op == "dock") then
-			bind_wingman(anchor, tp)
+		if ok and anchor and not state.owner_of_pane(cx, tp) and (op == "pip" or op == "dock") then
+			state.bind_wingman(anchor, tp)
 		end
 		send_mux(cid, { ok = ok, pane = tp, error = err }, false)
 		return
@@ -1602,13 +1162,12 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, pane = tp, state = busy_state, error = err_r }, false)
 			return
 		end
-		if anchor and not owner_of_pane(cx, tp) then
-			bind_wingman(anchor, tp)
+		if anchor and not state.owner_of_pane(cx, tp) then
+			state.bind_wingman(anchor, tp)
 		end
 		if req.async_callback == true then
-			if anchor and owner_auto_callback[anchor] == false then
-				owner_auto_callback[anchor] = true
-				save_callback_cfg()
+			if anchor then
+				state.arm_callback(anchor)
 			end
 			unsolicited_working[tp] = true
 			reported_in_turn[tp] = false
@@ -1659,7 +1218,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			return
 		end
 		if auto_root and type(tree) == "table" then
-			i_root, i_role = find_interactive_root(tree)
+			i_root, i_role = tsp.find_interactive_root(tree)
 			if root == nil then
 				root = i_root
 			end
@@ -1667,7 +1226,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		if want_as == "table" then
 			local out_tree = tree
 			if root ~= nil and type(tree) == "table" then
-				local sub = find_node_by_id(tree, tostring(root))
+				local sub = tsp.find_node_by_id(tree, tostring(root))
 				if sub ~= nil then
 					out_tree = sub
 				end
@@ -1678,14 +1237,14 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		local lines: { string } = {}
 		if type(tree) == "table" then
 			if root ~= nil then
-				local sub = find_node_by_id(tree, tostring(root))
+				local sub = tsp.find_node_by_id(tree, tostring(root))
 				if sub ~= nil then
-					format_tsp_subtree(sub, "", lines, 0)
+					tsp.format_tsp_subtree(sub, "", lines, 0)
 				end
 			else
 				for _, region in ipairs({ "layer", "main", "dock" }) do
 					if type(tree[region]) == "table" then
-						format_tsp_subtree(tree[region], "", lines, 0)
+						tsp.format_tsp_subtree(tree[region], "", lines, 0)
 					end
 				end
 			end
@@ -1715,9 +1274,9 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			table.insert(results, { index = i, ok = ok_e, error = if ok_e then nil else tostring(res_e), result = if ok_e then res_e else nil })
 		end
 		if req.rearm ~= false then
-			clear_waiting(tp)
-			if anchor and not owner_of_pane(cx, tp) then
-				bind_wingman(anchor, tp)
+			state.clear_waiting(tp)
+			if anchor and not state.owner_of_pane(cx, tp) then
+				state.bind_wingman(anchor, tp)
 			end
 			unsolicited_working[tp] = true
 			reported_in_turn[tp] = false
@@ -1733,8 +1292,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 
 	if op == "await" then
 		local tp = target :: number
-		if anchor and not owner_of_pane(cx, tp) then
-			bind_wingman(anchor, tp)
+		if anchor and not state.owner_of_pane(cx, tp) then
+			state.bind_wingman(anchor, tp)
 		end
 		send_mux(cid, { _ack = true, pane = tp }, true)
 		local ainfo = find_agent_info(cx, tp)
@@ -1804,12 +1363,12 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				send_mux(cid, { ok = false, error = err }, false)
 				return
 			end
-			local cycle = ownership_cycle(anchor, target_pane)
+			local cycle = state.ownership_cycle(anchor, target_pane)
 			if cycle then
 				send_mux(cid, { ok = false, error = cycle }, false)
 				return
 			end
-			local owner = owner_of_pane(cx, target_pane)
+			local owner = state.owner_of_pane(cx, target_pane)
 			if reset_new and owner ~= anchor then
 				send_mux(cid, { ok = false, error = "can only replace a wingman bound to the caller" }, false)
 				return
@@ -1834,8 +1393,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		end
 
 		local async_cb = req.async_callback == true
-		local state = if target_pane then find_agent_info(cx, target_pane) else nil
-		if state and state.state == "waiting_input" then
+		local agent = if target_pane then find_agent_info(cx, target_pane) else nil
+		if agent and agent.state == "waiting_input" then
 			send_mux(cid, {
 				ok = false,
 				status = "waiting_input",
@@ -1844,7 +1403,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			}, false)
 			return
 		end
-		local busy = state ~= nil and state.state == "working"
+		local busy = agent ~= nil and agent.state == "working"
 		if busy and req.queue == false then
 			send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
 			return
@@ -1883,16 +1442,12 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				return
 			end
 		end
-		bind_wingman(anchor, pane)
+		state.bind_wingman(anchor, pane)
 
 		if async_cb then
-			if owner_auto_callback[anchor] == false then
-				owner_auto_callback[anchor] = true
-				save_callback_cfg()
-			end
+			state.arm_callback(anchor)
 		elseif type(req.auto_callback) == "boolean" then
-			owner_auto_callback[anchor] = req.auto_callback
-			save_callback_cfg()
+			state.set_callback(anchor, req.auto_callback)
 		end
 
 		if busy then
@@ -2031,9 +1586,7 @@ tern.command({
 	title = "Wingman: Toggle auto-callback to supervisor",
 	icon = "bell",
 	run = function(cx: WindowCx)
-		default_auto_callback = not default_auto_callback
-		save_callback_cfg()
-		local state_label = if default_auto_callback then "enabled" else "disabled"
+		local state_label = if state.toggle_default_callback() then "enabled" else "disabled"
 		cx:toast("info", "Wingman auto-callback " .. state_label, "Unsolicited worker turns push to bound supervisor when enabled.")
 	end,
 })
@@ -2053,9 +1606,7 @@ local started = false
 local function start(cx: WindowCx?)
 	if not started then
 		started = true
-		load_owners()
-		load_callback_cfg()
-		load_waiting()
+		state.load()
 		ensure_mux()
 	end
 	if cx then
@@ -2070,9 +1621,7 @@ tern.timer(0, start)
 if radar_loaded then
 	local ok_attach, err_attach = pcall(function(): any
 		radar.attach({
-			owners = function(): { [number]: number }
-				return table.clone(owners)
-			end,
+			owners = state.owners,
 			queued_dispatches = function(pane: number): number
 				local q = queued_dispatches[pane]
 				return if q then #q else 0
@@ -2081,13 +1630,11 @@ if radar_loaded then
 				local q = queued_callbacks[pane]
 				return if q then #q else 0
 			end,
-			notified_waiting = function(pane: number): string?
-				return notified_waiting[pane]
-			end,
+			notified_waiting = state.waiting_key,
 			-- Fault keys are `fault:<surface node>:<summary>`, or `fault:<reason>` without a surface
 			-- (deliver_fault_if_needed); no surface is read here.
 			fault = function(pane: number): string?
-				local key = notified_waiting[pane]
+				local key = state.waiting_key(pane)
 				if key == nil or string.sub(key, 1, 6) ~= "fault:" then
 					return nil
 				end
@@ -2095,10 +1642,10 @@ if radar_loaded then
 				return string.match(rest, "^[^:]*:(.+)$") or rest
 			end,
 			pip = function(cx: WindowCx, pane: number): (boolean, string?)
-				return cx.layout:float(pane, owner_of_pane(cx, pane), "br", { focus = false })
+				return float_worker(cx, pane, state.owner_of_pane(cx, pane), "br")
 			end,
 			dock = function(cx: WindowCx, pane: number): (boolean, string?)
-				return cx.layout:dock(pane, owner_of_pane(cx, pane), "right", { focus = false })
+				return dock_worker(cx, pane, state.owner_of_pane(cx, pane), nil)
 			end,
 			park = park_pane,
 			unpark = unpark_pane,

@@ -1,9 +1,14 @@
--- The Python test injects window.luau here so the real mux handler runs under stock Luau.
--- Only Tern's outer API and mux byte transport are replaced.
-local handlers, effects = {}, {}
-local store = {}
-local frame, request, receive
-local function unexpected(message)
+--!strict
+-- The Python test copies state.luau and tsp.luau beside the generated script and injects window.luau here,
+-- so the real mux handler and real modules run under stock Luau. Only Tern's outer API, the live panel
+-- and mux byte transport are replaced.
+local handlers: { [string]: (any) -> () } = {}
+local effects: { { op: string, target: number } } = {}
+local store: { [string]: any } = {}
+local frame: any
+local request: { [string]: any }
+local receive: (string, any) -> ()
+local function unexpected(message: any)
     error(tostring(message), 2)
 end
 local tern = {
@@ -31,15 +36,20 @@ local tern = {
         end,
     },
 }
-local function require()
-    return { on_state_change = function() end, attach = function() end }
+local notifications = 0
+local real_require = require
+local function fixture_require(path: string): any
+    if path == "./radar" then
+        return { on_state_change = function() notifications += 1 end, attach = function() end }
+    end
+    return real_require(path)
 end
-local function load_plugin()
+local function load_plugin(require: (string) -> any)
 -- @WINDOW_PLUGIN@
 end
 
-local function effect(op, target)
-    table.insert(effects, { op, target })
+local function effect(op: string, target: number)
+    table.insert(effects, { op = op, target = target })
 end
 local panes = {}
 local agents = {}
@@ -66,20 +76,25 @@ local cx = {
         dock = function(_, pane) effect("dock", pane); return true end,
     },
 }
-local function rpc(op, anchor, target)
+local function rpc(op: string, anchor: number, target: number?, extra: { [string]: any }?): any
     frame = nil
     request = { op = op, anchor_pane = anchor, target_pane = target, prompt = "hello", async_callback = true,
         events = { { ev = "action", id = "test", act = "submit" } } }
+    if extra then
+        for key, value in extra do
+            request[key] = value
+        end
+    end
     receive("request", cx)
     assert(frame and frame.reply, op .. " did not reply")
     return frame.reply
 end
-local function start(data)
+local function start(data: { [string]: any }?)
     store = data or {}
-    load_plugin()
+    load_plugin(fixture_require)
     handlers.window_start(cx)
 end
-local function assert_cycle(op, anchor, target)
+local function assert_cycle(op: string, anchor: number, target: number)
     local before = #effects
     local out = rpc(op, anchor, target)
     assert(not out.ok and string.find(out.error or "", "ownership cycle", 1, true), op .. ": " .. tostring(out.error))
@@ -104,3 +119,43 @@ assert(rpc("status", 3).owner_pane == 2 and #rpc("status", 3).bound_panes == 0)
 start({ owners_v1 = { ["1"] = 3, ["2"] = 1, ["3"] = 2, ["4"] = 2 } })
 assert(store.owners_v1["3"] == nil and store.owners_v1["4"] == 2)
 assert_cycle("dispatch", 2, 3)
+
+-- Persisted policy and dedup keys survive a restart; entries for closed panes are pruned at start.
+start({
+    auto_callback_v1 = { default = false, owners = { ["1"] = true, ["99"] = true } },
+    notified_waiting_v1 = { ["1"] = "waiting:a", ["99"] = "waiting:b" },
+})
+assert(store.notified_waiting_v1["1"] == "waiting:a" and store.notified_waiting_v1["99"] == nil)
+assert(store.auto_callback_v1.default == false and store.auto_callback_v1.owners["1"] == true)
+assert(store.auto_callback_v1.owners["99"] == nil)
+local restored = rpc("status", 1)
+assert(restored.auto_callback == true and restored.default_auto_callback == false)
+assert(rpc("status", 2).auto_callback == false)
+
+-- Ownership edges persist and notify the panel; the callback op edits policy through the same module.
+start()
+local before_bind = notifications
+assert(rpc("dispatch", 1, 2).ok)
+assert(notifications > before_bind and store.owners_v1["2"] == 1)
+local off = rpc("callback", 1, nil, { mode = "off", scope = "owner" })
+assert(off.enabled == false and off.default_enabled == true and off.owner_pane == 1)
+assert(tern.kv.get("auto_callback_v1").owners["1"] == false)
+assert(rpc("dispatch", 1, 3).ok)
+assert(tern.kv.get("auto_callback_v1").owners["1"] == true, "an async dispatch re-arms a disabled callback")
+local global_off = rpc("callback", 1, nil, { mode = "off", scope = "global" })
+assert(global_off.default_enabled == false and tern.kv.get("auto_callback_v1").default == false)
+local reset = rpc("callback", 1, nil, { mode = "reset", scope = "global" })
+assert(reset.default_enabled == true and tern.kv.get("auto_callback_v1").default == true)
+assert(next(store.auto_callback_v1.owners) == nil)
+
+-- bind guards the graph at the mutation itself, independent of any caller preflight.
+store = {}
+local state = real_require("./state").new({ kv = tern.kv, log = tern.log, notify = function() end })
+assert(state.bind_wingman(1, 2) == nil and state.bind_wingman(2, 3) == nil)
+local saved = store.owners_v1
+assert(string.find(state.bind_wingman(3, 1) or "", "ownership cycle", 1, true))
+assert(string.find(state.bind_wingman(1, 1) or "", "ownership cycle", 1, true))
+assert(state.raw_owner(1) == nil and state.raw_owner(3) == 2 and store.owners_v1 == saved)
+assert(state.owners()[2] == 1 and state.bind_wingman(1, 2) == nil)
+state.unbind_pane(2)
+assert(state.raw_owner(2) == nil and state.raw_owner(3) == nil and store.owners_v1["3"] == nil)
