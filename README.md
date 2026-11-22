@@ -28,6 +28,7 @@ Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across
 - **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if `omp` finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if the lead agent is busy); `omp` can also push mid-turn progress or questions proactively via `wingman.py report`.
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
 - **Non-intrusive Splits & Picture-in-Picture (`--pip br`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), and floats/docks the wingman as a corner PiP overlay on demand.
+- **Native Live Panel (`radar.luau`)** — a Tern canvas showing the `owner → wingman` topology, the files agents are touching (`git status` ∪ edit/read tool calls), and their recent tool calls, with one-click Focus / PiP / Dock / Interrupt / Retry / Unqueue. Pure Luau inside the window plugin: no subprocess, no CLI round-trip, no change to the socket protocol.
 - **Mechanism, not policy** — zero prompt rewriting and zero hidden config overrides; the lead agent decides per task whether to open a fresh session (`new`), iterate in place (`same`), resume a specific session, or isolate risky changes in an [`ovnfs`](https://github.com/stencil-hq/ovnfs) copy-on-write checkout.
 
 ## Architecture
@@ -88,6 +89,17 @@ tern plugin list
 
 </details>
 
+## Live Panel
+
+Toggle it from the palette (**Wingman: Toggle Live Panel**) or add the **Wingman** widget to the widget bar (palette → *Edit widgets…* → *Plugins*); the widget shows working / waiting / queued counts and toggles the panel on click. The canvas opens as a sidebar on the far right of the tab (about a quarter of its width, taken from the panes on its left) without taking focus, and survives `tern plugin reload`. The button beside *Tab* / *All* floats it as a corner PiP over the rightmost pane or docks it back; that choice, and the corner you drag the float to, are remembered.
+
+- **Topology** — each owner with its bound wingmen: state, time in state, queued prompts, fault flag. Click a row to focus its pane; per-row PiP/Dock, Interrupt, Retry (after a fault) and Unqueue run the same cores as the CLI ops.
+- **Living files** — per repository, `git status` merged with the files agents edited or read in recent tool calls; click to open. *Clear reads* hides read-only entries.
+- **Activity** — each working agent's card shows its current tool and a strip of its last 24 calls colored by kind (read / search / edit / run / error, the running one pulsing); below, the last 8 calls across agents from `cx.agents:transcript`, for omp and ACP panes alike.
+- **Stage & dock** — working / waiting / queued / fault tiles under a glow that follows the agents' mood, *Tab* / *All* scope (persisted), *Open Git*, *Clear reads*, and a health dot whose tooltip shows the panel's measured cost per render.
+
+Budget (Tern pauses a window hook whose call runs past 50 ms of Lua, and every timer shares one hook with the wingman watchdog): while closed the panel only keeps per-agent counts for the widget — no timer, transcript or git work. While open it re-renders on agent events and ticks only while an in-scope agent is working, spaced to keep under 2 % of the window thread; `git status` runs once per repository, is never re-issued while pending, and is asked less often the slower it is. Each render times its Lua and native parts; past 10 ms of Lua (or 100 ms wall) it drops transcript sampling ("lite") for a cooldown that doubles like Tern's own pause. It never reads `cx.session:surface` (~20 ms per omp pane).
+
 ## CLI Reference (`wingman.py`)
 
 `wingman.py` requires only Python 3.10+ standard library (**Linux, macOS & Windows**). Outside Tern (or with `--mode headless`), `send` automatically falls back to detached `omp -p --wait-async --auto-approve`.
@@ -96,13 +108,18 @@ tern plugin list
 # Inspect live Tern TSP agents, PiP floats, ovnfs availability, and recent sessions
 python3 skills/wingman/scripts/wingman.py info --cwd /path/to/project
 
-# Dispatch work to a fresh session ('new'), active pane ('same'), or specific session ID
+# Dispatch work: 'new' ADDS another wingman (never closes or replaces an existing one); 'same' reuses one
 python3 skills/wingman/scripts/wingman.py send new \
   --cwd /path/to/project \
   --prompt-file /path/to/spec.md
 
-# Dispatch directly into a bottom-right Picture-in-Picture floating pane
-python3 skills/wingman/scripts/wingman.py send same --pip br --prompt "Run pytest -q and fix the failing edge case"
+# Choose placement for a new/existing worker: split (default) | down | pip | tab | park
+python3 skills/wingman/scripts/wingman.py send new --layout down --prompt "Add tests for parser.py"
+python3 skills/wingman/scripts/wingman.py send new --layout pip --pip tr --prompt "Watch the build"  # --pip tr works by itself too
+
+# Several wingmen bound? Target one exactly with --pane; replacement is explicit and never automatic
+python3 skills/wingman/scripts/wingman.py send same --pane <id> --prompt "Run pytest -q"
+python3 skills/wingman/scripts/wingman.py send new --replace --prompt "Start over"   # closes the sole/unique-cwd bound worker; errors if none or ambiguous
 
 # Read structured TSP chat messages & tool cards directly from Tern memory
 python3 skills/wingman/scripts/wingman.py transcript --last 6
@@ -112,9 +129,11 @@ python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id"
 # Worker turn failed/aborted (supervisor gets `[Wingman fault · retryable · pane <id>]`): native `/retry`, same as F5
 python3 skills/wingman/scripts/wingman.py retry --pane <id>
 
-# Float to PiP, dock back into split, interrupt Ctrl-C, cancel queued prompts, or close worker
+# Float to PiP (corner br|bl|tr|tl), dock back, park (hide, still live) / unpark, interrupt, cancel queued, close
 python3 skills/wingman/scripts/wingman.py pip --corner br
 python3 skills/wingman/scripts/wingman.py dock --dir right
+python3 skills/wingman/scripts/wingman.py park --pane <id>
+python3 skills/wingman/scripts/wingman.py unpark --pane <id>
 python3 skills/wingman/scripts/wingman.py interrupt
 python3 skills/wingman/scripts/wingman.py unqueue
 python3 skills/wingman/scripts/wingman.py stop
@@ -128,6 +147,22 @@ python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 
 - **Cross-agent memory ([deja-vu](https://github.com/vshulcz/deja-vu))**: `deja` indexes transcripts across 48 coding agents alongside `omp`, giving your lead agent instant historical recall while `tern-wingman` owns live TSP execution.
 - **Zero-copy sandboxes ([ovnfs](https://github.com/stencil-hq/ovnfs))**: Run risky refactors or parallel A/B tasks by passing `--cwd "$(ovnfs new .)"`, reviewing with `ovnfs diff`, and landing with `ovnfs apply`.
+
+### Multiple wingmen & placement
+
+One owner can run several wingmen at once. `send new` adds a worker; `send new --replace` closes only the selected bound worker before launching its replacement. `send same` and controls select the sole bound worker automatically. With several, use `--pane <id>` or an explicit `--cwd` that matches exactly one; ambiguous commands list the bound IDs. `info` reports sorted `boundWingmanPanes` and retains `boundWingmanPane` when there is exactly one.
+
+`--layout` selects placement (default `split` for a fresh worker; an existing target keeps its placement unless `--layout` is given):
+
+| Layout | Use for |
+| --- | --- |
+| `split` | primary worker, beside the supervisor |
+| `pip` | lightweight worker or watcher (`--pip tl\|tr\|bl\|br` sets the corner and implies `--layout pip`; default `br`) |
+| `down` | second worker, stacked under the right-side worker |
+| `tab` | independent unfocused tab for a 3rd+ or noisy worker |
+| `park` | hide a live worker; it keeps running and still reports (`unpark` brings it back) |
+
+New workers open without taking focus. The Live Panel shows all wingmen of an in-tab supervisor, even those parked or in another tab. Parked workers still receive prompts and deliver completion callbacks. Use `park` and `unpark` to hide and show a live worker without stopping it.
 
 ## Development & Tests
 

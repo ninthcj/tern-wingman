@@ -52,13 +52,18 @@ class WingmanTests(unittest.TestCase):
                 },
             ],
         }
-        # Even though bound pane 105 has a different cwd (ovnfs checkout), `same` & `new` & `interrupt` target 105
+        # Even though bound pane 105 has a different cwd (ovnfs checkout), `same` & `interrupt` target 105;
+        # plain `new` always spawns an additional worker (no target) and only `--replace` resets 105.
         self.assertEqual(
             wingman.resolve_target_pane_from_status(status, None, lead_cwd, "same", None, anchor_pane=100),
             (105, False),
         )
         self.assertEqual(
             wingman.resolve_target_pane_from_status(status, None, lead_cwd, "new", None, anchor_pane=100),
+            (None, False),
+        )
+        self.assertEqual(
+            wingman.resolve_target_pane_from_status(status, None, lead_cwd, "new", None, anchor_pane=100, replace=True),
             (105, True),
         )
         self.assertEqual(wingman.select_wingman_pane_from_status(status, None, 100, cwd=lead_cwd), 105)
@@ -462,6 +467,371 @@ class WingmanTests(unittest.TestCase):
                     os.environ.pop("XDG_RUNTIME_DIR", None)
                 else:
                     os.environ["XDG_RUNTIME_DIR"] = old_xdg
+
+    def test_read_prompt_input_dash_reads_piped_stdin(self) -> None:
+        class _FakeStdin:
+            def __init__(self, text: str, tty: bool) -> None:
+                self._text = text
+                self._tty = tty
+
+            def isatty(self) -> bool:
+                return self._tty
+
+            def read(self) -> str:
+                return self._text
+
+        with unittest.mock.patch.object(wingman.sys, "stdin", _FakeStdin("  heredoc body\n", tty=False)):
+            self.assertEqual(wingman._read_prompt_input("-", None), "heredoc body")
+        with unittest.mock.patch.object(wingman.sys, "stdin", _FakeStdin("", tty=True)):
+            self.assertEqual(wingman._read_prompt_input("-", None), "-")
+
+
+def _agent(pane: int, cwd: str = "/tmp/work", **extra: object) -> dict:
+    return {"pane": pane, "is_self": False, "same_tab": True, "cwd": cwd, "state": "idle", **extra}
+
+
+def _multi_status(bound: list[int], extra_agents: list[dict] | None = None, cwds: dict[int, str] | None = None) -> dict:
+    cwds = cwds or {}
+    agents = [{"pane": 100, "is_self": True, "same_tab": True, "cwd": "/tmp/main", "state": "working"}]
+    agents += [_agent(p, cwds.get(p, "/tmp/work"), bound_owner=100, is_bound_to_me=True) for p in bound]
+    agents += extra_agents or []
+    status: dict = {"ok": True, "bound_panes": sorted(bound), "agents": agents}
+    if len(bound) == 1:
+        status["bound_pane"] = bound[0]
+    return status
+
+
+class WingmanMultiWorkerTests(unittest.TestCase):
+    def _patched(self, status: dict, bridge_log: list[dict], reply: dict | None = None):
+        from contextlib import ExitStack
+        from unittest import mock
+
+        def fake_bridge(req, timeout=None, on_ack=None):
+            bridge_log.append(req)
+            if req["op"] == "status":
+                return status
+            return reply if reply is not None else {"ok": True, "pane": 777, "status": "done", "last_message": "ok"}
+
+        stack = ExitStack()
+        stack.enter_context(mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}))
+        stack.enter_context(mock.patch.object(wingman, "call_bridge", fake_bridge))
+        stack.enter_context(mock.patch.object(wingman, "find_omp_bin", lambda: "omp"))
+        stack.enter_context(mock.patch.object(wingman, "find_tern_bin", lambda: None))
+        stack.enter_context(mock.patch.object(wingman, "inspect_tern", lambda _b: None))
+        stack.enter_context(mock.patch("sys.stdout"))
+        stack.enter_context(mock.patch("sys.stderr"))
+        return stack
+
+    def _send(self, argv: list[str], status: dict) -> tuple[list[dict], object]:
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(["send", *argv, "-m", "go", "--wait"])
+        with self._patched(status, calls):
+            with self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+        return calls, cm.exception.code
+
+    def _dispatch(self, argv: list[str], status: dict) -> dict:
+        calls, code = self._send(argv, status)
+        self.assertEqual(code, 0)
+        dispatches = [c for c in calls if c["op"] == "dispatch"]
+        self.assertEqual(len(dispatches), 1)
+        return dispatches[0]
+
+    def _send_error(self, argv: list[str], status: dict) -> tuple[list[dict], str]:
+        calls, code = self._send(argv, status)
+        self.assertIsInstance(code, str)
+        self.assertFalse([c for c in calls if c["op"] == "dispatch"], "must not dispatch on error")
+        return calls, str(code)
+
+    def test_bound_panes_from_status_prefers_list_and_falls_back_to_legacy(self) -> None:
+        self.assertEqual(wingman.bound_panes_from_status({"bound_panes": [107, 105, 105]}), [105, 107])
+        self.assertEqual(wingman.bound_panes_from_status({"bound_panes": [100, 105]}, exclude=100), [105])
+        self.assertEqual(wingman.bound_panes_from_status({"bound_panes": []}), [])
+        # Old plugin only reports the singular field
+        self.assertEqual(wingman.bound_panes_from_status({"bound_pane": 105}), [105])
+        self.assertEqual(wingman.bound_panes_from_status({"bound_pane": None, "agents": []}), [])
+        # New list wins over a stale singular value
+        self.assertEqual(wingman.bound_panes_from_status({"bound_panes": [106, 107], "bound_pane": 105}), [106, 107])
+
+    def test_new_spawns_additional_worker_without_target_even_when_bound(self) -> None:
+        req = self._dispatch(["new"], _multi_status([105, 106]))
+        self.assertIsNone(req["target_pane"])
+        self.assertFalse(req["reset_new"])
+        self.assertEqual(req["layout"], "split")
+        self.assertNotIn("pip_corner", req)
+        req = self._dispatch(["new"], _multi_status([105]))
+        self.assertIsNone(req["target_pane"])
+        self.assertFalse(req["reset_new"])
+
+    def test_new_replace_selects_sole_explicit_or_unique_cwd_owned_worker(self) -> None:
+        req = self._dispatch(["new", "--replace"], _multi_status([105]))
+        self.assertEqual((req["target_pane"], req["reset_new"]), (105, True))
+        self.assertNotIn("layout", req)  # existing target keeps its placement
+
+        two = _multi_status([105, 106], cwds={105: "/tmp/a", 106: "/tmp/b"})
+        req = self._dispatch(["new", "--replace", "--pane", "106"], two)
+        self.assertEqual((req["target_pane"], req["reset_new"]), (106, True))
+        req = self._dispatch(["new", "--replace", "--cwd", "/tmp/b"], two)
+        self.assertEqual((req["target_pane"], req["reset_new"]), (106, True))
+
+        # Replace with a layout re-places the replaced worker explicitly
+        req = self._dispatch(["new", "--replace", "--layout", "tab"], _multi_status([105]))
+        self.assertEqual((req["target_pane"], req["reset_new"], req["layout"]), (105, True, "tab"))
+
+    def test_new_replace_errors_instead_of_guessing_or_closing_unowned_panes(self) -> None:
+        two = _multi_status([105, 106], cwds={105: "/tmp/a", 106: "/tmp/b"})
+        _, msg = self._send_error(["new", "--replace"], two)
+        self.assertIn("105", msg)
+        self.assertIn("106", msg)
+        self.assertIn("--pane", msg)
+        # Explicit --cwd that matches none (or several) never auto-selects
+        _, msg = self._send_error(["new", "--replace", "--cwd", "/tmp/c"], two)
+        self.assertIn("--pane", msg)
+        # Unowned pane (peer wingman, manual omp) must not be replaceable via --pane
+        manual = _agent(200, bound_owner=None)
+        _, msg = self._send_error(["new", "--replace", "--pane", "200"], _multi_status([105], [manual]))
+        self.assertIn("not a wingman bound", msg)
+        # No bound worker -> there is nothing to replace, even with an unclaimed pane in the tab
+        _, msg = self._send_error(["new", "--replace"], _multi_status([], [_agent(200)]))
+        self.assertIn("no replacement target", msg)
+
+    def test_new_replace_works_with_legacy_status_bound_pane(self) -> None:
+        legacy = {"ok": True, "bound_pane": 105, "agents": [_agent(105, bound_owner=100)]}
+        req = self._dispatch(["new", "--replace"], legacy)
+        self.assertEqual((req["target_pane"], req["reset_new"]), (105, True))
+        req = self._dispatch(["same"], legacy)
+        self.assertEqual((req["target_pane"], req["reset_new"]), (105, False))
+
+    def test_same_requires_pane_or_cwd_when_several_owned_workers(self) -> None:
+        three = _multi_status([105, 106, 107], cwds={105: "/tmp/a", 106: "/tmp/b", 107: "/tmp/b"})
+        _, msg = self._send_error(["same"], three)
+        for pid in ("105", "106", "107"):
+            self.assertIn(pid, msg)
+        self.assertIn("--pane", msg)
+        # A unique cwd disambiguates; an ambiguous cwd still errors rather than picking first
+        req = self._dispatch(["same", "--cwd", "/tmp/a"], three)
+        self.assertEqual(req["target_pane"], 105)
+        self._send_error(["same", "--cwd", "/tmp/b"], three)
+        # Exact pane always wins
+        req = self._dispatch(["same", "--pane", "107"], three)
+        self.assertEqual((req["target_pane"], req["reset_new"]), (107, False))
+        self.assertNotIn("layout", req)
+
+    def test_same_adopts_unclaimed_omp_only_when_no_bound_worker(self) -> None:
+        cwd = Path("/tmp/demo-repo")
+        inspect_data = {"panes": [{"pane": 102, "omp_session_file": "/tmp/s102.jsonl"}]}
+        manual = _agent(102, str(cwd), bound_owner=None)
+        status = _multi_status([], [manual])
+        self.assertEqual(
+            wingman.resolve_target_pane_from_status(status, inspect_data, cwd, "same", None, anchor_pane=100),
+            (102, False),
+        )
+        # With an owned worker the manual pane is never considered
+        owned = _multi_status([105], [manual])
+        self.assertEqual(
+            wingman.resolve_target_pane_from_status(owned, inspect_data, cwd, "same", None, anchor_pane=100),
+            (105, False),
+        )
+        # Nothing owned and nothing adoptable -> no target
+        self.assertEqual(
+            wingman.resolve_target_pane_from_status(_multi_status([]), inspect_data, cwd, "same", None, anchor_pane=100),
+            (None, False),
+        )
+        # Explicit session resume keeps matching by authoritative session file, regardless of ownership
+        sess = Path("/tmp/s102.jsonl")
+        resume_inspect = {"panes": [{"pane": 102, "omp_session_file": str(sess.resolve())}]}
+        self.assertEqual(
+            wingman.resolve_target_pane_from_status(owned, resume_inspect, cwd, "latest", sess, anchor_pane=100),
+            (102, False),
+        )
+
+    def test_every_layout_is_forwarded_for_fresh_and_existing_targets(self) -> None:
+        for layout in ("split", "down", "tab", "park"):
+            with self.subTest(layout=layout, target="fresh"):
+                req = self._dispatch(["new", "--layout", layout], _multi_status([]))
+                self.assertEqual((req["layout"], req["target_pane"], req["reset_new"]), (layout, None, False))
+                self.assertNotIn("pip_corner", req)
+            with self.subTest(layout=layout, target="existing"):
+                req = self._dispatch(["same", "--layout", layout], _multi_status([105]))
+                self.assertEqual((req["layout"], req["target_pane"], req["reset_new"]), (layout, 105, False))
+                self.assertNotIn("pip_corner", req)
+
+        for target_argv, status in ((["new"], _multi_status([])), (["same"], _multi_status([105]))):
+            with self.subTest(layout="pip", argv=target_argv):
+                # `--layout pip` alone defaults to the bottom-right corner
+                req = self._dispatch([*target_argv, "--layout", "pip"], status)
+                self.assertEqual((req["layout"], req["pip_corner"]), ("pip", "br"))
+                # `--layout pip --pip <corner>` and legacy `--pip <corner>` alone are equivalent
+                for corner in ("tl", "tr", "bl", "br"):
+                    both = self._dispatch([*target_argv, "--layout", "pip", "--pip", corner], status)
+                    alone = self._dispatch([*target_argv, "--pip", corner], status)
+                    self.assertEqual((both["layout"], both["pip_corner"]), ("pip", corner))
+                    self.assertEqual((alone["layout"], alone["pip_corner"]), ("pip", corner))
+                    self.assertEqual(both["target_pane"], alone["target_pane"])
+
+    def test_pip_flag_alone_and_with_layout_pip_target_existing_worker(self) -> None:
+        req = self._dispatch(["same", "--pip", "tl"], _multi_status([105]))
+        self.assertEqual((req["layout"], req["pip_corner"], req["target_pane"]), ("pip", "tl", 105))
+        req = self._dispatch(["same", "--layout", "pip", "--pip", "tl"], _multi_status([105]))
+        self.assertEqual((req["layout"], req["pip_corner"], req["target_pane"]), ("pip", "tl", 105))
+
+    def test_existing_target_without_layout_keeps_placement_and_dispatch_command_is_unchanged(self) -> None:
+        req = self._dispatch(["same"], _multi_status([105]))
+        self.assertNotIn("layout", req)
+        self.assertNotIn("pip_corner", req)
+        self.assertEqual(
+            set(req),
+            {"op", "anchor_pane", "target_pane", "reset_new", "queue", "async_callback", "cwd", "command", "prompt"},
+        )
+        self.assertEqual(req["command"], wingman.format_command_line(["omp", "--auto-approve", "--cwd", req["cwd"]]))
+        self.assertEqual(req["prompt"], "go")
+
+    def test_send_flag_conflicts_are_rejected_before_any_bridge_call(self) -> None:
+        cases = {
+            "--pip conflicts": ["new", "--pip", "tl", "--layout", "down"],
+            "--pip conflicts with --layout tab": ["new", "--layout", "tab", "--pip", "tl"],
+            "--pip conflicts with --layout split": ["same", "--layout", "split", "--pip", "br"],
+            "only applies to `send new`": ["same", "--replace"],
+            "only applies to `send same`": ["new", "--pane", "105"],
+            "own pane": ["same", "--pane", "100"],
+            "invalid pane": ["same", "--pane", "abc"],
+        }
+        for needle, argv in cases.items():
+            with self.subTest(needle=needle):
+                calls, msg = self._send_error(argv, _multi_status([105]))
+                self.assertIn(needle, msg)
+                self.assertEqual(calls, [])
+        # --pane is not meaningful for resume-by-session or latest
+        _, msg = self._send_error(["latest", "--pane", "105"], _multi_status([105]))
+        self.assertIn("only applies", msg)
+
+    def test_headless_rejects_tern_only_placement_flags(self) -> None:
+        from unittest import mock
+
+        parser = wingman.build_parser()
+        for flags in (
+            ["new", "--pane", "105"],
+            ["new", "--replace"],
+            ["new", "--layout", "tab"],
+            ["new", "--pip", "tl"],
+        ):
+            with self.subTest(flags=flags):
+                ns = parser.parse_args(["send", *flags, "-m", "hi", "--mode", "headless"])
+                with mock.patch.object(wingman.subprocess, "Popen") as popen, self.assertRaises(SystemExit) as cm:
+                    ns.func(ns)
+                self.assertIn("headless", str(cm.exception.code))
+                popen.assert_not_called()
+        # Outside Tern (`auto` with no $TERN_PANE) is headless too
+        ns = parser.parse_args(["send", "new", "--layout", "tab", "-m", "hi"])
+        with mock.patch.dict(wingman.os.environ, {}, clear=False):
+            wingman.os.environ.pop("TERN_PANE", None)
+            with mock.patch.object(wingman.subprocess, "Popen") as popen, self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+        self.assertIn("headless", str(cm.exception.code))
+        popen.assert_not_called()
+
+    def _control(self, subcmd: str, argv: list[str], status: dict) -> tuple[list[dict], object]:
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args([subcmd, *argv])
+        with self._patched(status, calls, reply={"ok": True}):
+            try:
+                ns.func(ns)
+                code = None
+            except SystemExit as exc:
+                code = exc.code
+        return calls, code
+
+    def test_park_unpark_use_bound_list_and_exact_pane(self) -> None:
+        for sub in ("park", "unpark"):
+            with self.subTest(sub=sub, how="sole bound"):
+                calls, code = self._control(sub, [], _multi_status([105]))
+                self.assertIsNone(code)
+                self.assertEqual(calls[-1], {"op": sub, "anchor_pane": 100, "target_pane": 105})
+            with self.subTest(sub=sub, how="explicit pane among many"):
+                calls, code = self._control(sub, ["--pane", "106"], _multi_status([105, 106]))
+                self.assertIsNone(code)
+                self.assertEqual(calls, [{"op": sub, "anchor_pane": 100, "target_pane": 106}])  # no status lookup needed
+            with self.subTest(sub=sub, how="positional pane"):
+                calls, _ = self._control(sub, ["107"], _multi_status([105, 106]))
+                self.assertEqual(calls[-1]["target_pane"], 107)
+            with self.subTest(sub=sub, how="self rejected"):
+                calls, code = self._control(sub, ["--pane", "100"], _multi_status([105]))
+                self.assertIn("own pane", str(code))
+                self.assertEqual(calls, [])
+            with self.subTest(sub=sub, how="bridge error"):
+                calls = []
+                ns = wingman.build_parser().parse_args([sub, "--pane", "105"])
+                with self._patched({}, calls, reply={"ok": False, "error": "not a worker"}):
+                    with self.assertRaises(SystemExit) as cm:
+                        ns.func(ns)
+                self.assertIn("not a worker", str(cm.exception.code))
+
+    def test_controls_never_pick_first_of_multiple_bound_workers(self) -> None:
+        status = _multi_status([105, 106], cwds={105: "/tmp/a", 106: "/tmp/b"})
+        for sub in ("park", "unpark", "stop", "interrupt", "pip", "dock", "transcript"):
+            with self.subTest(sub=sub):
+                calls, code = self._control(sub, [], status)
+                self.assertIn("105", str(code))
+                self.assertIn("106", str(code))
+                self.assertIn("--pane", str(code))
+                self.assertEqual([c["op"] for c in calls], ["status"])
+        # Explicit --cwd picks only a unique match
+        calls, code = self._control("park", ["--cwd", "/tmp/b"], status)
+        self.assertIsNone(code)
+        self.assertEqual(calls[-1]["target_pane"], 106)
+        calls, code = self._control("park", ["--cwd", "/tmp/zzz"], status)
+        self.assertIsInstance(code, str)
+        self.assertEqual([c["op"] for c in calls], ["status"])
+
+    def test_controls_fall_back_to_manual_adoption_only_without_bound_workers(self) -> None:
+        cwd = Path("/tmp/demo-repo")
+        inspect_data = {"panes": [{"pane": 102, "omp_session_file": "/tmp/s102.jsonl"}]}
+        manual = _agent(102, str(cwd))
+        self.assertEqual(wingman.select_wingman_pane_from_status(_multi_status([], [manual]), inspect_data, 100, cwd=cwd), 102)
+        # Owned worker 105 is chosen even though a manual omp pane exists
+        self.assertEqual(wingman.select_wingman_pane_from_status(_multi_status([105], [manual]), inspect_data, 100), 105)
+        with self.assertRaises(SystemExit):
+            wingman.select_wingman_pane_from_status(_multi_status([]), inspect_data, 100)
+        # Legacy status with only `bound_pane`
+        self.assertEqual(wingman.select_wingman_pane_from_status({"bound_pane": 105, "agents": []}, None, 100), 105)
+
+    def test_info_reports_all_bound_panes_plus_singular_and_placement_flags(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        def info_for(status: dict) -> dict:
+            with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+                ns = wingman.build_parser().parse_args(["info", "--cwd", tmp])
+                buf = io.StringIO()
+                with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(
+                    wingman, "find_omp_bin", lambda: "omp"
+                ), mock.patch.object(wingman, "find_tern_bin", lambda: None), mock.patch.object(
+                    wingman, "find_ovnfs_bin", lambda: None
+                ), mock.patch.object(wingman, "get_collab_hosts", lambda _b: {}), mock.patch.object(
+                    wingman, "call_bridge", lambda req, timeout=None: status
+                ), mock.patch.object(wingman, "inspect_tern", lambda _b: None), redirect_stdout(buf):
+                    ns.func(ns)
+                return json.loads(buf.getvalue())
+
+        many = _multi_status([107, 105])
+        many["agents"][1]["parked"] = True
+        many["agents"][2]["floating"] = True
+        out = info_for(many)
+        self.assertEqual(out["boundWingmanPanes"], [105, 107])
+        self.assertIsNone(out["boundWingmanPane"])
+        by_pane = {a["pane"]: a for a in out["ternAgents"]}
+        self.assertTrue(by_pane[107]["parked"])
+        self.assertTrue(by_pane[105]["floating"])
+        self.assertTrue(by_pane[105]["isBoundToMe"])
+
+        out = info_for(_multi_status([105]))
+        self.assertEqual((out["boundWingmanPanes"], out["boundWingmanPane"]), ([105], 105))
+        out = info_for(_multi_status([]))
+        self.assertEqual((out["boundWingmanPanes"], out["boundWingmanPane"]), ([], None))
+        # Old plugin: only singular bound_pane
+        out = info_for({"ok": True, "bound_pane": 105, "agents": [_agent(105, bound_owner=100)]})
+        self.assertEqual((out["boundWingmanPanes"], out["boundWingmanPane"]), ([105], 105))
 
 
 if __name__ == "__main__":

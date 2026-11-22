@@ -24,28 +24,41 @@ local function resolve_ipc_dir(): string
 end
 
 local ipc_dir = resolve_ipc_dir()
-local KV_BINDINGS = "bindings_v1"
+local KV_OWNERS = "owners_v1"
+local KV_LEGACY_BINDINGS = "bindings_v1"
 local KV_CALLBACK_CFG = "auto_callback_v1"
 local KV_WAITING = "notified_waiting_v1"
+
+-- Live panel (radar.luau): optional UI over this control plane. A load error must never take the plugin down.
+local radar_loaded, radar = pcall(function()
+	return require("./radar")
+end)
+if not radar_loaded then
+	tern.log.error("wingman: radar.luau failed to load:", tostring(radar))
+end
+
+-- Tells the panel that ownership, placement, queues or escalations may have moved.
+local function notify_radar()
+	if radar_loaded then
+		pcall(radar.on_state_change)
+	end
+end
 
 type WaitEntry = {
 	cids: { number },
 	started_ms: number,
 	saw_working: boolean,
 	idle_since: number?,
-	pending_prompt: string?,
-	ask_deadline: number?,
 }
 
 type QueuedDispatch = {
 	cid: number?,
 	anchor: number,
 	prompt: string,
-	pip_corner: string?,
 }
 
--- Explicit ownership bijection: anchor_pane (supervisor, e.g. agy) -> wingman_pane (worker, e.g. omp)
-local bindings: { [number]: number } = {}
+-- Each worker has one owner; an owner can supervise any number of workers.
+local owners: { [number]: number } = {}
 -- Active in-flight turn waits keyed by wingman pane_id
 local pending_waits: { [number]: WaitEntry } = {}
 -- Native per-pane FIFO dispatch queue when target_pane is busy (`working`)
@@ -69,31 +82,50 @@ local mux_child: Child? = nil
 local unloading = false
 local watchdog_armed = false
 
-local function save_bindings()
-	local ser: { [string]: number } = {}
-	local any_entry = false
-	for anchor_id, worker_id in pairs(bindings) do
-		ser[tostring(anchor_id)] = worker_id
-		any_entry = true
+local function save_owners(): boolean
+	local serialized: { [string]: number } = {}
+	for worker, owner in owners do
+		serialized[tostring(worker)] = owner
 	end
-	pcall(function()
-		if any_entry then
-			tern.kv.set(KV_BINDINGS, ser)
-		else
-			tern.kv.set(KV_BINDINGS, nil)
-		end
+	local ok, err = pcall(function(): any
+		tern.kv.set(KV_OWNERS, serialized)
+		return nil
 	end)
+	if not ok then
+		tern.log.warn("wingman: could not persist owners:", tostring(err))
+	end
+	notify_radar()
+	return ok
 end
 
-local function load_bindings()
-	local ok, raw = pcall(tern.kv.get, KV_BINDINGS)
-	if ok and type(raw) == "table" then
-		for k, v in pairs(raw) do
-			local aid = tonumber(k)
-			local wid = tonumber(v)
-			if aid and wid and aid ~= wid then
-				bindings[aid] = wid
+local function load_owners()
+	local ok, raw = pcall(tern.kv.get, KV_OWNERS)
+	if not ok then
+		tern.log.warn("wingman: could not read owners:", tostring(raw))
+		return
+	end
+	local legacy = raw == nil
+	if legacy then
+		ok, raw = pcall(tern.kv.get, KV_LEGACY_BINDINGS)
+		if not ok then
+			tern.log.warn("wingman: could not read legacy bindings:", tostring(raw))
+			return
+		end
+	end
+	if type(raw) == "table" then
+		for k, v in raw do
+			local key, value = tonumber(k), tonumber(v)
+			if key and value and key ~= value then
+				local worker, owner = if legacy then value else key, if legacy then key else value
+				local previous = owners[worker]
+				-- Old versions guaranteed uniqueness; resolve malformed duplicates deterministically.
+				if previous == nil or owner < previous then
+					owners[worker] = owner
+				end
 			end
+		end
+		if legacy and save_owners() then
+			pcall(tern.kv.set, KV_LEGACY_BINDINGS, nil)
 		end
 	end
 end
@@ -136,6 +168,7 @@ local function save_waiting()
 	pcall(function()
 		tern.kv.set(KV_WAITING, if next(ser) ~= nil then ser else nil)
 	end)
+	notify_radar()
 end
 
 local function load_waiting()
@@ -164,17 +197,7 @@ local function is_auto_callback_enabled(owner_pane: number?): boolean
 	return default_auto_callback
 end
 
-local function prune_bindings(cx: WindowCx)
-	local dirty = false
-	for aid, wid in pairs(bindings) do
-		if aid == wid or cx.session:pane(aid) == nil or cx.session:pane(wid) == nil then
-			bindings[aid] = nil
-			dirty = true
-		end
-	end
-	if dirty then
-		save_bindings()
-	end
+local function prune_notifications(cx: WindowCx)
 	local cb_dirty = false
 	for aid, _ in pairs(owner_auto_callback) do
 		if cx.session:pane(aid) == nil then
@@ -197,50 +220,40 @@ local function prune_bindings(cx: WindowCx)
 	end
 end
 
-local function get_bound_wingman(cx: WindowCx, anchor: number): number?
-	prune_bindings(cx)
-	return bindings[anchor]
+local function bound_workers(cx: WindowCx, anchor: number): { number }
+	local workers: { number } = {}
+	for worker, owner in owners do
+		if owner == anchor and cx.session:pane(worker) ~= nil then
+			table.insert(workers, worker)
+		end
+	end
+	table.sort(workers)
+	return workers
 end
 
 local function owner_of_pane(cx: WindowCx, pane_id: number): number?
-	prune_bindings(cx)
-	for aid, wid in pairs(bindings) do
-		if wid == pane_id then
-			return aid
-		end
-	end
-	return nil
+	local owner = owners[pane_id]
+	return if owner ~= nil and cx.session:pane(owner) ~= nil then owner else nil
 end
 
 local function bind_wingman(anchor: number, worker: number)
-	if anchor == worker then
-		return
-	end
-	for aid, wid in pairs(bindings) do
-		if wid == worker and aid ~= anchor then
-			bindings[aid] = nil
-		end
-	end
-	if bindings[anchor] ~= worker then
-		bindings[anchor] = worker
-		save_bindings()
+	if anchor ~= worker and owners[worker] ~= anchor then
+		owners[worker] = anchor
+		save_owners()
 	end
 end
 
 local function unbind_pane(pane_id: number)
-	local dirty = false
-	if bindings[pane_id] ~= nil then
-		bindings[pane_id] = nil
-		dirty = true
-	end
-	for aid, wid in pairs(bindings) do
-		if wid == pane_id then
-			bindings[aid] = nil
+	local dirty = owners[pane_id] ~= nil
+	owners[pane_id] = nil
+	for worker, owner in owners do
+		if owner == pane_id then
+			owners[worker] = nil
 			dirty = true
 		end
 	end
 	if dirty then
-		save_bindings()
+		save_owners()
 	end
 	if owner_auto_callback[pane_id] ~= nil then
 		owner_auto_callback[pane_id] = nil
@@ -378,7 +391,6 @@ local INTERACTIVE_ROLES = {
 	["omp.overlay.hook-input"] = true,
 	["omp.overlay.hook-select"] = true,
 }
-local WIRE_KINDS = { button = true, list = true, input = true, editor = true, el = true }
 
 local function walk_nodes(node: any, depth: number, visit: (any) -> boolean): boolean
 	if type(node) ~= "table" or depth > 16 then
@@ -521,19 +533,13 @@ local function build_waiting_summary(cx: WindowCx, pane_id: number): (string, st
 				if type(m.text) == "string" and m.text ~= "" and not string.find(surface_text, m.text, 1, true) then
 					table.insert(parts, "Last assistant message:\n" .. string.sub(m.text, 1, 1000))
 				end
-				if type(m.tools) == "table" and #m.tools > 0 then
-					table.insert(parts, "Tool call metadata:\n" .. string.sub(tern.json.encode(m.tools), 1, 4000))
-				end
 				break
 			end
 		end
 	end
 	table.insert(parts, string.format("Interactive surface (%s · root %s):\n%s", tostring(role or "unknown"), tostring(root_id or "-"), surface_text))
 	table.insert(parts, string.format(
-		"Inspect: `wingman.py surface --pane %d [--json]`. Answer via `wingman.py event --pane %d '<json-event>' ...`:\n"
-			.. "- Pick option & submit: `'{\"ev\":\"action\",\"id\":\"ui\",\"act\":\"pick:0:0\"}' '{\"ev\":\"action\",\"id\":\"ui.actions/submit\",\"act\":\"submit\"}'`\n"
-			.. "- Open folded field / fill `Other…` or text input: `open:<idx>` -> `{\"ev\":\"select\",\"id\":\"<list_id>\",\"item\":\"other\"}` -> check `<input_id>` via `surface` -> `{\"ev\":\"edit\",\"id\":\"<input_id>\",\"from\":0,\"to\":0,\"text\":\"...\",\"cursor\":<utf16_len>,\"len\":0}`\n"
-			.. "- Add option note: `{\"ev\":\"action\",\"id\":\"<item_id>\",\"act\":\"note\"}` -> `edit` `<editor_id>` -> `{\"ev\":\"action\",\"id\":\"ui.actions/save-note\",\"act\":\"save-note\"}`\n"
+		"Inspect: `wingman surface --pane %d`. Answer via `wingman event --pane %d '<json-event>' ...` (see `wingman` skill for multi-step/Other recipes). "
 			.. "Decide technical/architectural questions yourself; consult the user first on product/scope/cost trade-offs.",
 		pane_id, pane_id
 	))
@@ -689,12 +695,6 @@ local function promote_next_queued(cx: WindowCx, pane_id: number)
 		return
 	end
 
-	bind_wingman(item.anchor, pane_id)
-	if item.pip_corner and item.pip_corner ~= "" then
-		pcall(function()
-			cx.layout:float(pane_id, item.anchor, item.pip_corner, { focus = false })
-		end)
-	end
 	reported_in_turn[pane_id] = false
 	if item.cid ~= nil then
 		unsolicited_working[pane_id] = false
@@ -703,8 +703,6 @@ local function promote_next_queued(cx: WindowCx, pane_id: number)
 			started_ms = tern.now(),
 			saw_working = false,
 			idle_since = nil,
-			pending_prompt = nil,
-			ask_deadline = nil,
 		}
 		ensure_watchdog()
 	else
@@ -812,47 +810,27 @@ local function watchdog_step(cx: WindowCx?)
 	if cx then
 		local now = tern.now()
 		for pane_id, w in pairs(pending_waits) do
-			if w.pending_prompt ~= nil then
-				local prompt_text = w.pending_prompt :: string
-				if find_agent_info(cx, pane_id) ~= nil then
-					local ok_ask = pcall(function()
-						cx.agents:ask(pane_id, prompt_text)
-					end)
-					if ok_ask then
-						w.pending_prompt = nil
-						if #w.cids == 0 then
-							pending_waits[pane_id] = nil
-							unsolicited_working[pane_id] = true
-							reported_in_turn[pane_id] = false
-						end
-					end
-				end
-				if w.pending_prompt ~= nil and w.ask_deadline and now > w.ask_deadline then
-					finish_wait(cx, pane_id, "failed", "Timed out waiting for spawned agent TSP surface to accept prompt")
+			local ainfo = find_agent_info(cx, pane_id)
+			if not ainfo then
+				if now - w.started_ms > 5000 and cx.session:pane(pane_id) == nil then
+					finish_wait(cx, pane_id, "closed", "Agent pane disappeared")
 				end
 			else
-				local ainfo = find_agent_info(cx, pane_id)
-				if not ainfo then
-					if now - w.started_ms > 5000 and cx.session:pane(pane_id) == nil then
-						finish_wait(cx, pane_id, "closed", "Agent pane disappeared")
-					end
-				else
-					local derr: any = ainfo.delivery_error
-					if type(derr) == "string" and derr ~= "" then
-						finish_wait(cx, pane_id, "failed", "TSP delivery error: " .. derr)
-					elseif ainfo.state == "working" then
-						w.saw_working = true
-						w.idle_since = nil
-					elseif ainfo.state == "waiting_input" then
-						finish_wait(cx, pane_id, "waiting_input", "Agent is waiting for interactive user input")
-					elseif ainfo.state == "exited" then
-						finish_wait(cx, pane_id, "exited", "Agent process exited")
-					elseif ainfo.state == "idle" and w.saw_working then
-						local since = w.idle_since or now
-						w.idle_since = since
-						if now - since >= 1000 then
-							finish_wait(cx, pane_id, "done", nil)
-						end
+				local derr: any = ainfo.delivery_error
+				if type(derr) == "string" and derr ~= "" then
+					finish_wait(cx, pane_id, "failed", "TSP delivery error: " .. derr)
+				elseif ainfo.state == "working" then
+					w.saw_working = true
+					w.idle_since = nil
+				elseif ainfo.state == "waiting_input" then
+					finish_wait(cx, pane_id, "waiting_input", "Agent is waiting for interactive user input")
+				elseif ainfo.state == "exited" then
+					finish_wait(cx, pane_id, "exited", "Agent process exited")
+				elseif ainfo.state == "idle" and w.saw_working then
+					local since = w.idle_since or now
+					w.idle_since = since
+					if now - since >= 1000 then
+						finish_wait(cx, pane_id, "done", nil)
 					end
 				end
 			end
@@ -896,6 +874,7 @@ local function watchdog_step(cx: WindowCx?)
 		watchdog_armed = true
 		tern.timer(500, watchdog_step)
 	end
+	notify_radar()
 end
 
 ensure_watchdog = function()
@@ -906,7 +885,7 @@ ensure_watchdog = function()
 end
 
 local function seed_inflight_unsolicited_turns(cx: WindowCx)
-	prune_bindings(cx)
+	prune_notifications(cx)
 	for _, a in ipairs(cx.agents:list()) do
 		if a.state == "working" and pending_waits[a.pane] == nil and queued_dispatches[a.pane] == nil then
 			if owner_of_pane(cx, a.pane) ~= nil then
@@ -952,21 +931,6 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 	end
 	local w = pending_waits[ev.pane]
 	if w then
-		if w.pending_prompt ~= nil then
-			local prompt_text = w.pending_prompt :: string
-			local ok_ask = pcall(function()
-				cx.agents:ask(ev.pane, prompt_text)
-			end)
-			if ok_ask then
-				w.pending_prompt = nil
-				if #w.cids == 0 then
-					pending_waits[ev.pane] = nil
-					unsolicited_working[ev.pane] = true
-					reported_in_turn[ev.pane] = false
-				end
-			end
-			return
-		end
 		if ev.new == "working" then
 			w.saw_working = true
 			w.idle_since = nil
@@ -1007,12 +971,9 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		flush_queued_callbacks(cx, ev.pane)
 	end
 
-	-- 2. Active synchronous/async `send` or `await` waiter gets direct reply over mux socket
+	-- 2. Active synchronous `send` or `await` waiter gets its reply over the mux socket.
 	local w = pending_waits[ev.pane]
 	if w then
-		if w.pending_prompt ~= nil then
-			return
-		end
 		finish_wait(cx, ev.pane, ev.result, nil)
 		return
 	end
@@ -1104,6 +1065,7 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	unsolicited_working[ev.pane] = nil
 	reported_in_turn[ev.pane] = nil
 	queued_callbacks[ev.pane] = nil
+	manual_interrupt[ev.pane] = nil
 	if pending_waits[ev.pane] then
 		finish_wait(cx, ev.pane, "closed", "Agent pane was closed")
 	elseif queued_dispatches[ev.pane] then
@@ -1126,31 +1088,14 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	end
 end)
 
-local function register_waiter(pane_id: number, cid: number?, pending_prompt: string?)
+local function register_waiter(pane_id: number, cid: number)
 	unsolicited_working[pane_id] = false
 	reported_in_turn[pane_id] = false
 	local existing = pending_waits[pane_id]
 	if existing then
-		if cid ~= nil then
-			table.insert(existing.cids, cid)
-		end
-		if pending_prompt ~= nil then
-			existing.pending_prompt = pending_prompt
-			existing.ask_deadline = tern.now() + 20000
-		end
+		table.insert(existing.cids, cid)
 	else
-		local cids_list: { number } = {}
-		if cid ~= nil then
-			table.insert(cids_list, cid)
-		end
-		pending_waits[pane_id] = {
-			cids = cids_list,
-			started_ms = tern.now(),
-			saw_working = false,
-			idle_since = nil,
-			pending_prompt = pending_prompt,
-			ask_deadline = if pending_prompt ~= nil then (tern.now() + 20000) else nil,
-		}
+		pending_waits[pane_id] = { cids = { cid }, started_ms = tern.now(), saw_working = false }
 	end
 	ensure_watchdog()
 end
@@ -1185,14 +1130,227 @@ local function resolve_report_owner(cx: WindowCx, worker_pane: number, explicit_
 	return nil, "no supervisor/owner pane is bound to this wingman pane (pass `--pane <id>` to specify)"
 end
 
+-- Cores shared by the RPC ops and the live panel's buttons, so both keep the same control-plane bookkeeping.
+local function interrupt_pane(cx: WindowCx, tp: number): (boolean, string?)
+	manual_interrupt[tp] = true
+	unsolicited_working[tp] = false
+	local ok_i, err_i = pcall(function()
+		cx.agents:interrupt(tp)
+	end)
+	return ok_i, if not ok_i then tostring(err_i) else nil
+end
+
+-- Cancels one queued prompt (1-based `position`) or all of them, failing every cancelled caller's wait.
+local function cancel_queued(tp: number, position: number?): (number, string?)
+	local q = queued_dispatches[tp]
+	if not q or #q == 0 then
+		return 0, nil
+	end
+	local function cancel(item: QueuedDispatch)
+		if item.cid ~= nil then
+			send_mux(item.cid, {
+				ok = false,
+				pane = tp,
+				status = "cancelled",
+				error = "Cancelled from queue via unqueue",
+				last_message = "",
+				transcript = tern.json.array(),
+			}, false)
+		end
+	end
+	if position then
+		local idx = math.floor(position)
+		if idx < 1 or idx > #q then
+			return 0, string.format("queue position %d out of range (1..%d)", idx, #q)
+		end
+		cancel(table.remove(q, idx) :: QueuedDispatch)
+		if #q == 0 then
+			queued_dispatches[tp] = nil
+		end
+		return 1, nil
+	end
+	queued_dispatches[tp] = nil
+	for _, item in ipairs(q) do
+		cancel(item)
+	end
+	return #q, nil
+end
+
+-- Sends `/retry` (F5) to an idle/failed pane; the third value is the busy state that refused it.
+local function retry_pane(cx: WindowCx, tp: number): (boolean, string?, string?)
+	local ainfo = find_agent_info(cx, tp)
+	if ainfo and (ainfo.state == "working" or ainfo.state == "waiting_input") then
+		return false, "target pane is " .. ainfo.state .. " (not idle/failed)", ainfo.state
+	end
+	local ok_r, err_r = pcall(function()
+		cx.agents:ask(tp, "/retry")
+	end)
+	if not ok_r then
+		return false, "cx.agents:ask /retry failed: " .. tostring(err_r), nil
+	end
+	clear_waiting(tp)
+	manual_interrupt[tp] = nil
+	return true, nil, nil
+end
+
+type WorkerLayout = "split" | "down" | "pip" | "tab" | "park"
+
+local function corner_of(value: any): Corner?
+	return if value == "tl" or value == "tr" or value == "bl" or value == "br" then value else nil
+end
+
+local function down_target(cx: WindowCx, anchor: number, moving: number?): number
+	local tab = cx.session:tab_of(anchor)
+	local layout = if tab then cx.session:layout(tab) else nil
+	if not layout then
+		return anchor
+	end
+	local function last_worker(node: TabTree?): number?
+		if not node then
+			return nil
+		end
+		local pane = node.pane
+		if pane then
+			return if pane ~= moving and owners[pane] == anchor then pane else nil
+		end
+		return last_worker(node[2]) or last_worker(node[1])
+	end
+	-- Prefer the bottom worker of the nearest right column along the anchor's path.
+	local function find(node: TabTree?): (boolean, number?)
+		if not node then
+			return false, nil
+		end
+		if node.pane then
+			return node.pane == anchor, nil
+		end
+		local found, worker = find(node[1])
+		if found then
+			return true, worker or (if node.split == "right" then last_worker(node[2]) else nil)
+		end
+		return find(node[2])
+	end
+	local _, worker = find(layout.root)
+	return worker or anchor
+end
+
+local function park_pane(cx: WindowCx, pane: number): (boolean, string?)
+	return cx.layout:park(pane)
+end
+
+local function unpark_pane(cx: WindowCx, pane: number): (boolean, string?)
+	return cx.layout:unpark(pane, { focus = false })
+end
+
+local function place_worker(cx: WindowCx, pane: number, anchor: number, form: WorkerLayout, corner: Corner): (boolean, string?)
+	if form == "pip" then
+		return cx.layout:float(pane, anchor, corner, { focus = false })
+	elseif form == "park" then
+		return park_pane(cx, pane)
+	elseif form == "tab" then
+		local tab, err = cx.layout:move_to_new_tab(pane, nil, { focus = false })
+		return tab ~= nil, err
+	end
+	local target = if form == "down" then down_target(cx, anchor, pane) else anchor
+	local dir: Dir = if form == "down" then "down" else "right"
+	local info = cx.session:pane(pane)
+	if info and info.floating then
+		return cx.layout:dock(pane, target, dir, { focus = false })
+	end
+	local ok = cx.layout:move(pane, target, dir, { focus = false })
+	return ok, if ok then nil else "could not move wingman beside target pane"
+end
+
+local function spawn_worker(cx: WindowCx, anchor: number, form: WorkerLayout, cwd: string, command: string, corner: Corner): (number?, string?)
+	local launch = { cwd = cwd, command = command }
+	local pane: number?
+	if form == "tab" then
+		pane = cx.layout:new_tab(launch, { focus = false })
+	else
+		local target = if form == "down" then down_target(cx, anchor, nil) else anchor
+		pane = cx.layout:split(target, if form == "down" then "down" else "right", launch, { focus = false })
+	end
+	if not pane then
+		return nil, "could not open wingman with layout " .. form
+	end
+	if form == "pip" or form == "park" then
+		local ok, err = place_worker(cx, pane, anchor, form, corner)
+		if not ok then
+			cx.layout:close(pane)
+			return nil, err or ("could not place wingman in " .. form)
+		end
+	end
+	return pane, nil
+end
+
+local function select_worker(cx: WindowCx, anchor: number?, value: any, cwd: any): (number?, string?)
+	if value ~= nil and value ~= tern.json.null then
+		local pane = tonumber(value)
+		if not pane or pane == anchor or cx.session:pane(pane) == nil then
+			return nil, "invalid target_pane (must be an existing pane other than the caller)"
+		end
+		return pane, nil
+	end
+	local workers: { number } = if anchor then bound_workers(cx, anchor) else {}
+	if #workers == 1 then
+		return workers[1], nil
+	elseif #workers == 0 then
+		return nil, "no wingman pane is bound to this pane; pass --pane <id>"
+	end
+	if type(cwd) == "string" and cwd ~= "" then
+		local match: number? = nil
+		for _, pane in workers do
+			local info = cx.session:pane(pane)
+			if info and info.cwd == cwd then
+				if match then
+					match = nil
+					break
+				end
+				match = pane
+			end
+		end
+		if match then
+			return match, nil
+		end
+	end
+	local ids: { string } = table.create(#workers)
+	for i, worker in workers do
+		ids[i] = tostring(worker)
+	end
+	return nil, "multiple bound wingman panes (" .. table.concat(ids, ", ") .. "); pass --pane <id> or a unique --cwd"
+end
+
+local function stop_worker(cx: WindowCx, pane: number): (boolean, string?)
+	local ok, err = pcall(function()
+		cx.agents:stop(pane)
+	end)
+	if ok then
+		unbind_pane(pane)
+	end
+	return ok, if ok then nil else tostring(err)
+end
+
+local TARGETED_OPS = {
+	pip = true, dock = true, park = true, unpark = true, interrupt = true,
+	unqueue = true, retry = true, stop = true, transcript = true, surface = true, event = true, await = true,
+}
+
 local function handle_request(cx: WindowCx, cid: number, req: any)
 	local op = req.op
 	local anchor = tonumber(req.anchor_pane)
+	local target: number? = nil
+	if TARGETED_OPS[op] then
+		local err: string?
+		target, err = select_worker(cx, anchor, req.target_pane, req.cwd)
+		if not target then
+			send_mux(cid, { ok = false, error = err }, false)
+			return
+		end
+	end
 
 	if op == "status" then
 		seed_inflight_unsolicited_turns(cx)
 		local my_tab = if anchor then cx.session:tab_of(anchor) else nil
-		local bound_pane = if anchor then get_bound_wingman(cx, anchor) else nil
+		local bound_panes = if anchor then bound_workers(cx, anchor) else {}
 		local my_owner = if anchor then owner_of_pane(cx, anchor) else nil
 		local floats = tern.json.array()
 		if my_tab then
@@ -1203,7 +1361,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		end
 		local out = {}
 		for _, a in ipairs(cx.agents:list()) do
-			local atab = cx.session:tab_of(a.pane)
+			local info = cx.session:pane(a.pane)
+			local atab = if info then info.tab else nil
 			local owner = owner_of_pane(cx, a.pane)
 			local q = queued_dispatches[a.pane]
 			local q_count = if q then #q else 0
@@ -1218,7 +1377,9 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				tab = atab,
 				same_tab = (my_tab ~= nil and atab == my_tab),
 				is_self = (anchor ~= nil and a.pane == anchor),
-				is_bound_to_me = (bound_pane ~= nil and a.pane == bound_pane),
+				is_bound_to_me = anchor ~= nil and owner == anchor,
+				parked = info ~= nil and info.parked == true,
+				floating = info ~= nil and info.floating == true,
 				bound_owner = owner,
 				auto_callback = if owner ~= nil then is_auto_callback_enabled(owner) else is_auto_callback_enabled(a.pane),
 				queued_count = q_count,
@@ -1226,17 +1387,18 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				queued_callbacks_count = cb_q_count,
 				cwd = a.cwd,
 				state = a.state,
-				model = if a.model ~= tern.json.null then a.model else nil,
-				command = if a.command ~= tern.json.null then a.command else nil,
-				last_message = if a.last_message ~= tern.json.null then a.last_message else nil,
-				delivery_error = if a.delivery_error ~= tern.json.null then a.delivery_error else nil,
+				model = if (a.model :: any) ~= tern.json.null then a.model else nil,
+				command = if (a.command :: any) ~= tern.json.null then a.command else nil,
+				last_message = if (a.last_message :: any) ~= tern.json.null then a.last_message else nil,
+				delivery_error = if (a.delivery_error :: any) ~= tern.json.null then a.delivery_error else nil,
 			})
 		end
 		send_mux(cid, {
 			ok = true,
 			window_key = cx:window_key(),
 			anchor_tab = my_tab,
-			bound_pane = bound_pane,
+			bound_panes = tern.json.array(bound_panes),
+			bound_pane = if #bound_panes == 1 then bound_panes[1] else nil,
 			owner_pane = my_owner,
 			auto_callback = is_auto_callback_enabled(anchor),
 			default_auto_callback = default_auto_callback,
@@ -1291,7 +1453,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		local target_owner: number? = if req.owner_pane ~= nil and req.owner_pane ~= tern.json.null
 			then tonumber(req.owner_pane)
 			else anchor
-		if target_owner ~= nil and bindings[target_owner] == nil then
+		if target_owner ~= nil and #bound_workers(cx, target_owner) == 0 then
 			local maybe_owner = owner_of_pane(cx, target_owner)
 			if maybe_owner ~= nil then
 				target_owner = maybe_owner
@@ -1323,98 +1485,40 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		return
 	end
 
-	if op == "pip" then
-		local tp = tonumber(req.target_pane) :: number
-		if anchor and tp == anchor then
-			send_mux(cid, { ok = false, error = "refusing to float anchor_pane (caller agent itself)" }, false)
-			return
+	if op == "pip" or op == "dock" or op == "park" or op == "unpark" then
+		local tp = target :: number
+		local over = owner_of_pane(cx, tp) or anchor
+		local ok: boolean, err: string?
+		if op == "pip" then
+			ok, err = cx.layout:float(tp, over, corner_of(req.corner) or "br", { focus = false })
+		elseif op == "dock" then
+			ok, err = cx.layout:dock(tp, over, req.dir or "right", { focus = false })
+		elseif op == "park" then
+			ok, err = park_pane(cx, tp)
+		else
+			ok, err = unpark_pane(cx, tp)
 		end
-		if anchor then
+		if ok and anchor and not owner_of_pane(cx, tp) and (op == "pip" or op == "dock") then
 			bind_wingman(anchor, tp)
 		end
-		local ok_f, err_f = cx.layout:float(tp, anchor, req.corner or "br", { focus = false })
-		send_mux(cid, { ok = ok_f, error = err_f }, false)
-		return
-	end
-
-	if op == "dock" then
-		local tp = tonumber(req.target_pane) :: number
-		if anchor and tp == anchor then
-			send_mux(cid, { ok = false, error = "refusing to dock anchor_pane (caller agent itself)" }, false)
-			return
-		end
-		if anchor then
-			bind_wingman(anchor, tp)
-		end
-		local ok_d, err_d = cx.layout:dock(tp, anchor, req.dir or "right", { focus = false })
-		send_mux(cid, { ok = ok_d, error = err_d }, false)
+		send_mux(cid, { ok = ok, pane = tp, error = err }, false)
 		return
 	end
 
 	if op == "interrupt" then
-		local tp = tonumber(req.target_pane) :: number
-		if anchor and tp == anchor then
-			send_mux(cid, { ok = false, error = "refusing to interrupt anchor_pane (caller agent itself)" }, false)
-			return
-		end
-		manual_interrupt[tp] = true
-		unsolicited_working[tp] = false
-		local ok_i, err_i = pcall(function()
-			cx.agents:interrupt(tp)
-		end)
-		send_mux(cid, { ok = ok_i, error = if not ok_i then tostring(err_i) else nil }, false)
+		local tp = target :: number
+		local ok_i, err_i = interrupt_pane(cx, tp)
+		send_mux(cid, { ok = ok_i, error = err_i }, false)
 		return
 	end
 
 	if op == "unqueue" then
-		local tp = tonumber(req.target_pane) :: number
-		if anchor and tp == anchor then
-			send_mux(cid, { ok = false, error = "refusing to unqueue anchor_pane (caller agent itself)" }, false)
-			return
-		end
-		local q = queued_dispatches[tp]
-		if not q or #q == 0 then
-			send_mux(cid, { ok = true, pane = tp, cancelled = 0, remaining = 0 }, false)
-			return
-		end
+		local tp = target :: number
 		local pos = if req.position ~= nil and req.position ~= tern.json.null then tonumber(req.position) else nil
-		local cancelled = 0
-		if pos then
-			local idx = math.floor(pos)
-			if idx < 1 or idx > #q then
-				send_mux(cid, { ok = false, error = string.format("queue position %d out of range (1..%d)", idx, #q) }, false)
-				return
-			end
-			local removed = table.remove(q, idx) :: QueuedDispatch
-			cancelled = 1
-			if removed.cid ~= nil then
-				send_mux(removed.cid, {
-					ok = false,
-					pane = tp,
-					status = "cancelled",
-					error = "Cancelled from queue via unqueue",
-					last_message = "",
-					transcript = tern.json.array(),
-				}, false)
-			end
-			if #q == 0 then
-				queued_dispatches[tp] = nil
-			end
-		else
-			queued_dispatches[tp] = nil
-			for _, item in ipairs(q) do
-				cancelled += 1
-				if item.cid ~= nil then
-					send_mux(item.cid, {
-						ok = false,
-						pane = tp,
-						status = "cancelled",
-						error = "Cancelled from queue via unqueue",
-						last_message = "",
-						transcript = tern.json.array(),
-					}, false)
-				end
-			end
+		local cancelled, err_q = cancel_queued(tp, pos)
+		if err_q then
+			send_mux(cid, { ok = false, error = err_q }, false)
+			return
 		end
 		local rem = if queued_dispatches[tp] then #queued_dispatches[tp] else 0
 		send_mux(cid, { ok = true, pane = tp, cancelled = cancelled, remaining = rem }, false)
@@ -1422,26 +1526,13 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 	end
 
 	if op == "retry" then
-		local tp = tonumber(req.target_pane) :: number
-		if anchor and tp == anchor then
-			send_mux(cid, { ok = false, error = "refusing to retry anchor_pane (caller agent itself)" }, false)
-			return
-		end
-		local ainfo = find_agent_info(cx, tp)
-		if ainfo and (ainfo.state == "working" or ainfo.state == "waiting_input") then
-			send_mux(cid, { ok = false, pane = tp, state = ainfo.state, error = "target pane is " .. ainfo.state .. " (not idle/failed)" }, false)
-			return
-		end
-		local ok_r, err_r = pcall(function()
-			cx.agents:ask(tp, "/retry")
-		end)
+		local tp = target :: number
+		local ok_r, err_r, busy_state = retry_pane(cx, tp)
 		if not ok_r then
-			send_mux(cid, { ok = false, pane = tp, error = "cx.agents:ask /retry failed: " .. tostring(err_r) }, false)
+			send_mux(cid, { ok = false, pane = tp, state = busy_state, error = err_r }, false)
 			return
 		end
-		clear_waiting(tp)
-		manual_interrupt[tp] = nil
-		if anchor then
+		if anchor and not owner_of_pane(cx, tp) then
 			bind_wingman(anchor, tp)
 		end
 		if req.async_callback == true then
@@ -1454,30 +1545,20 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = true, async_callback = true, pane = tp, retried = true }, false)
 		else
 			send_mux(cid, { _ack = true, pane = tp }, true)
-			register_waiter(tp, cid, nil)
+			register_waiter(tp, cid)
 		end
 		return
 	end
 
 	if op == "stop" then
-		local tp = tonumber(req.target_pane) :: number
-		if anchor and tp == anchor then
-			send_mux(cid, { ok = false, error = "refusing to stop anchor_pane (caller agent itself)" }, false)
-			return
-		end
-		unbind_pane(tp)
-		clear_waiting(tp)
-		unsolicited_working[tp] = nil
-		reported_in_turn[tp] = nil
-		local ok_s, err_s = pcall(function()
-			cx.agents:stop(tp)
-		end)
-		send_mux(cid, { ok = ok_s, error = if not ok_s then tostring(err_s) else nil }, false)
+		local tp = target :: number
+		local ok, err = stop_worker(cx, tp)
+		send_mux(cid, { ok = ok, pane = tp, error = err }, false)
 		return
 	end
 
 	if op == "transcript" then
-		local tp = tonumber(req.target_pane) :: number
+		local tp = target :: number
 		local ok_t, msgs = pcall(function()
 			return cx.agents:transcript(tp, { last = tonumber(req.last) or 10 })
 		end)
@@ -1490,7 +1571,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 	end
 
 	if op == "surface" then
-		local tp = tonumber(req.target_pane) :: number
+		local tp = target :: number
 		local root: any = if req.root ~= tern.json.null then req.root else nil
 		local auto_root = req.auto_root == true
 		local want_as = req.as or "text"
@@ -1551,24 +1632,21 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 	end
 
 	if op == "event" then
-		local tp = tonumber(req.target_pane)
-		if not tp or (anchor and tp == anchor) then
-			send_mux(cid, { ok = false, error = "invalid target_pane for event (refusing caller's own pane)" }, false)
-			return
-		end
+		local tp = target :: number
 		local events: any = if type(req.events) == "table" then req.events elseif type(req.ev) == "table" then { req.ev } else {}
 		local results = {}
 		local all_ok = #events > 0
 		for i, ev in ipairs(events) do
-			local ok_e, res_e = pcall(function()
-				return cx.session:event(tp :: number, ev)
+			local ok_e, res_e = pcall(function(): any
+				cx.session:event(tp :: number, ev)
+				return nil
 			end)
 			all_ok = all_ok and ok_e
 			table.insert(results, { index = i, ok = ok_e, error = if ok_e then nil else tostring(res_e), result = if ok_e then res_e else nil })
 		end
 		if req.rearm ~= false then
 			clear_waiting(tp)
-			if anchor then
+			if anchor and not owner_of_pane(cx, tp) then
 				bind_wingman(anchor, tp)
 			end
 			unsolicited_working[tp] = true
@@ -1584,12 +1662,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 	end
 
 	if op == "await" then
-		local tp = tonumber(req.target_pane)
-		if not tp or (anchor and tp == anchor) then
-			send_mux(cid, { ok = false, error = "invalid target_pane for await" }, false)
-			return
-		end
-		if anchor then
+		local tp = target :: number
+		if anchor and not owner_of_pane(cx, tp) then
 			bind_wingman(anchor, tp)
 		end
 		send_mux(cid, { _ack = true, pane = tp }, true)
@@ -1599,7 +1673,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				send_mux(cid, { ok = false, pane = tp, status = "closed", error = "Agent pane disappeared", last_message = "", transcript = tern.json.array() }, false)
 				return
 			end
-			register_waiter(tp, cid, nil)
+			register_waiter(tp, cid)
 			return
 		end
 		local derr: any = ainfo.delivery_error
@@ -1619,7 +1693,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, pane = tp, status = ainfo.state, error = reason, last_message = last_msg or "", transcript = transcript }, false)
 			return
 		end
-		register_waiter(tp, cid, nil)
+		register_waiter(tp, cid)
 		local w = pending_waits[tp]
 		if w then
 			w.saw_working = true
@@ -1632,16 +1706,111 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = "missing anchor_pane" }, false)
 			return
 		end
-		local prompt = tostring(req.prompt or "")
-		local cwd = tostring(req.cwd or "")
-		local cmd = req.command
-		local target_pane: number? = if req.target_pane ~= nil and req.target_pane ~= tern.json.null then tonumber(req.target_pane) else nil
+		local prompt = req.prompt
+		if type(prompt) ~= "string" or not string.find(prompt, "%S") then
+			send_mux(cid, { ok = false, error = "dispatch prompt is empty" }, false)
+			return
+		end
+		local form: WorkerLayout? = nil
+		local requested = req.layout
+		local corner: Corner? = corner_of(req.pip_corner)
+		local placement_corner: Corner = if corner then corner else "br"
+		if requested == nil or requested == tern.json.null then
+			if corner then
+				form = "pip" -- Legacy clients sent only pip_corner.
+			end
+		elseif requested == "split" or requested == "down" or requested == "pip" or requested == "tab" or requested == "park" then
+			form = requested
+		else
+			send_mux(cid, { ok = false, error = "invalid wingman layout" }, false)
+			return
+		end
 		local reset_new = req.reset_new == true
-		local pip_corner = req.pip_corner
+		local target_pane: number? = nil
+		if reset_new or (req.target_pane ~= nil and req.target_pane ~= tern.json.null) then
+			local err: string?
+			target_pane, err = select_worker(cx, anchor, req.target_pane, req.cwd)
+			if not target_pane then
+				send_mux(cid, { ok = false, error = err }, false)
+				return
+			end
+			local owner = owner_of_pane(cx, target_pane)
+			if reset_new and owner ~= anchor then
+				send_mux(cid, { ok = false, error = "can only replace a wingman bound to the caller" }, false)
+				return
+			elseif owner and owner ~= anchor then
+				send_mux(cid, { ok = false, error = "target wingman is bound to pane " .. tostring(owner) }, false)
+				return
+			end
+		end
+
+		local command = req.command
+		if (not target_pane or reset_new) and (type(command) ~= "string" or command == "") then
+			send_mux(cid, { ok = false, error = "missing worker launch command" }, false)
+			return
+		end
+		if target_pane and reset_new then
+			local ok, err = stop_worker(cx, target_pane)
+			if not ok then
+				send_mux(cid, { ok = false, error = "could not replace wingman: " .. tostring(err) }, false)
+				return
+			end
+			target_pane = nil
+		end
+
 		local async_cb = req.async_callback == true
+		local state = if target_pane then find_agent_info(cx, target_pane) else nil
+		if state and state.state == "waiting_input" then
+			send_mux(cid, {
+				ok = false,
+				status = "waiting_input",
+				pane = target_pane,
+				error = "target wingman pane is waiting_input; inspect via `wingman.py surface` and answer/cancel via `wingman.py event` instead of `send`",
+			}, false)
+			return
+		end
+		local busy = state ~= nil and state.state == "working"
+		if busy and req.queue == false then
+			send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
+			return
+		end
+
+		local new_worker = target_pane == nil
+		local pane: number
+		if target_pane then
+			pane = target_pane
+			if form then
+				local ok, err = place_worker(cx, pane, anchor, form, placement_corner)
+				if not ok then
+					send_mux(cid, { ok = false, error = err or ("could not place wingman in " .. form) }, false)
+					return
+				end
+			end
+		else
+			local spawned, err = spawn_worker(cx, anchor, form or "split", tostring(req.cwd or ""), command, placement_corner)
+			if not spawned then
+				send_mux(cid, { ok = false, error = err }, false)
+				return
+			end
+			pane = spawned
+		end
+
+		if not busy then
+			-- Tern queues the prompt until the composer is sendable, including on a freshly parked pane.
+			local ok, err = pcall(function()
+				cx.agents:ask(pane, prompt)
+			end)
+			if not ok then
+				if new_worker then
+					cx.layout:close(pane)
+				end
+				send_mux(cid, { ok = false, error = "cx.agents:ask failed: " .. tostring(err) }, false)
+				return
+			end
+		end
+		bind_wingman(anchor, pane)
 
 		if async_cb then
-			-- Async ACP callback mode requires auto-callback to be active on `anchor` so completion returns via `cx.agents:ask`
 			if owner_auto_callback[anchor] == false then
 				owner_auto_callback[anchor] = true
 				save_callback_cfg()
@@ -1651,119 +1820,27 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			save_callback_cfg()
 		end
 
-		if target_pane and target_pane == anchor then
-			send_mux(cid, { ok = false, error = "refusing to dispatch onto anchor_pane (caller agent itself)" }, false)
-			return
-		end
-
-		if target_pane and reset_new then
-			unbind_pane(target_pane)
-			unsolicited_working[target_pane] = nil
-			reported_in_turn[target_pane] = nil
-			clear_waiting(target_pane :: number)
-			pcall(function()
-				cx.agents:stop(target_pane :: number)
-			end)
-			target_pane = nil
-		end
-
-		local pending_bootstrap_prompt: string? = nil
-
-		if target_pane then
-			local ainfo = find_agent_info(cx, target_pane)
-			if ainfo and ainfo.state == "waiting_input" then
-				send_mux(cid, {
-					ok = false,
-					status = "waiting_input",
-					pane = target_pane,
-					error = "target wingman pane is waiting_input; inspect via `wingman.py surface` and answer/cancel via `wingman.py event` instead of `send`",
-				}, false)
-				return
+		if busy then
+			local q = queued_dispatches[pane]
+			if not q then
+				q = {}
+				queued_dispatches[pane] = q
 			end
-			if ainfo and ainfo.state == "working" then
-				if req.queue == false then
-					send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
-					return
-				end
-				bind_wingman(anchor, target_pane)
-				local q = queued_dispatches[target_pane]
-				if not q then
-					q = {}
-					queued_dispatches[target_pane] = q
-				end
-				local corner_str: string? = if type(pip_corner) == "string" and pip_corner ~= "" then pip_corner else nil
-				table.insert(q, {
-					cid = if async_cb then nil else cid,
-					anchor = anchor,
-					prompt = prompt,
-					pip_corner = corner_str,
-				})
-				if async_cb then
-					send_mux(cid, { ok = true, async_callback = true, pane = target_pane, queued = true, position = #q }, false)
-				else
-					send_mux(cid, { _ack = true, pane = target_pane, queued = true, position = #q }, true)
-				end
-				ensure_watchdog()
-				return
+			table.insert(q, { cid = if async_cb then nil else cid, anchor = anchor, prompt = prompt })
+			if async_cb then
+				send_mux(cid, { ok = true, async_callback = true, pane = pane, queued = true, position = #q }, false)
+			else
+				send_mux(cid, { _ack = true, pane = pane, queued = true, position = #q }, true)
 			end
-			local ok_ask, err_ask = pcall(function()
-				cx.agents:ask(target_pane :: number, prompt)
-			end)
-			if not ok_ask then
-				send_mux(cid, { ok = false, error = "cx.agents:ask failed: " .. tostring(err_ask) }, false)
-				return
-			end
+			ensure_watchdog()
+		elseif async_cb then
+			unsolicited_working[pane] = true
+			reported_in_turn[pane] = false
+			send_mux(cid, { ok = true, async_callback = true, pane = pane, queued = false, position = 0 }, false)
 		else
-			local focused_now = cx.session:focused()
-			if focused_now == anchor then
-				local ok_st, res_st = pcall(function()
-					return cx.agents:start({
-						prompt = prompt,
-						cwd = cwd,
-						command = cmd,
-						how = "split",
-					})
-				end)
-				if not ok_st then
-					send_mux(cid, { ok = false, error = "cx.agents:start failed: " .. tostring(res_st) }, false)
-					return
-				end
-				target_pane = res_st
-				cx.layout:focus(anchor)
-			else
-				-- User is focused elsewhere: split anchor silently without stealing focus, then submit via TSP once agent_state fires
-				local new_p = cx.layout:split(anchor, "right", { cwd = cwd, command = cmd }, { focus = false })
-				if not new_p then
-					send_mux(cid, { ok = false, error = "cx.layout:split returned nil" }, false)
-					return
-				end
-				target_pane = new_p
-				pending_bootstrap_prompt = prompt
-			end
+			send_mux(cid, { _ack = true, pane = pane }, true)
+			register_waiter(pane, cid)
 		end
-
-		local final_pane = target_pane :: number
-		bind_wingman(anchor, final_pane)
-
-		if pip_corner and pip_corner ~= tern.json.null then
-			pcall(function()
-				cx.layout:float(final_pane, anchor, pip_corner, { focus = false })
-			end)
-		end
-
-		if async_cb then
-			if pending_bootstrap_prompt ~= nil then
-				register_waiter(final_pane, nil, pending_bootstrap_prompt)
-			else
-				unsolicited_working[final_pane] = true
-				reported_in_turn[final_pane] = false
-			end
-			send_mux(cid, { ok = true, async_callback = true, pane = final_pane, queued = false, position = 0 }, false)
-			return
-		end
-
-		send_mux(cid, { _ack = true, pane = final_pane }, true)
-		register_waiter(final_pane, cid, pending_bootstrap_prompt)
 		return
 	end
 
@@ -1804,6 +1881,7 @@ local function on_mux_stdout(line: string, cx: WindowCx?)
 	end
 	if msg.disconnected == true then
 		drop_disconnected_cid(cid, cx)
+		notify_radar()
 		return
 	end
 	local req = msg.req
@@ -1824,10 +1902,14 @@ local function on_mux_stdout(line: string, cx: WindowCx?)
 		send_mux(cid, { _skip = true }, false)
 		return
 	end
-	local ok_h, err_h = pcall(handle_request, cx, cid, req)
+	local ok_h, err_h = pcall(function(): any
+		handle_request(cx, cid, req)
+		return nil
+	end)
 	if not ok_h then
 		send_mux(cid, { ok = false, error = tostring(err_h) }, false)
 	end
+	notify_radar()
 end
 
 ensure_mux = function()
@@ -1896,7 +1978,7 @@ local started = false
 local function start(cx: WindowCx?)
 	if not started then
 		started = true
-		load_bindings()
+		load_owners()
 		load_callback_cfg()
 		load_waiting()
 		ensure_mux()
@@ -1908,3 +1990,60 @@ end
 
 tern.on("window_start", start)
 tern.timer(0, start)
+
+-- The live panel's narrow view of this control plane: read-only accessors plus the cores the RPC ops use.
+if radar_loaded then
+	local ok_attach, err_attach = pcall(function(): any
+		radar.attach({
+			owners = function(): { [number]: number }
+				return table.clone(owners)
+			end,
+			queued_dispatches = function(pane: number): number
+				local q = queued_dispatches[pane]
+				return if q then #q else 0
+			end,
+			queued_callbacks = function(pane: number): number
+				local q = queued_callbacks[pane]
+				return if q then #q else 0
+			end,
+			notified_waiting = function(pane: number): string?
+				return notified_waiting[pane]
+			end,
+			-- Fault keys are `fault:<surface node>:<summary>`, or `fault:<reason>` without a surface
+			-- (deliver_fault_if_needed); no surface is read here.
+			fault = function(pane: number): string?
+				local key = notified_waiting[pane]
+				if key == nil or string.sub(key, 1, 6) ~= "fault:" then
+					return nil
+				end
+				local rest = string.sub(key, 7)
+				return string.match(rest, "^[^:]*:(.+)$") or rest
+			end,
+			pip = function(cx: WindowCx, pane: number): (boolean, string?)
+				return cx.layout:float(pane, owner_of_pane(cx, pane), "br", { focus = false })
+			end,
+			dock = function(cx: WindowCx, pane: number): (boolean, string?)
+				return cx.layout:dock(pane, owner_of_pane(cx, pane), "right", { focus = false })
+			end,
+			park = park_pane,
+			unpark = unpark_pane,
+			interrupt = interrupt_pane,
+			retry = function(cx: WindowCx, pane: number): (boolean, string?)
+				local ok_r, err_r = retry_pane(cx, pane)
+				if ok_r then
+					-- As `retry --async`: the retried turn reports back to its bound owner when it ends.
+					unsolicited_working[pane] = true
+					reported_in_turn[pane] = false
+				end
+				return ok_r, err_r
+			end,
+			unqueue = function(_cx: WindowCx, pane: number): number
+				return (cancel_queued(pane, nil))
+			end,
+		})
+		return nil
+	end)
+	if not ok_attach then
+		tern.log.error("wingman: radar.attach failed:", tostring(err_attach))
+	end
+end

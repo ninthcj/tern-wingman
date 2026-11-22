@@ -570,6 +570,41 @@ def _pick_unclaimed_omp_in_tab(
     return int(unclaimed[0]["pane"])
 
 
+def bound_panes_from_status(status: dict[str, Any], exclude: int | None = None) -> list[int]:
+    """Sorted, de-duplicated wingman panes owned by the caller (`bound_panes`; legacy plugins only send `bound_pane`)."""
+    raw = status.get("bound_panes")
+    if not isinstance(raw, list):
+        raw = [status["bound_pane"]] if status.get("bound_pane") is not None else []
+    return sorted({int(p) for p in raw if exclude is None or int(p) != exclude})
+
+
+def _choose_bound_pane(
+    bound: list[int],
+    agents_by_id: dict[int, dict[str, Any]],
+    cwd: Path | None,
+    action: str,
+) -> int:
+    """Pick the one owned worker to act on: the sole one, or the unique one whose cwd equals an explicit `cwd`."""
+    if len(bound) == 1:
+        return bound[0]
+    if cwd is not None:
+        want = cwd.resolve()
+        matches: list[int] = []
+        for pid in bound:
+            try:
+                if Path(str(agents_by_id.get(pid, {}).get("cwd", ""))).resolve() == want:
+                    matches.append(pid)
+            except OSError:
+                pass
+        if len(matches) == 1:
+            return matches[0]
+    ids = ", ".join(str(p) for p in bound)
+    raise SystemExit(
+        f"error: {len(bound)} wingman panes are bound to this pane ({ids}); "
+        f"pass `--pane <id>` to choose the one to {action}"
+    )
+
+
 def resolve_target_pane_from_status(
     status: dict[str, Any],
     inspect_data: dict[str, Any] | None,
@@ -577,22 +612,26 @@ def resolve_target_pane_from_status(
     target_session: str,
     session_path: Path | None,
     anchor_pane: int | None = None,
+    explicit_pane: int | None = None,
+    replace: bool = False,
+    cwd_explicit: bool = False,
 ) -> tuple[int | None, bool]:
-    """Return (target_pane_id, reset_new) from explicit ownership (`bound_pane`) + authoritative `omp_session_file`."""
+    """Return (target_pane_id, reset_new) from explicit ownership (`bound_panes`) + authoritative `omp_session_file`.
+
+    `new` always spawns a fresh worker (no target) unless `replace` selects an owned worker to reset.
+    `cwd` only disambiguates among several owned workers when `cwd_explicit`; it never picks arbitrarily.
+    """
+    if explicit_pane is not None and anchor_pane is not None and explicit_pane == anchor_pane:
+        raise SystemExit(f"error: refusing to target caller's own pane ({anchor_pane})")
     pane_files = extract_omp_pane_files(inspect_data)
     agents = [
         a
         for a in status.get("agents", [])
         if not a.get("is_self") and (anchor_pane is None or int(a["pane"]) != anchor_pane)
     ]
-    active_ids = {int(a["pane"]) for a in agents}
-
-    raw_bound = status.get("bound_pane")
-    bound_pane: int | None = None
-    if raw_bound is not None:
-        bp = int(raw_bound)
-        if (anchor_pane is None or bp != anchor_pane) and bp in active_ids:
-            bound_pane = bp
+    agents_by_id = {int(a["pane"]): a for a in agents}
+    bound = [p for p in bound_panes_from_status(status, anchor_pane) if p in agents_by_id]
+    match_cwd = cwd if cwd_explicit else None
 
     if session_path is not None:
         want = str(session_path.resolve())
@@ -603,15 +642,28 @@ def resolve_target_pane_from_status(
         return None, False
 
     if target_session == "same":
-        if bound_pane is not None:
-            return bound_pane, False
+        if explicit_pane is not None:
+            return explicit_pane, False
+        if bound:
+            return _choose_bound_pane(bound, agents_by_id, match_cwd, "send to"), False
         adopted = _pick_unclaimed_omp_in_tab(agents, pane_files, cwd)
         return (adopted, False) if adopted is not None else (None, False)
 
     if target_session == "new":
-        if bound_pane is not None:
-            return bound_pane, True
-        return None, False
+        if not replace:
+            return None, False
+        if explicit_pane is not None:
+            if explicit_pane not in bound:
+                raise SystemExit(
+                    f"error: refusing to --replace pane {explicit_pane}: it is not a wingman bound to this pane"
+                )
+            return explicit_pane, True
+        if not bound:
+            raise SystemExit(
+                "error: --replace has no replacement target: no wingman pane is bound to this pane "
+                "(drop --replace to start a new worker)"
+            )
+        return _choose_bound_pane(bound, agents_by_id, match_cwd, "replace"), True
 
     return None, False
 
@@ -622,10 +674,11 @@ def select_wingman_pane_from_status(
     my_pane: int,
     cwd: Path | None = None,
 ) -> int:
-    """Resolve the caller's wingman pane for lifecycle/layout ops (`interrupt`, `stop`, `pip`, `dock`, `transcript`)."""
-    raw_bound = status.get("bound_pane")
-    if raw_bound is not None and int(raw_bound) != my_pane:
-        return int(raw_bound)
+    """Resolve the caller's wingman pane for lifecycle/layout ops (`interrupt`, `stop`, `pip`, `dock`, `park`, `transcript`)."""
+    bound = bound_panes_from_status(status, my_pane)
+    if bound:
+        agents_by_id = {int(a["pane"]): a for a in status.get("agents", [])}
+        return _choose_bound_pane(bound, agents_by_id, cwd, "control")
 
     pane_files = extract_omp_pane_files(inspect_data)
     agents = [
@@ -751,6 +804,8 @@ def cmd_info(args: argparse.Namespace) -> None:
                     "queuedPreview": a.get("queued_preview"),
                     "queuedCallbacksCount": int(a.get("queued_callbacks_count") or 0),
                     "sameTab": a.get("same_tab"),
+                    "parked": a.get("parked"),
+                    "floating": a.get("floating"),
                     "state": a.get("state"),
                     "model": a.get("model"),
                     "cwd": a.get("cwd"),
@@ -759,11 +814,14 @@ def cmd_info(args: argparse.Namespace) -> None:
                 }
             )
 
+    bound_panes = bound_panes_from_status(bridge_status) if bridge_status else []
+
     out = {
         "ompBin": omp_bin,
         "ovnfsBin": ovnfs_bin,
         "ternPane": my_pane,
-        "boundWingmanPane": bridge_status.get("bound_pane") if bridge_status else None,
+        "boundWingmanPane": bound_panes[0] if len(bound_panes) == 1 else None,
+        "boundWingmanPanes": bound_panes,
         "ownerPane": bridge_status.get("owner_pane") if bridge_status else None,
         "autoCallback": bridge_status.get("auto_callback") if bridge_status else None,
         "wingmanBridgeReady": bool(bridge_status and bridge_status.get("ok")),
@@ -778,6 +836,8 @@ def cmd_info(args: argparse.Namespace) -> None:
 def _read_prompt_input(prompt: str | None, prompt_file: str | None, label: str = "prompt") -> str:
     if prompt_file:
         text = sys.stdin.read() if prompt_file == "-" else Path(prompt_file).read_text(encoding="utf-8")
+    elif prompt == "-" and not sys.stdin.isatty():
+        text = sys.stdin.read()
     else:
         text = prompt or ""
     if not text.strip():
@@ -785,18 +845,73 @@ def _read_prompt_input(prompt: str | None, prompt_file: str | None, label: str =
     return text.strip()
 
 
+PLACEMENTS = ("split", "down", "pip", "tab", "park")
+PIP_CORNERS = ("tl", "tr", "bl", "br")
+
+
+def _parse_pane_id(raw: Any, my_pane: int | None) -> int:
+    if not str(raw).strip().isdigit():
+        raise SystemExit(f"error: invalid pane id: {raw!r}")
+    pane = int(raw)
+    if my_pane is not None and pane == my_pane:
+        raise SystemExit(f"error: refusing to target caller's own pane ({my_pane})")
+    return pane
+
+
+def parse_send_options(
+    args: argparse.Namespace, my_pane: int | None, use_tui: bool
+) -> tuple[int | None, str | None, str | None]:
+    """Validate Tern-only `send` flags; return (explicit_pane, layout, pip_corner).
+
+    `layout` is None when the caller expressed no placement. `--pip <corner>` is both the legacy alias for
+    `--layout pip` and the corner modifier of `--layout pip`; `pip_corner` is set only for layout `pip` (default `br`).
+    """
+    layout = args.layout
+    corner = args.pip
+    given = [
+        flag
+        for flag, present in (
+            ("--pane", args.pane_flag is not None),
+            ("--replace", args.replace),
+            ("--layout", layout is not None),
+            ("--pip", args.pip is not None),
+        )
+        if present
+    ]
+    if given and not use_tui:
+        raise SystemExit(
+            f"error: {', '.join(given)} only apply to Tern panes; they cannot be used in headless mode"
+        )
+
+    explicit_pane = _parse_pane_id(args.pane_flag, my_pane) if args.pane_flag is not None else None
+    if args.replace and args.session != "new":
+        raise SystemExit("error: --replace only applies to `send new`")
+    if explicit_pane is not None and not (args.session == "same" or (args.session == "new" and args.replace)):
+        raise SystemExit("error: --pane only applies to `send same` or `send new --replace`")
+
+    if corner is not None and layout not in (None, "pip"):
+        raise SystemExit(f"error: --pip conflicts with --layout {layout}")
+    if corner is not None:
+        layout = "pip"
+    if layout == "pip" and corner is None:
+        corner = "br"
+    return explicit_pane, layout, corner
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     """Deliver prompt via native Tern TSP `cx.agents` (`wingman` plugin) or headless `-p` fallback."""
+    my_pane = current_tern_pane()
+    use_tui = args.mode == "tui" or (args.mode == "auto" and my_pane is not None)
+    explicit_pane, layout, pip_corner = parse_send_options(args, my_pane, use_tui)
+
     omp_bin = find_omp_bin()
     tern_bin = find_tern_bin()
-    my_pane = current_tern_pane()
-    cwd = Path(args.cwd).resolve()
+    cwd = Path(args.cwd or ".").resolve()
 
     prompt = _read_prompt_input(args.prompt, args.prompt_file, label="prompt")
 
     session_path = resolve_session(args.session, cwd, allow_missing=True)
     timeout_s = parse_duration_seconds(args.max_time)
-    use_tui = args.mode == "tui" or (args.mode == "auto" and my_pane is not None)
 
     if use_tui:
         if my_pane is None:
@@ -811,7 +926,15 @@ def cmd_send(args: argparse.Namespace) -> None:
 
         inspect_data = inspect_tern(tern_bin)
         target_pane, reset_new = resolve_target_pane_from_status(
-            status, inspect_data, cwd, args.session, session_path, anchor_pane=my_pane
+            status,
+            inspect_data,
+            cwd,
+            args.session,
+            session_path,
+            anchor_pane=my_pane,
+            explicit_pane=explicit_pane,
+            replace=args.replace,
+            cwd_explicit=args.cwd is not None,
         )
         use_async_cb = (args.delivery == "async") or (
             args.delivery == "auto" and is_caller_acp_agent(status, inspect_data, my_pane)
@@ -849,6 +972,8 @@ def cmd_send(args: argparse.Namespace) -> None:
         if args.thinking:
             cmd_parts += ["--thinking", args.thinking]
 
+        if layout is None and target_pane is None:
+            layout = "split"
         req: dict[str, Any] = {
             "op": "dispatch",
             "anchor_pane": my_pane,
@@ -859,8 +984,11 @@ def cmd_send(args: argparse.Namespace) -> None:
             "cwd": str(cwd),
             "command": format_command_line(cmd_parts),
             "prompt": prompt,
-            "pip_corner": args.pip,
         }
+        if layout is not None:
+            req["layout"] = layout
+        if pip_corner is not None:
+            req["pip_corner"] = pip_corner
         if args.auto_callback is not None:
             req["auto_callback"] = bool(args.auto_callback)
 
@@ -964,7 +1092,7 @@ def cmd_send(args: argparse.Namespace) -> None:
 def resolve_same_tab_agent_pane(my_pane: int, cwd: Path | None = None) -> int:
     status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
     inspect_data = None
-    if status.get("bound_pane") is None:
+    if not bound_panes_from_status(status, my_pane):
         inspect_data = inspect_tern(find_tern_bin())
     return select_wingman_pane_from_status(status, inspect_data, my_pane, cwd=cwd)
 
@@ -972,12 +1100,7 @@ def resolve_same_tab_agent_pane(my_pane: int, cwd: Path | None = None) -> int:
 def _resolve_explicit_or_bound_pane(args: argparse.Namespace, my_pane: int) -> int:
     raw = getattr(args, "pane_flag", None) or getattr(args, "pane", None)
     if raw is not None and str(raw).strip():
-        if not str(raw).isdigit():
-            raise SystemExit(f"error: invalid pane id: {raw!r}")
-        pane = int(raw)
-        if pane == my_pane:
-            raise SystemExit(f"error: refusing to target caller's own pane ({my_pane})")
-        return pane
+        return _parse_pane_id(raw, my_pane)
     cwd = Path(args.cwd).resolve() if getattr(args, "cwd", None) else None
     return resolve_same_tab_agent_pane(my_pane, cwd=cwd)
 
@@ -1022,6 +1145,34 @@ def cmd_dock(args: argparse.Namespace) -> None:
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(json.dumps({"pane": pane, "docked": args.dir}, indent=2))
+
+
+def cmd_park(args: argparse.Namespace) -> None:
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `park` requires running inside Tern")
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "park", "anchor_pane": my_pane, "target_pane": pane},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    print(json.dumps({"pane": pane, "parked": True}, indent=2))
+
+
+def cmd_unpark(args: argparse.Namespace) -> None:
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `unpark` requires running inside Tern")
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    reply = call_bridge(
+        {"op": "unpark", "anchor_pane": my_pane, "target_pane": pane},
+        timeout=DEFAULT_BRIDGE_TIMEOUT,
+    )
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    print(json.dumps({"pane": pane, "parked": False}, indent=2))
 
 
 def cmd_interrupt(args: argparse.Namespace) -> None:
@@ -1329,8 +1480,11 @@ def build_parser() -> argparse.ArgumentParser:
     grp = p_send.add_mutually_exclusive_group(required=True)
     grp.add_argument("--prompt", "--message", "-m", dest="prompt", help="Prompt text")
     grp.add_argument("--prompt-file", help="Path to prompt file (or '-' for stdin)")
-    p_send.add_argument("--cwd", default=".", help="Workspace directory")
-    p_send.add_argument("--pip", choices=["tl", "tr", "bl", "br"], help="Float worker as Picture-in-Picture corner")
+    p_send.add_argument("--cwd", default=None, help="Workspace directory (default: current directory); when given explicitly it also picks among several owned workers by cwd")
+    p_send.add_argument("--pane", dest="pane_flag", help="Exact worker pane: target for `same`, or the owned worker to replace with `new --replace`")
+    p_send.add_argument("--replace", action="store_true", help="With `new`: reset the sole (or --pane / unique --cwd) owned worker instead of starting an additional one")
+    p_send.add_argument("--layout", choices=list(PLACEMENTS), help="Worker placement: split beside caller (new default), down stack, pip float, independent tab, or park hidden (existing workers keep their placement unless set)")
+    p_send.add_argument("--pip", choices=list(PIP_CORNERS), help="Float worker as Picture-in-Picture in this corner (implies `--layout pip`; corner defaults to br with `--layout pip`)")
     p_send.add_argument("--mode", choices=["auto", "tui", "headless"], default="auto")
     p_send.add_argument("--model", help="Optional model override")
     p_send.add_argument("--thinking", help="Optional thinking level")
@@ -1374,6 +1528,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_pane_args(p_dock)
     p_dock.add_argument("--dir", choices=["left", "right", "up", "down"], default="right")
     p_dock.set_defaults(func=cmd_dock)
+
+    p_park = sub.add_parser("park", help="Hide a live worker (keeps running, still receives prompts and callbacks)")
+    _add_pane_args(p_park)
+    p_park.set_defaults(func=cmd_park)
+
+    p_unpark = sub.add_parser("unpark", help="Bring a parked worker back into the current tab")
+    _add_pane_args(p_unpark)
+    p_unpark.set_defaults(func=cmd_unpark)
 
     p_int = sub.add_parser("interrupt", help="Interrupt active turn via `cx.agents:interrupt`")
     _add_pane_args(p_int)
