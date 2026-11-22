@@ -59,6 +59,18 @@ type QueuedDispatch = {
 
 -- Each worker has one owner; an owner can supervise any number of workers.
 local owners: { [number]: number } = {}
+
+local function ownership_cycle(anchor: number, worker: number): string?
+	local ancestor: number? = anchor
+	while ancestor ~= nil do
+		if ancestor == worker then
+			return string.format("refusing to bind pane %d to pane %d: ownership cycle", worker, anchor)
+		end
+		ancestor = owners[ancestor]
+	end
+	return nil
+end
+
 -- Active in-flight turn waits keyed by wingman pane_id
 local pending_waits: { [number]: WaitEntry } = {}
 -- Native per-pane FIFO dispatch queue when target_pane is busy (`working`)
@@ -113,18 +125,33 @@ local function load_owners()
 		end
 	end
 	if type(raw) == "table" then
+		local candidates: { [number]: number } = {}
+		local workers: { number } = {}
 		for k, v in raw do
 			local key, value = tonumber(k), tonumber(v)
-			if key and value and key ~= value then
+			if key and value then
 				local worker, owner = if legacy then value else key, if legacy then key else value
-				local previous = owners[worker]
-				-- Old versions guaranteed uniqueness; resolve malformed duplicates deterministically.
-				if previous == nil or owner < previous then
-					owners[worker] = owner
+				local previous = candidates[worker]
+				if previous == nil then
+					table.insert(workers, worker)
+					candidates[worker] = owner
+				elseif owner < previous then
+					candidates[worker] = owner
 				end
 			end
 		end
-		if legacy and save_owners() then
+		-- Older versions could persist cycles. Keep valid edges in stable pane order.
+		table.sort(workers)
+		local repaired = false
+		for _, worker in workers do
+			local owner = candidates[worker]
+			if ownership_cycle(owner, worker) then
+				repaired = true
+			else
+				owners[worker] = owner
+			end
+		end
+		if (legacy or repaired) and save_owners() and legacy then
 			pcall(tern.kv.set, KV_LEGACY_BINDINGS, nil)
 		end
 	end
@@ -237,7 +264,8 @@ local function owner_of_pane(cx: WindowCx, pane_id: number): number?
 end
 
 local function bind_wingman(anchor: number, worker: number)
-	if anchor ~= worker and owners[worker] ~= anchor then
+	-- Callers preflight existing panes before changing layout or sending a turn. A fresh pane has no edges.
+	if owners[worker] ~= anchor then
 		owners[worker] = anchor
 		save_owners()
 	end
@@ -1345,6 +1373,13 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = err }, false)
 			return
 		end
+		if anchor and (op == "pip" or op == "dock" or op == "retry" or op == "await" or (op == "event" and req.rearm ~= false)) then
+			local cycle = ownership_cycle(anchor, target)
+			if cycle then
+				send_mux(cid, { ok = false, error = cycle }, false)
+				return
+			end
+		end
 	end
 
 	if op == "status" then
@@ -1732,6 +1767,11 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			target_pane, err = select_worker(cx, anchor, req.target_pane, req.cwd)
 			if not target_pane then
 				send_mux(cid, { ok = false, error = err }, false)
+				return
+			end
+			local cycle = ownership_cycle(anchor, target_pane)
+			if cycle then
+				send_mux(cid, { ok = false, error = cycle }, false)
 				return
 			end
 			local owner = owner_of_pane(cx, target_pane)

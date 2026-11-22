@@ -1,7 +1,7 @@
 # tern-wingman
 
 <p align="center">
-  <b>Fly with a live side-pane or Picture-in-Picture <code>omp</code> wingman inside <a href="https://stencil.so/tern">Tern</a>.</b><br>
+  <b>Fly with live side-pane or Picture-in-Picture agent wingmen (<code>omp</code> by default, or any Tern agent) inside <a href="https://stencil.so/tern">Tern</a>.</b><br>
   Native <code>WindowCx.agents</code> TSP bridge + portable agent skill for Antigravity, Claude Code, Codex, Gemini CLI, OpenCode &amp; more.
 </p>
 
@@ -18,13 +18,13 @@
 
 ---
 
-**`tern-wingman`** lets any coding agent running inside a [Tern](https://stencil.so/tern) pane act as lead architect/supervisor while delegating implementation, refactoring, and heavy test runs to a live **[oh-my-pi (`omp`)](https://github.com/can1357/oh-my-pi)** wingman right beside it — or floating in a Picture-in-Picture corner.
+**`tern-wingman`** lets any coding agent running inside a [Tern](https://stencil.so/tern) pane delegate implementation, refactoring, and heavy test runs to live wingman agents right beside it — or floating in a Picture-in-Picture corner. The default wingman is **[oh-my-pi (`omp`)](https://github.com/can1357/oh-my-pi)**; `--agent ID` launches any other Tern agent (`claude`, `codex`, `copilot`, or a custom one) via `tern acp`. Wingmen can have wingmen of their own (multi-level trees).
 
 Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across 4 KB PTY buffers and steals focus) or polling multi-hundred-MB `.jsonl` logs on disk, `tern-wingman` drives Tern's own **`WindowCx.agents`** engine over the **Tern Surface Protocol (TSP)**:
 
-- **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until `omp` reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
+- **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until the agent reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
 - **Zero-polling `AF_UNIX` event bus (`tern.process.spawn` + `agent_finished`)** — zero `.jsonl` polling, zero timer directory scans, and zero ephemeral TCP ports; `window.luau` wakes `wingman.py` over a `0600` UNIX domain socket in `2–10 ms` (even when occluded on Wayland) and survives live `tern plugin reload`.
-- **Explicit `anchor → wingman` ownership graph & FIFO queueing** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs; sending to a busy worker queues natively in `window.luau` (`unqueue` cancels pending slots), and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
+- **Explicit `anchor → wingman` ownership graph & FIFO queueing** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs; binding a pane to itself or an ancestor is rejected with a cycle error before any effect. Sending to a busy worker queues natively in `window.luau` (`unqueue` cancels pending slots), and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
 - **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if `omp` finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if the lead agent is busy); `omp` can also push mid-turn progress or questions proactively via `wingman.py report`.
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
 - **Non-intrusive Splits & Picture-in-Picture (`--pip br`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), and floats/docks the wingman as a corner PiP overlay on demand.
@@ -64,6 +64,8 @@ tern plugin install github.com/ninthcj/tern-wingman
 npx skills add ninthcj/tern-wingman
 ```
 
+Custom agents (any id other than `omp`/`claude`/`codex`/`copilot`, e.g. `agy`) are not installed by this plugin: add them in Tern **Settings › Agents** (id, name, command, args, env) before using `--agent <id>`.
+
 <details>
 <summary><b>Manual / Antigravity / Local checkout setup</b></summary>
 
@@ -102,7 +104,7 @@ Budget (Tern pauses a window hook whose call runs past 50 ms of Lua, and every t
 
 ## CLI Reference (`wingman.py`)
 
-`wingman.py` requires only Python 3.10+ standard library (**Linux, macOS & Windows**). Outside Tern (or with `--mode headless`), `send` automatically falls back to detached `omp -p --wait-async --auto-approve`.
+`wingman.py` requires only Python 3.10+ standard library (**Linux, macOS & Windows**). Outside Tern (or with `--mode headless`), `send` automatically falls back to detached `omp -p --wait-async --auto-approve`; this headless fallback is `omp`-only.
 
 ```sh
 # Inspect live Tern TSP agents, PiP floats, ovnfs availability, and recent sessions
@@ -117,6 +119,11 @@ python3 skills/wingman/scripts/wingman.py send new \
 python3 skills/wingman/scripts/wingman.py send new --layout down --prompt "Add tests for parser.py"
 python3 skills/wingman/scripts/wingman.py send new --layout pip --pip tr --prompt "Watch the build"  # --pip tr works by itself too
 
+# Any Tern agent as wingman (launched as `tern acp <id>`); model / explicit resume / latest (= native --continue)
+python3 skills/wingman/scripts/wingman.py send new --agent claude --model <model> --prompt "Review the diff"
+python3 skills/wingman/scripts/wingman.py send <session-id> --agent codex --prompt "Continue"   # Wingman passes native --resume <session-id>
+python3 skills/wingman/scripts/wingman.py send latest --agent claude --prompt "Pick up where you left off"
+
 # Several wingmen bound? Target one exactly with --pane; replacement is explicit and never automatic
 python3 skills/wingman/scripts/wingman.py send same --pane <id> --prompt "Run pytest -q"
 python3 skills/wingman/scripts/wingman.py send new --replace --prompt "Start over"   # closes the sole/unique-cwd bound worker; errors if none or ambiguous
@@ -129,7 +136,7 @@ python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id"
 # Worker turn failed/aborted (supervisor gets `[Wingman fault · retryable · pane <id>]`): native `/retry`, same as F5
 python3 skills/wingman/scripts/wingman.py retry --pane <id>
 
-# Float to PiP (corner br|bl|tr|tl), dock back, park (hide, still live) / unpark, interrupt, cancel queued, close
+# Float to PiP (corner br|bl|tr|tl), dock back, park (hide; omp keeps running) / unpark, interrupt, cancel queued, close
 python3 skills/wingman/scripts/wingman.py pip --corner br
 python3 skills/wingman/scripts/wingman.py dock --dir right
 python3 skills/wingman/scripts/wingman.py park --pane <id>
@@ -148,9 +155,15 @@ python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 - **Cross-agent memory ([deja-vu](https://github.com/vshulcz/deja-vu))**: `deja` indexes transcripts across 48 coding agents alongside `omp`, giving your lead agent instant historical recall while `tern-wingman` owns live TSP execution.
 - **Zero-copy sandboxes ([ovnfs](https://github.com/stencil-hq/ovnfs))**: Run risky refactors or parallel A/B tasks by passing `--cwd "$(ovnfs new .)"`, reviewing with `ovnfs diff`, and landing with `ovnfs apply`.
 
+### Agents & constraints
+
+`send --agent ID` defaults to `omp`. For other agents the worker starts as `tern acp <id>` with optional `--model`; a positional session ID (`send <session-id> --agent claude …`) is passed to the agent as native `--resume <session-id>` (Wingman itself has no `--resume` flag), `latest` maps to native `--continue`, `new` starts fresh. The working directory comes from the pane layout (`--cwd`). Rejected for non-`omp` agents rather than emulated: `--mode headless`, `--thinking`, and the `omp`-specific `--takeover-idle` / `--allow-fork`. Custom ids must be lowercase letters, digits, `.`, `_`, `-` (≤64 chars, no leading `-`). `same` and controls reuse or adopt any live unowned agent in the same tab (preferring a matching cwd) regardless of `--agent`. `info` reports each agent's `kind`. `send` / `retry` default to async when the caller itself is a Tern agent; `retry` is the `omp` `/retry` fault-recovery path.
+
+**Hidden ACP agents:** on Tern 0.9.30 a hidden ACP agent (parked, or in a background tab) accepts a prompt but keeps it queued until its pane is shown or unparked. For unattended work and callback delivery with ACP agents use `split`, `down` or `pip` in the current tab; `unpark`/show the pane before expecting queued ACP prompts or callbacks. `omp` keeps running and responding while parked.
+
 ### Multiple wingmen & placement
 
-One owner can run several wingmen at once. `send new` adds a worker; `send new --replace` closes only the selected bound worker before launching its replacement. `send same` and controls select the sole bound worker automatically. With several, use `--pane <id>` or an explicit `--cwd` that matches exactly one; ambiguous commands list the bound IDs. `info` reports sorted `boundWingmanPanes` and retains `boundWingmanPane` when there is exactly one.
+One owner can run several wingmen at once, and wingmen can own wingmen. `send new` adds a worker; `send new --replace` closes only the selected bound worker before launching its replacement. `send same` and controls select the sole bound worker automatically. With several, use `--pane <id>` or an explicit `--cwd` that matches exactly one; ambiguous commands list the bound IDs. `info` reports sorted `boundWingmanPanes` and retains `boundWingmanPane` when there is exactly one.
 
 `--layout` selects placement (default `split` for a fresh worker; an existing target keeps its placement unless `--layout` is given):
 
@@ -160,9 +173,9 @@ One owner can run several wingmen at once. `send new` adds a worker; `send new -
 | `pip` | lightweight worker or watcher (`--pip tl\|tr\|bl\|br` sets the corner and implies `--layout pip`; default `br`) |
 | `down` | second worker, stacked under the right-side worker |
 | `tab` | independent unfocused tab for a 3rd+ or noisy worker |
-| `park` | hide a live worker; it keeps running and still reports (`unpark` brings it back) |
+| `park` | hide a live worker; `omp` keeps running and responding while parked, but a hidden ACP agent queues prompts until `unpark` |
 
-New workers open without taking focus. The Live Panel shows all wingmen of an in-tab supervisor, even those parked or in another tab. Parked workers still receive prompts and deliver completion callbacks. Use `park` and `unpark` to hide and show a live worker without stopping it.
+New workers open without taking focus. The Live Panel shows all wingmen of an in-tab supervisor, even those parked or in another tab. Use `park` and `unpark` to hide and show a live worker without stopping it.
 
 ## Development & Tests
 

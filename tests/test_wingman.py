@@ -66,50 +66,40 @@ class WingmanTests(unittest.TestCase):
             wingman.resolve_target_pane_from_status(status, None, lead_cwd, "new", None, anchor_pane=100, replace=True),
             (105, True),
         )
-        self.assertEqual(wingman.select_wingman_pane_from_status(status, None, 100, cwd=lead_cwd), 105)
+        self.assertEqual(wingman.select_wingman_pane_from_status(status, 100, cwd=lead_cwd), 105)
 
-    def test_unbound_adoption_uses_authoritative_omp_session_file_and_respects_other_owners(self) -> None:
+    def test_unbound_adoption_prefers_cwd_and_respects_other_owners(self) -> None:
         cwd = Path("/tmp/demo-repo")
-        inspect_data = {
-            "panes": [
-                {"pane": 100, "omp_session_file": None},  # ACP agy lead 1
-                {"pane": 200, "omp_session_file": None},  # ACP claude lead 2 in same tab
-                {"pane": 201, "omp_session_file": "/tmp/s201.jsonl"},  # Owned by lead 200
-                {"pane": 102, "omp_session_file": "/tmp/s102.jsonl"},  # Unclaimed omp pane
-            ]
-        }
         status = {
             "bound_pane": None,
             "agents": [
                 {"pane": 100, "is_self": True, "same_tab": True, "cwd": str(cwd), "state": "working"},
-                {"pane": 200, "is_self": False, "same_tab": True, "cwd": str(cwd), "state": "working"},
                 {"pane": 201, "is_self": False, "bound_owner": 200, "same_tab": True, "cwd": str(cwd), "state": "idle"},
+                {"pane": 300, "is_self": False, "bound_owner": None, "same_tab": False, "cwd": str(cwd), "state": "idle"},
+                {"pane": 101, "is_self": False, "bound_owner": None, "same_tab": True, "cwd": "/tmp/other", "state": "idle"},
                 {"pane": 102, "is_self": False, "bound_owner": None, "same_tab": True, "cwd": str(cwd), "state": "idle"},
             ],
         }
-        # Adopts unclaimed omp pane 102 — never self (100), never ACP peer (200), never peer's wingman (201)
+        # Never self (100), peer-owned (201) or other-tab (300); cwd match (102) beats first unclaimed (101)
         self.assertEqual(
-            wingman.resolve_target_pane_from_status(status, inspect_data, cwd, "same", None, anchor_pane=100),
+            wingman.resolve_target_pane_from_status(status, None, cwd, "same", None, anchor_pane=100),
             (102, False),
         )
-        self.assertEqual(wingman.select_wingman_pane_from_status(status, inspect_data, 100, cwd=cwd), 102)
-
-        # `new` when caller has no bound_pane spawns a fresh split (None, False) without killing manual pane 102
+        self.assertEqual(wingman.select_wingman_pane_from_status(status, 100, cwd=cwd), 102)
+        # No cwd match: falls back to the first unclaimed agent
         self.assertEqual(
-            wingman.resolve_target_pane_from_status(status, inspect_data, cwd, "new", None, anchor_pane=100),
+            wingman.resolve_target_pane_from_status(status, None, Path("/tmp/none"), "same", None, anchor_pane=100),
+            (101, False),
+        )
+        # `new` spawns a fresh split without touching the unclaimed pane
+        self.assertEqual(
+            wingman.resolve_target_pane_from_status(status, None, cwd, "new", None, anchor_pane=100),
             (None, False),
         )
-
-        # When only ACP panes exist in the tab (no omp_session_file), refuses to hit self or ACP peer
-        only_acp = {
-            "bound_pane": None,
-            "agents": [
-                {"pane": 100, "is_self": True, "same_tab": True, "cwd": str(cwd), "state": "working"},
-                {"pane": 200, "is_self": False, "same_tab": True, "cwd": str(cwd), "state": "idle"},
-            ],
-        }
+        # Only self and peer-owned agents: nothing to adopt
+        only_owned = {"agents": [status["agents"][0], status["agents"][1]]}
         with self.assertRaises(SystemExit):
-            wingman.select_wingman_pane_from_status(only_acp, inspect_data, 100, cwd=cwd)
+            wingman.select_wingman_pane_from_status(only_owned, 100, cwd=cwd)
 
     def test_cli_control_subcommands_accept_cwd(self) -> None:
         import io
@@ -271,18 +261,11 @@ class WingmanTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             wingman.select_owner_pane_from_status(status_ambiguous, 105)
 
-        # 4. `is_caller_acp_agent` distinguishes Tern ACP panes (`agy`/`claude`) from plain shells and `omp` panes
-        inspect_sample = {
-            "panes": [
-                {"pane": 50, "omp_session_file": None},  # plain zsh shell (not in status.agents)
-                {"pane": 100, "omp_session_file": None},  # ACP agy pane (in status.agents, no omp_session_file)
-                {"pane": 105, "omp_session_file": "/tmp/s105.jsonl"},  # omp worker pane
-            ]
-        }
+        # 4. `is_caller_tern_agent` is true for any pane listed in status.agents (ACP or omp), false for plain shells
         status_sample = {"agents": [{"pane": 100}, {"pane": 105}]}
-        self.assertFalse(wingman.is_caller_acp_agent(status_sample, inspect_sample, 50))
-        self.assertTrue(wingman.is_caller_acp_agent(status_sample, inspect_sample, 100))
-        self.assertFalse(wingman.is_caller_acp_agent(status_sample, inspect_sample, 105))
+        self.assertFalse(wingman.is_caller_tern_agent(status_sample, 50))
+        self.assertTrue(wingman.is_caller_tern_agent(status_sample, 100))
+        self.assertTrue(wingman.is_caller_tern_agent(status_sample, 105))
 
     def test_windows_paths_cmdline_and_tcp_token_fallback(self) -> None:
         from unittest import mock
@@ -515,7 +498,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         stack = ExitStack()
         stack.enter_context(mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}))
         stack.enter_context(mock.patch.object(wingman, "call_bridge", fake_bridge))
-        stack.enter_context(mock.patch.object(wingman, "find_omp_bin", lambda: "omp"))
+        stack.enter_context(mock.patch.object(wingman, "find_omp_bin", lambda required=True: "omp"))
         stack.enter_context(mock.patch.object(wingman, "find_tern_bin", lambda: None))
         stack.enter_context(mock.patch.object(wingman, "inspect_tern", lambda _b: None))
         stack.enter_context(mock.patch("sys.stdout"))
@@ -617,24 +600,24 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         self.assertEqual((req["target_pane"], req["reset_new"]), (107, False))
         self.assertNotIn("layout", req)
 
-    def test_same_adopts_unclaimed_omp_only_when_no_bound_worker(self) -> None:
+    def test_same_adopts_unclaimed_agent_only_when_no_bound_worker(self) -> None:
         cwd = Path("/tmp/demo-repo")
-        inspect_data = {"panes": [{"pane": 102, "omp_session_file": "/tmp/s102.jsonl"}]}
         manual = _agent(102, str(cwd), bound_owner=None)
         status = _multi_status([], [manual])
+        # No inspect data needed: any live unowned same-tab agent qualifies
         self.assertEqual(
-            wingman.resolve_target_pane_from_status(status, inspect_data, cwd, "same", None, anchor_pane=100),
+            wingman.resolve_target_pane_from_status(status, None, cwd, "same", None, anchor_pane=100),
             (102, False),
         )
         # With an owned worker the manual pane is never considered
         owned = _multi_status([105], [manual])
         self.assertEqual(
-            wingman.resolve_target_pane_from_status(owned, inspect_data, cwd, "same", None, anchor_pane=100),
+            wingman.resolve_target_pane_from_status(owned, None, cwd, "same", None, anchor_pane=100),
             (105, False),
         )
         # Nothing owned and nothing adoptable -> no target
         self.assertEqual(
-            wingman.resolve_target_pane_from_status(_multi_status([]), inspect_data, cwd, "same", None, anchor_pane=100),
+            wingman.resolve_target_pane_from_status(_multi_status([]), None, cwd, "same", None, anchor_pane=100),
             (None, False),
         )
         # Explicit session resume keeps matching by authoritative session file, regardless of ownership
@@ -675,16 +658,29 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         req = self._dispatch(["same", "--layout", "pip", "--pip", "tl"], _multi_status([105]))
         self.assertEqual((req["layout"], req["pip_corner"], req["target_pane"]), ("pip", "tl", 105))
 
-    def test_existing_target_without_layout_keeps_placement_and_dispatch_command_is_unchanged(self) -> None:
-        req = self._dispatch(["same"], _multi_status([105]))
+    def test_existing_target_has_no_launch_command_and_spawn_command_is_unchanged(self) -> None:
+        from unittest import mock
+
+        def forbidden(*_a: object, **_k: object) -> None:
+            raise AssertionError("omp must not be located for an existing target")
+
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(["send", "same", "-m", "go", "--wait"])
+        with self._patched(_multi_status([105]), calls) as stack:
+            stack.enter_context(mock.patch.object(wingman, "find_omp_bin", forbidden))
+            with self.assertRaises(SystemExit):
+                ns.func(ns)
+        req = [c for c in calls if c["op"] == "dispatch"][0]
         self.assertNotIn("layout", req)
         self.assertNotIn("pip_corner", req)
         self.assertEqual(
             set(req),
-            {"op", "anchor_pane", "target_pane", "reset_new", "queue", "async_callback", "cwd", "command", "prompt"},
+            {"op", "anchor_pane", "target_pane", "reset_new", "queue", "async_callback", "cwd", "prompt"},
         )
-        self.assertEqual(req["command"], wingman.format_command_line(["omp", "--auto-approve", "--cwd", req["cwd"]]))
         self.assertEqual(req["prompt"], "go")
+        # Spawning keeps the default omp command
+        req = self._dispatch(["new"], _multi_status([105]))
+        self.assertEqual(req["command"], wingman.format_command_line(["omp", "--auto-approve", "--cwd", req["cwd"]]))
 
     def test_send_flag_conflicts_are_rejected_before_any_bridge_call(self) -> None:
         cases = {
@@ -783,17 +779,147 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         self.assertIsInstance(code, str)
         self.assertEqual([c["op"] for c in calls], ["status"])
 
-    def test_controls_fall_back_to_manual_adoption_only_without_bound_workers(self) -> None:
+    def test_controls_fall_back_to_unclaimed_adoption_only_without_bound_workers(self) -> None:
         cwd = Path("/tmp/demo-repo")
-        inspect_data = {"panes": [{"pane": 102, "omp_session_file": "/tmp/s102.jsonl"}]}
         manual = _agent(102, str(cwd))
-        self.assertEqual(wingman.select_wingman_pane_from_status(_multi_status([], [manual]), inspect_data, 100, cwd=cwd), 102)
-        # Owned worker 105 is chosen even though a manual omp pane exists
-        self.assertEqual(wingman.select_wingman_pane_from_status(_multi_status([105], [manual]), inspect_data, 100), 105)
+        self.assertEqual(wingman.select_wingman_pane_from_status(_multi_status([], [manual]), 100, cwd=cwd), 102)
+        # Owned worker 105 is chosen even though an unclaimed pane exists
+        self.assertEqual(wingman.select_wingman_pane_from_status(_multi_status([105], [manual]), 100), 105)
         with self.assertRaises(SystemExit):
-            wingman.select_wingman_pane_from_status(_multi_status([]), inspect_data, 100)
+            wingman.select_wingman_pane_from_status(_multi_status([]), 100)
         # Legacy status with only `bound_pane`
-        self.assertEqual(wingman.select_wingman_pane_from_status({"bound_pane": 105, "agents": []}, None, 100), 105)
+        self.assertEqual(wingman.select_wingman_pane_from_status({"bound_pane": 105, "agents": []}, 100), 105)
+
+    def _acp_dispatch(self, argv: list[str], status: dict, tern: str | None = "/opt/tern") -> dict:
+        from unittest import mock
+
+        def forbidden(*_a: object, **_k: object) -> None:
+            raise AssertionError("omp / inspect must not be consulted for native ACP agents")
+
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(["send", *argv, "-m", "go", "--wait"])
+        with self._patched(status, calls) as stack:
+            stack.enter_context(mock.patch.object(wingman, "find_omp_bin", forbidden))
+            stack.enter_context(mock.patch.object(wingman, "inspect_tern", forbidden))
+            stack.enter_context(mock.patch.object(wingman, "find_tern_bin", lambda: tern))
+            with self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+        self.assertEqual(cm.exception.code, 0)
+        dispatches = [c for c in calls if c["op"] == "dispatch"]
+        self.assertEqual(len(dispatches), 1)
+        return dispatches[0]
+
+    def _acp_error(self, argv: list[str], status: dict | None = None, env_pane: bool = True) -> str:
+        from unittest import mock
+
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(["send", *argv, "-m", "go", "--wait"])
+        with self._patched(status or _multi_status([]), calls) as stack:
+            stack.enter_context(mock.patch.object(wingman, "find_tern_bin", lambda: "/opt/tern"))
+            if not env_pane:
+                wingman.os.environ.pop("TERN_PANE", None)
+            with mock.patch.object(wingman.subprocess, "Popen") as popen, self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+            popen.assert_not_called()
+        self.assertFalse([c for c in calls if c["op"] == "dispatch"])
+        self.assertIsInstance(cm.exception.code, str)
+        return str(cm.exception.code)
+
+    def test_native_acp_agent_launch_argv_model_resume_and_continue(self) -> None:
+        status = _multi_status([])
+        req = self._acp_dispatch(["new", "--agent", "agy"], status)
+        self.assertEqual(req["command"], wingman.format_command_line(["/opt/tern", "acp", "agy"]))
+        self.assertIsNone(req["target_pane"])
+        self.assertEqual(req["layout"], "split")
+        self.assertNotIn("--cwd", req["command"])
+        self.assertNotIn("--prompt", req["command"])
+        req = self._acp_dispatch(["new", "--agent", "claude", "--model", "opus"], status)
+        self.assertEqual(req["command"], wingman.format_command_line(["/opt/tern", "acp", "claude", "--model", "opus"]))
+        # `latest` -> native --continue; explicit id passes through opaquely (not resolved as an omp session)
+        req = self._acp_dispatch(["latest", "--agent", "codex"], status)
+        self.assertEqual(req["command"], wingman.format_command_line(["/opt/tern", "acp", "codex", "--continue"]))
+        req = self._acp_dispatch(["abc-123", "--agent", "codex", "--model", "m"], status)
+        self.assertEqual(
+            req["command"],
+            wingman.format_command_line(["/opt/tern", "acp", "codex", "--resume", "abc-123", "--model", "m"]),
+        )
+        req = self._acp_dispatch(["/some/path with space", "--agent", "copilot"], status)
+        self.assertIn("--resume", req["command"])
+        self.assertIn("/some/path with space", __import__("shlex").split(req["command"]))
+
+    def test_native_acp_same_reattaches_and_adopts_without_launch_binaries(self) -> None:
+        # Reattach to an owned worker: no tern launch executable required, no resume args
+        req = self._acp_dispatch(["same", "--agent", "agy"], _multi_status([105]), tern=None)
+        self.assertEqual(req["target_pane"], 105)
+        self.assertNotIn("command", req)
+        # Unclaimed same-tab agent is adopted (cwd preferred) regardless of agent id
+        cwd = "/tmp/proj"
+        extra = [_agent(201, "/tmp/other"), _agent(202, cwd)]
+        req = self._acp_dispatch(["same", "--agent", "agy", "--cwd", cwd], _multi_status([], extra), tern=None)
+        self.assertEqual(req["target_pane"], 202)
+        req = self._acp_dispatch(["same", "--agent", "agy"], _multi_status([], extra), tern=None)
+        self.assertEqual(req["target_pane"], 201)
+
+    def test_native_acp_rejections(self) -> None:
+        self.assertIn("--thinking", self._acp_error(["new", "--agent", "agy", "--thinking", "high"]))
+        self.assertIn("--takeover-idle", self._acp_error(["new", "--agent", "agy", "--takeover-idle"]))
+        self.assertIn("--allow-fork", self._acp_error(["new", "--agent", "agy", "--allow-fork"]))
+        self.assertIn("headless", self._acp_error(["new", "--agent", "agy", "--mode", "headless"]))
+        self.assertIn("headless", self._acp_error(["new", "--agent", "agy"], env_pane=False))
+        for bad in ("-agy", "Agy", "a b", "x" * 65, ""):
+            with self.subTest(agent=bad):
+                self.assertIn("invalid --agent", self._acp_error(["new", f"--agent={bad}"]))
+        # Launching needs the `tern` CLI
+        from unittest import mock
+
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(["send", "new", "--agent", "agy", "-m", "go", "--wait"])
+        with self._patched(_multi_status([]), calls), self.assertRaises(SystemExit) as cm:
+            ns.func(ns)
+        self.assertIn("`tern` CLI", str(cm.exception.code))
+        self.assertEqual([c["op"] for c in calls], ["status"])
+
+    def test_bridge_cycle_error_is_passed_through_unmodified(self) -> None:
+        from unittest import mock
+
+        message = "cannot bind pane 105: would create an ownership cycle"
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(["send", "same", "--pane", "105", "-m", "go", "--wait"])
+        err = __import__("io").StringIO()
+        with self._patched(_multi_status([]), calls, reply={"ok": False, "status": "failed", "error": message}) as stack:
+            stack.enter_context(mock.patch("sys.stderr", err))
+            with self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn(f"[wingman] Worker finished with status=failed: {message}", err.getvalue())
+
+    def test_auto_delivery_is_async_iff_caller_is_listed_in_status_agents(self) -> None:
+        from unittest import mock
+
+        def forbidden(*_a: object, **_k: object) -> None:
+            raise AssertionError("no inspect for caller detection")
+
+        def auto_req(status: dict, retry: bool = False) -> dict:
+            calls: list[dict] = []
+            argv = ["retry", "105"] if retry else ["send", "new", "-m", "go"]
+            ns = wingman.build_parser().parse_args(argv)
+            with self._patched(status, calls) as stack:
+                stack.enter_context(mock.patch.object(wingman, "inspect_tern", forbidden))
+                if retry:
+                    ns.func(ns)
+                else:
+                    with self.assertRaises(SystemExit) as cm:
+                        ns.func(ns)
+                    self.assertEqual(cm.exception.code, 0)
+            op = "retry" if retry else "dispatch"
+            return next(c for c in calls if c["op"] == op)
+
+        listed = _multi_status([105])  # caller 100 (omp or ACP alike) is in status.agents
+        shell = {"ok": True, "agents": [_agent(105, bound_owner=None)]}
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                self.assertTrue(auto_req(listed, retry)["async_callback"])
+                self.assertFalse(auto_req(shell, retry)["async_callback"])
 
     def test_info_reports_all_bound_panes_plus_singular_and_placement_flags(self) -> None:
         import io
@@ -805,7 +931,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
                 ns = wingman.build_parser().parse_args(["info", "--cwd", tmp])
                 buf = io.StringIO()
                 with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(
-                    wingman, "find_omp_bin", lambda: "omp"
+                    wingman, "find_omp_bin", lambda required=True: "omp"
                 ), mock.patch.object(wingman, "find_tern_bin", lambda: None), mock.patch.object(
                     wingman, "find_ovnfs_bin", lambda: None
                 ), mock.patch.object(wingman, "get_collab_hosts", lambda _b: {}), mock.patch.object(
@@ -832,6 +958,66 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         # Old plugin: only singular bound_pane
         out = info_for({"ok": True, "bound_pane": 105, "agents": [_agent(105, bound_owner=100)]})
         self.assertEqual((out["boundWingmanPanes"], out["boundWingmanPane"]), ([105], 105))
+
+    def _info(self, status: dict, omp: str | None, inspect_data: dict | None = None) -> dict:
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        def no_omp(*_a: object, **_k: object) -> None:
+            raise AssertionError("omp must not be consulted when it is missing")
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
+            ns = wingman.build_parser().parse_args(["info", "--cwd", tmp])
+            buf = io.StringIO()
+            with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(
+                wingman, "find_omp_bin", lambda required=True: omp
+            ), mock.patch.object(wingman, "find_tern_bin", lambda: "/bin/tern"), mock.patch.object(
+                wingman, "find_ovnfs_bin", lambda: None
+            ), mock.patch.object(wingman, "get_collab_hosts", (lambda _b: {}) if omp else no_omp), mock.patch.object(
+                wingman, "check_leases", (lambda _b, _s: set()) if omp else no_omp
+            ), mock.patch.object(wingman, "call_bridge", lambda req, timeout=None: status), mock.patch.object(
+                wingman, "inspect_tern", lambda _b: inspect_data
+            ), redirect_stdout(buf):
+                ns.func(ns)
+            return json.loads(buf.getvalue())
+
+    def test_info_kind_comes_only_from_omp_session_file_and_omp_is_optional(self) -> None:
+        status = _multi_status([105], [_agent(106)])
+        inspect_data = {"panes": [{"pane": 105, "omp_session_file": "/tmp/s105.jsonl"}, {"pane": 106, "omp_session_file": None}]}
+        out = self._info(status, "omp", inspect_data)
+        kinds = {a["pane"]: a["kind"] for a in out["ternAgents"]}
+        self.assertEqual((kinds[105], kinds[106]), ("omp", "acp"))
+        self.assertEqual(out["ompBin"], "omp")
+        # Without omp installed `info` still works and reports the native agents
+        out = self._info(status, None, inspect_data)
+        self.assertIsNone(out["ompBin"])
+        self.assertEqual(out["boundWingmanPanes"], [105])
+        self.assertEqual({a["pane"] for a in out["ternAgents"]}, {100, 105, 106})
+
+    def test_find_omp_bin_not_required_returns_none_when_absent(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(wingman, "home_dir", lambda: Path(tmp)), mock.patch.object(
+            wingman.shutil, "which", lambda _n: None
+        ), mock.patch.dict(wingman.os.environ, {"LOCALAPPDATA": ""}):
+            self.assertIsNone(wingman.find_omp_bin(required=False))
+            with self.assertRaises(SystemExit):
+                wingman.find_omp_bin()
+
+    def test_window_luau_ownership_fixture(self) -> None:
+        import shutil
+
+        luau = shutil.which("luau")
+        if luau is None:
+            self.skipTest("`luau` runner is not on PATH; cannot execute window.luau against tests/ownership_fixture.luau")
+        fixture = (ROOT_DIR / "tests" / "ownership_fixture.luau").read_text(encoding="utf-8")
+        window = (ROOT_DIR / "window.luau").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "ownership_fixture_run.luau"
+            script.write_text(fixture.replace("-- @WINDOW_PLUGIN@", window), encoding="utf-8")
+            proc = subprocess.run([luau, str(script)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
 
 
 if __name__ == "__main__":

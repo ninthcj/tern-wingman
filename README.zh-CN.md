@@ -1,7 +1,7 @@
 # tern-wingman
 
 <p align="center">
-  <b>在 <a href="https://stencil.so/tern">Tern</a> 里一边用主控 Agent 聊架构，一边让侧边分屏 / 画中画里的 <code>omp</code> 僚机实时干重活。</b><br>
+  <b>在 <a href="https://stencil.so/tern">Tern</a> 里一边用主控 Agent 聊架构，一边让侧边分屏 / 画中画里的僚机 Agent（默认 <code>omp</code>，也可是任意 Tern Agent）实时干重活。</b><br>
   基于原生 <code>WindowCx.agents</code> (TSP) 协议桥接，通用于 Antigravity、Claude Code、Codex、Gemini CLI、OpenCode 等任意主控 Agent。
 </p>
 
@@ -11,13 +11,13 @@
 
 ---
 
-**`tern-wingman`** 把 Tern 窗口底层的 **`WindowCx.agents`** 原生 TSP 通道桥接给跑在 Tern Pane 里的任意命令行 Agent（如 `agy`、`claude`、`codex`）：你在左边跟主 Agent 讨论设计与验收，右边分屏（或右下角画中画悬浮小窗）里的 **[oh-my-pi (`omp`)](https://github.com/can1357/oh-my-pi)** 实时流式执行代码修改与测试。
+**`tern-wingman`** 把 Tern 窗口底层的 **`WindowCx.agents`** 原生 TSP 通道桥接给跑在 Tern Pane 里的任意命令行 Agent（如 `agy`、`claude`、`codex`）：你在左边跟主 Agent 讨论设计与验收，右边分屏（或右下角画中画悬浮小窗）里的僚机实时流式执行代码修改与测试。默认僚机是 **[oh-my-pi (`omp`)](https://github.com/can1357/oh-my-pi)**；`--agent ID` 可通过 `tern acp` 启动任意其他 Tern Agent（`claude`、`codex`、`copilot` 或自定义 Agent）。僚机还可以拥有自己的僚机（多级树）。
 
 ### 核心特性
 
-- **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 `omp` 输入框 `sendable=true` 后单次原子投递。
+- **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 Agent 输入框 `sendable=true` 后单次原子投递。
 - **零轮询 `AF_UNIX` 原生事件总线（`tern.process.spawn` + `agent_finished`）**：0 磁盘 `.jsonl` 轮询、0 定时器扫目录、0 临时 TCP 端口；通过本地 `0600` UNIX Domain Socket 原生跨线程唤醒 UI 虚拟机（Wayland 后台失焦同样稳定 `2~10 ms` 响应），并支持插件热重载不断连恢复。
-- **显式 `anchor → wingman` 归属绑定与原生排队（`unqueue`）**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机；僚机忙碌时继续派单会在 `window.luau` 内存队列自动排队并在 `agent_finished` 时按序推进，支持随时 `unqueue` 撤回。
+- **显式 `anchor → wingman` 归属绑定与原生排队（`unqueue`）**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机；显式把 pane 绑定到自身或其祖先会在产生任何副作用之前以环路错误拒绝。僚机忙碌时继续派单会在 `window.luau` 内存队列自动排队并在 `agent_finished` 时按序推进，支持随时 `unqueue` 撤回。
 - **全双工双向回推（`report` 主动汇报 + 异步轮次自动唤醒）**：当 `omp` 内部后台长任务（如 `bg_x`）跑完自动开启新一轮并结束时，即便主控 `agy` 早已进入 `idle`，插件也会自动把本轮结果回推唤醒主控（若主控正忙则自动缓冲合并投递）；同时 `omp` 也可随时调用 `wingman.py report -m "..."` 沿着 `boundOwner` 主动上报进度或提问。
 - **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片。
 - **零抢焦点分屏 & 画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；随时支持 `--pip br` 缩成角落画中画小窗盯盘、`dock` 一键贴回分屏。
@@ -35,6 +35,8 @@ tern plugin install github.com/ninthcj/tern-wingman
 # 2. 安装通用 Agent Skill
 npx skills add ninthcj/tern-wingman
 ```
+
+自定义 Agent（`omp`/`claude`/`codex`/`copilot` 之外的 id，例如 `agy`）不由本插件安装：使用 `--agent <id>` 前，请先在 Tern **Settings › Agents** 中添加（id、名称、命令、参数、环境变量）。
 
 Antigravity 或本地源码开发链接方式：
 
@@ -59,7 +61,7 @@ ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wing
 
 ## 常用命令（`wingman.py`）
 
-仅依赖 Python 3.10+ 标准库（跨平台支持 **Linux、macOS 与 Windows**；不在 Tern 环境内时自动回退至独立进程组的 `omp -p --wait-async` 无头模式）：
+仅依赖 Python 3.10+ 标准库（跨平台支持 **Linux、macOS 与 Windows**；不在 Tern 环境内时自动回退至独立进程组的 `omp -p --wait-async` 无头模式，该回退仅支持 `omp`）：
 
 ```sh
 # 查看当前窗口活跃的 TSP Agents、画中画状态、ovnfs 与最近会话
@@ -74,6 +76,11 @@ python3 skills/wingman/scripts/wingman.py send new \
 python3 skills/wingman/scripts/wingman.py send new --layout down --prompt "给 parser.py 补测试"
 python3 skills/wingman/scripts/wingman.py send new --layout pip --pip tr --prompt "盯构建"   # 也可只写 --pip tr
 
+# 任意 Tern Agent 作僚机（以 `tern acp <id>` 启动）；模型 / 显式续接 / latest（= 原生 --continue）
+python3 skills/wingman/scripts/wingman.py send new --agent claude --model <model> --prompt "审查 diff"
+python3 skills/wingman/scripts/wingman.py send <session-id> --agent codex --prompt "继续"   # Wingman 向 Agent 传原生 --resume <session-id>
+python3 skills/wingman/scripts/wingman.py send latest --agent claude --prompt "接着上次继续"
+
 # 绑定了多个僚机时用 --pane 精确指定；替换必须显式、绝不自动发生
 python3 skills/wingman/scripts/wingman.py send same --pane <id> --prompt "跑 pytest -q"
 python3 skills/wingman/scripts/wingman.py send new --replace --prompt "重来"   # 关闭唯一/同 cwd 唯一的已绑定僚机；没有或有歧义则报错
@@ -86,7 +93,7 @@ python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id"
 # 僚机回合报错/中断（主控自动收到 `[Wingman fault · retryable · pane <id>]`）：原生 `/retry` 重试，等同 F5
 python3 skills/wingman/scripts/wingman.py retry --pane <id>
 
-# 画中画悬浮（角落 br|bl|tr|tl）/ 贴回分屏 / 隐藏（park，仍在运行）/ 恢复 / 中断 / 撤回排队 / 关闭
+# 画中画悬浮（角落 br|bl|tr|tl）/ 贴回分屏 / 隐藏（park；omp 仍运行）/ 恢复 / 中断 / 撤回排队 / 关闭
 python3 skills/wingman/scripts/wingman.py pip --corner br
 python3 skills/wingman/scripts/wingman.py dock --dir right
 python3 skills/wingman/scripts/wingman.py park --pane <id>
@@ -100,9 +107,15 @@ python3 skills/wingman/scripts/wingman.py report -m "后台链路已跑完，测
 python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 ```
 
+### Agent 与限制
+
+`send --agent ID` 默认 `omp`。其他 Agent 以 `tern acp <id>` 启动，可带 `--model`；位置参数会话 ID（`send <session-id> --agent claude …`）会作为原生 `--resume <session-id>` 传给 Agent（Wingman 自身没有 `--resume` 参数），`latest` 对应原生 `--continue`，`new` 为全新会话。工作目录取自 pane 布局（`--cwd`）。对非 `omp` Agent 会直接拒绝而非模拟：`--mode headless`、`--thinking`，以及 `omp` 专有的 `--takeover-idle` / `--allow-fork`。自定义 id 须为小写字母、数字、`.`、`_`、`-`（≤64 字符，不以 `-` 开头）。`same` 与控制命令复用或接管同一标签页内任意存活且无主的 Agent（优先 cwd 匹配），与 `--agent` 无关。`info` 会返回各 Agent 的 `kind`。调用方本身是 Tern Agent 时，`send` / `retry` 默认异步；`retry` 是 `omp` 的 `/retry` 故障恢复路径。
+
+**隐藏的 ACP Agent：** Tern 0.9.30 上，被隐藏（停放或位于后台标签页）的 ACP Agent 会接收提示，但在其 pane 被显示或 `unpark` 之前一直排队。ACP Agent 需要无人值守执行与回推时，请在当前标签页使用 `split`、`down` 或 `pip`；期望排队的 ACP 提示或回推送达前，先 `unpark` / 显示该 pane。`omp` 在停放期间仍会继续运行并响应。
+
 ### 多僚机与布局
 
-一个主控可同时带多个僚机。`send new` 新增僚机；`send new --replace` 只关闭选定的已绑定僚机，再启动新的。只有一个绑定时，`send same` 和控制命令会自动选中它；有多个时，请用 `--pane <id>` 或显式传入能唯一匹配的 `--cwd`，有歧义时会列出已绑定的 ID。`info` 返回排序后的 `boundWingmanPanes`，仅有一个绑定时也保留 `boundWingmanPane`。
+一个主控可同时带多个僚机，僚机也可以再带僚机。`send new` 新增僚机；`send new --replace` 只关闭选定的已绑定僚机，再启动新的。只有一个绑定时，`send same` 和控制命令会自动选中它；有多个时，请用 `--pane <id>` 或显式传入能唯一匹配的 `--cwd`，有歧义时会列出已绑定的 ID。`info` 返回排序后的 `boundWingmanPanes`，仅有一个绑定时也保留 `boundWingmanPane`。
 
 `--layout` 指定布局（新建默认 `split`；已有目标不指定则保持原位置）：
 
@@ -112,9 +125,9 @@ python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 | `pip` | 轻量任务或盯盘（`--pip tl\|tr\|bl\|br` 选择角落并隐含 `--layout pip`，默认 `br`） |
 | `down` | 第二个僚机，叠在右侧僚机下方 |
 | `tab` | 第 3 个及以上或输出嘈杂的僚机，放入独立且不抢焦点的 Tab |
-| `park` | 隐藏仍在运行的僚机；仍会回报，`unpark` 恢复 |
+| `park` | 隐藏僚机；`omp` 停放期间继续运行并响应，但被隐藏的 ACP Agent 会让提示排队直到 `unpark` |
 
-新僚机不抢焦点。Live Panel 会显示当前标签页主控的所有僚机，即使它们已停放或在其他标签页。停放后仍能接收提示并回推结果；用 `park` 和 `unpark` 隐藏或恢复运行中的僚机。
+新僚机不抢焦点。Live Panel 会显示当前标签页主控的所有僚机，即使它们已停放或在其他标签页。用 `park` 和 `unpark` 隐藏或恢复运行中的僚机。
 
 ## 开源协议
 

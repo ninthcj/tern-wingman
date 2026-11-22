@@ -70,8 +70,8 @@ def format_command_line(parts: list[str]) -> str:
     return shlex.join(parts)
 
 
-def find_omp_bin() -> str:
-    """Locate the active `omp` binary across Linux, macOS, and Windows."""
+def find_omp_bin(required: bool = True) -> str | None:
+    """Locate the active `omp` binary across Linux, macOS, and Windows; with `required=False` return None when absent."""
     h = home_dir()
     local_app = Path(os.environ["LOCALAPPDATA"]) if os.environ.get("LOCALAPPDATA") else None
     exe_names = ("omp.exe", "omp.cmd", "omp") if IS_WINDOWS else ("omp",)
@@ -108,6 +108,8 @@ def find_omp_bin() -> str:
             )
             if vers:
                 return str(vers[0])
+    if not required:
+        return None
     raise SystemExit("error: could not locate `omp` binary on PATH or under Tern's managed directory")
 
 
@@ -544,19 +546,12 @@ def extract_content(content: Any) -> tuple[str, list[str], int]:
     return "\n".join(texts), tools, thinking_chars
 
 
-def _pick_unclaimed_omp_in_tab(
+def _pick_unclaimed_agent_in_tab(
     agents: list[dict[str, Any]],
-    pane_files: dict[int, str],
     cwd: Path | None,
 ) -> int | None:
-    """Select an unbound `omp` pane (verified via `tern inspect`'s `omp_session_file`) in the caller's tab."""
-    unclaimed = [
-        a
-        for a in agents
-        if a.get("same_tab")
-        and a.get("bound_owner") is None
-        and int(a["pane"]) in pane_files
-    ]
+    """Select a live agent pane in the caller's tab that no owner has claimed, preferring a cwd match."""
+    unclaimed = [a for a in agents if a.get("same_tab") and a.get("bound_owner") is None]
     if not unclaimed:
         return None
     if cwd is not None:
@@ -646,7 +641,7 @@ def resolve_target_pane_from_status(
             return explicit_pane, False
         if bound:
             return _choose_bound_pane(bound, agents_by_id, match_cwd, "send to"), False
-        adopted = _pick_unclaimed_omp_in_tab(agents, pane_files, cwd)
+        adopted = _pick_unclaimed_agent_in_tab(agents, cwd)
         return (adopted, False) if adopted is not None else (None, False)
 
     if target_session == "new":
@@ -670,7 +665,6 @@ def resolve_target_pane_from_status(
 
 def select_wingman_pane_from_status(
     status: dict[str, Any],
-    inspect_data: dict[str, Any] | None,
     my_pane: int,
     cwd: Path | None = None,
 ) -> int:
@@ -680,13 +674,12 @@ def select_wingman_pane_from_status(
         agents_by_id = {int(a["pane"]): a for a in status.get("agents", [])}
         return _choose_bound_pane(bound, agents_by_id, cwd, "control")
 
-    pane_files = extract_omp_pane_files(inspect_data)
     agents = [
         a
         for a in status.get("agents", [])
         if not a.get("is_self") and int(a["pane"]) != my_pane
     ]
-    adopted = _pick_unclaimed_omp_in_tab(agents, pane_files, cwd)
+    adopted = _pick_unclaimed_agent_in_tab(agents, cwd)
     if adopted is not None:
         return adopted
 
@@ -730,26 +723,19 @@ def select_owner_pane_from_status(
     )
 
 
-def is_caller_acp_agent(
-    status: dict[str, Any],
-    inspect_data: dict[str, Any] | None,
-    my_pane: int,
-) -> bool:
-    """True when `my_pane` is a Tern ACP chat pane (e.g. `agy`, `claude`, `codex`) rather than a plain shell or `omp`."""
-    pane_files = extract_omp_pane_files(inspect_data)
-    if my_pane in pane_files:
-        return False
+def is_caller_tern_agent(status: dict[str, Any], my_pane: int) -> bool:
+    """True when `my_pane` is a live Tern agent pane (any ACP agent or `omp`) rather than a plain shell."""
     return any(int(a["pane"]) == my_pane for a in status.get("agents", []))
 
 
 def cmd_info(args: argparse.Namespace) -> None:
-    omp_bin = find_omp_bin()
+    omp_bin = find_omp_bin(required=False)
     tern_bin = find_tern_bin()
     ovnfs_bin = find_ovnfs_bin()
     my_pane = current_tern_pane()
     cwd = Path(args.cwd).resolve()
     bucket = sessions_root() / encode_cwd_bucket(cwd)
-    hosts = get_collab_hosts(omp_bin)
+    hosts = get_collab_hosts(omp_bin) if omp_bin else {}
 
     bridge_status: dict[str, Any] | None = None
     if my_pane is not None:
@@ -770,7 +756,7 @@ def cmd_info(args: argparse.Namespace) -> None:
         )[: args.limit]
         headers = [(f, read_session_header(f)) for f in files]
         sids = [h["id"] for _, h in headers if "id" in h]
-        held = check_leases(omp_bin, sids)
+        held = check_leases(omp_bin, sids) if omp_bin else set()
         for f, h in headers:
             sid = h.get("id", "")
             st = f.stat()
@@ -810,6 +796,7 @@ def cmd_info(args: argparse.Namespace) -> None:
                     "model": a.get("model"),
                     "cwd": a.get("cwd"),
                     "sessionFile": pane_files.get(pid),
+                    "kind": "omp" if pid in pane_files else "acp",
                     "lastMessagePreview": lm[:200] + ("…" if len(lm) > 200 else ""),
                 }
             )
@@ -898,19 +885,43 @@ def parse_send_options(
     return explicit_pane, layout, corner
 
 
+AGENT_ID_RE = re.compile(r"[a-z0-9._][a-z0-9._-]{0,63}")
+
+
+def validate_agent_options(args: argparse.Namespace, use_tui: bool) -> None:
+    """Reject `send` options that only make sense for `omp`, or ACP agents that cannot run headless."""
+    agent = args.agent
+    if not AGENT_ID_RE.fullmatch(agent):
+        raise SystemExit(
+            f"error: invalid --agent {agent!r}: use lowercase letters, digits, '.', '_' or '-' (max 64, no leading '-')"
+        )
+    if agent == "omp":
+        return
+    if not use_tui:
+        raise SystemExit(f"error: --agent {agent} only runs in Tern panes; it cannot be used in headless mode")
+    for flag, present in (
+        ("--thinking", bool(args.thinking)),
+        ("--takeover-idle", args.takeover_idle),
+        ("--allow-fork", args.allow_fork),
+    ):
+        if present:
+            raise SystemExit(f"error: {flag} only applies to --agent omp")
+
+
 def cmd_send(args: argparse.Namespace) -> None:
     """Deliver prompt via native Tern TSP `cx.agents` (`wingman` plugin) or headless `-p` fallback."""
     my_pane = current_tern_pane()
     use_tui = args.mode == "tui" or (args.mode == "auto" and my_pane is not None)
     explicit_pane, layout, pip_corner = parse_send_options(args, my_pane, use_tui)
+    validate_agent_options(args, use_tui)
+    is_omp = args.agent == "omp"
 
-    omp_bin = find_omp_bin()
     tern_bin = find_tern_bin()
     cwd = Path(args.cwd or ".").resolve()
 
     prompt = _read_prompt_input(args.prompt, args.prompt_file, label="prompt")
 
-    session_path = resolve_session(args.session, cwd, allow_missing=True)
+    session_path = resolve_session(args.session, cwd, allow_missing=True) if is_omp else None
     timeout_s = parse_duration_seconds(args.max_time)
 
     if use_tui:
@@ -924,7 +935,7 @@ def cmd_send(args: argparse.Namespace) -> None:
                 "Install it with `tern plugin install github.com/ninthcj/tern-wingman` or pass `--mode headless`."
             )
 
-        inspect_data = inspect_tern(tern_bin)
+        inspect_data = inspect_tern(tern_bin) if session_path is not None else None
         target_pane, reset_new = resolve_target_pane_from_status(
             status,
             inspect_data,
@@ -936,9 +947,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             replace=args.replace,
             cwd_explicit=args.cwd is not None,
         )
-        use_async_cb = (args.delivery == "async") or (
-            args.delivery == "auto" and is_caller_acp_agent(status, inspect_data, my_pane)
-        )
+        use_async_cb = (args.delivery == "async") or (args.delivery == "auto" and is_caller_tern_agent(status, my_pane))
 
         if args.session == "same" and target_pane is None:
             raise SystemExit(
@@ -946,6 +955,8 @@ def cmd_send(args: argparse.Namespace) -> None:
                 "Choose `new` for a fresh session, or pass `latest` / an explicit `<sessionId>` from `info`."
             )
 
+        launching = target_pane is None or reset_new
+        omp_bin = find_omp_bin() if launching and is_omp else None
         if target_pane is None and session_path is not None:
             sid = read_session_header(session_path).get("id", "")
             if sid and sid in check_leases(omp_bin, [sid]):
@@ -964,13 +975,25 @@ def cmd_send(args: argparse.Namespace) -> None:
                         "Pass --takeover-idle or use `new`."
                     )
 
-        cmd_parts = [omp_bin, "--auto-approve", "--cwd", str(cwd)]
-        if (target_pane is None or reset_new) and session_path is not None:
-            cmd_parts += ["-r", str(session_path)]
-        if args.model:
-            cmd_parts += ["--model", args.model]
-        if args.thinking:
-            cmd_parts += ["--thinking", args.thinking]
+        if launching:
+            if is_omp:
+                cmd_parts = [omp_bin, "--auto-approve", "--cwd", str(cwd)]
+                if session_path is not None:
+                    cmd_parts += ["-r", str(session_path)]
+                if args.model:
+                    cmd_parts += ["--model", args.model]
+                if args.thinking:
+                    cmd_parts += ["--thinking", args.thinking]
+            else:
+                if tern_bin is None:
+                    raise SystemExit(f"error: could not locate the `tern` CLI needed to launch agent {args.agent!r}")
+                cmd_parts = [tern_bin, "acp", args.agent]
+                if args.session == "latest":
+                    cmd_parts += ["--continue"]
+                elif args.session not in ("new", "same"):
+                    cmd_parts += ["--resume", args.session]
+                if args.model:
+                    cmd_parts += ["--model", args.model]
 
         if layout is None and target_pane is None:
             layout = "split"
@@ -982,15 +1005,23 @@ def cmd_send(args: argparse.Namespace) -> None:
             "queue": not args.no_queue,
             "async_callback": use_async_cb,
             "cwd": str(cwd),
-            "command": format_command_line(cmd_parts),
-            "prompt": prompt,
         }
+        if launching:
+            req["command"] = format_command_line(cmd_parts)
+        req["prompt"] = prompt
         if layout is not None:
             req["layout"] = layout
         if pip_corner is not None:
             req["pip_corner"] = pip_corner
         if args.auto_callback is not None:
             req["auto_callback"] = bool(args.auto_callback)
+
+        if launching and not is_omp and layout in ("park", "tab"):
+            print(
+                "[wingman] Hidden ACP panes on Tern 0.9.30 queue prompts until shown. "
+                "Show or unpark the worker to start the turn.",
+                file=sys.stderr,
+            )
 
         def _on_ack(frame: dict[str, Any]) -> None:
             pane_id = int(frame["pane"])
@@ -1027,13 +1058,13 @@ def cmd_send(args: argparse.Namespace) -> None:
             if reply.get("queued"):
                 pos = int(reply.get("position") or 1)
                 print(
-                    f"[wingman] Queued (#{pos}, {len(prompt)} chars) onto wingman pane {dispatched_pane} (async ACP callback armed).\n"
+                    f"[wingman] Queued (#{pos}, {len(prompt)} chars) onto wingman pane {dispatched_pane} (async callback armed).\n"
                     f"When pane {dispatched_pane} finishes this turn, Tern will automatically submit `[Wingman auto-callback · pane {dispatched_pane}]` "
                     "into your chat composer as a visible turn. Do NOT poll or sleep; end your turn now and wait for the callback."
                 )
             else:
                 print(
-                    f"[wingman] Dispatched ({len(prompt)} chars) onto wingman pane {dispatched_pane} (async ACP callback armed).\n"
+                    f"[wingman] Dispatched ({len(prompt)} chars) onto wingman pane {dispatched_pane} (async callback armed).\n"
                     f"When pane {dispatched_pane} finishes, Tern will automatically submit `[Wingman auto-callback · pane {dispatched_pane}]` "
                     "into your chat composer as a visible turn. Do NOT poll or sleep; end your turn now and wait for the callback."
                 )
@@ -1049,6 +1080,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             "error: `same` refers to an active Tern pane; in headless mode choose `new`, `latest`, or an explicit `<sessionId>`."
         )
 
+    omp_bin = find_omp_bin()
     sid = read_session_header(session_path).get("id", "") if session_path else ""
     if sid and sid in check_leases(omp_bin, [sid]) and not args.allow_fork:
         host = get_collab_hosts(omp_bin).get(sid)
@@ -1091,10 +1123,7 @@ def cmd_send(args: argparse.Namespace) -> None:
 
 def resolve_same_tab_agent_pane(my_pane: int, cwd: Path | None = None) -> int:
     status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
-    inspect_data = None
-    if not bound_panes_from_status(status, my_pane):
-        inspect_data = inspect_tern(find_tern_bin())
-    return select_wingman_pane_from_status(status, inspect_data, my_pane, cwd=cwd)
+    return select_wingman_pane_from_status(status, my_pane, cwd=cwd)
 
 
 def _resolve_explicit_or_bound_pane(args: argparse.Namespace, my_pane: int) -> int:
@@ -1289,7 +1318,7 @@ def cmd_retry(args: argparse.Namespace) -> None:
     use_async = args.delivery == "async"
     if args.delivery == "auto":
         status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
-        use_async = is_caller_acp_agent(status, inspect_tern(find_tern_bin()), my_pane)
+        use_async = is_caller_tern_agent(status, my_pane)
     req = {"op": "retry", "anchor_pane": my_pane, "target_pane": pane, "async_callback": use_async}
     try:
         reply = call_bridge(
@@ -1308,7 +1337,7 @@ def cmd_retry(args: argparse.Namespace) -> None:
         raise SystemExit(2 if st == "waiting_input" else 1)
     if reply.get("async_callback"):
         print(
-            f"[wingman] Sent native /retry to pane {pane} (async ACP callback armed). "
+            f"[wingman] Sent native /retry to pane {pane} (async callback armed). "
             "Do NOT poll or sleep; end your turn now and wait for the callback."
         )
         raise SystemExit(0)
@@ -1486,6 +1515,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--layout", choices=list(PLACEMENTS), help="Worker placement: split beside caller (new default), down stack, pip float, independent tab, or park hidden (existing workers keep their placement unless set)")
     p_send.add_argument("--pip", choices=list(PIP_CORNERS), help="Float worker as Picture-in-Picture in this corner (implies `--layout pip`; corner defaults to br with `--layout pip`)")
     p_send.add_argument("--mode", choices=["auto", "tui", "headless"], default="auto")
+    p_send.add_argument("--agent", default="omp", help="Worker agent id: `omp` (default) or any Tern ACP agent id (built-in `claude`/`codex`/`copilot` or a configured custom agent); non-omp agents launch via `tern acp <id>`")
     p_send.add_argument("--model", help="Optional model override")
     p_send.add_argument("--thinking", help="Optional thinking level")
     p_send.add_argument("--max-time", help="Optional max runtime (e.g. 30m, 1h)")
@@ -1493,8 +1523,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--allow-fork", action="store_true")
     p_send.add_argument("--no-queue", action="store_true", help="Fail immediately if target wingman pane is busy instead of queueing natively")
     deliv_grp = p_send.add_mutually_exclusive_group()
-    deliv_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately after TSP dispatch and deliver reply via `cx.agents:ask` callback (default for Tern ACP callers)")
-    deliv_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block synchronously until wingman turn finishes (default for shell/non-ACP callers)")
+    deliv_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately after TSP dispatch and deliver reply via `cx.agents:ask` callback (default when the caller is a Tern agent)")
+    deliv_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block synchronously until wingman turn finishes (default for shell callers)")
     cb_grp = p_send.add_mutually_exclusive_group()
     cb_grp.add_argument("--auto-callback", dest="auto_callback", action="store_true", default=None, help="Enable unsolicited worker->owner auto-callback (default: on)")
     cb_grp.add_argument("--no-auto-callback", dest="auto_callback", action="store_false", help="Disable unsolicited worker->owner auto-callback for this binding")
@@ -1568,7 +1598,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_pane_args(p_retry)
     p_retry.add_argument("--max-time", help="Optional max wait in --wait mode (e.g. 30m)")
     retry_grp = p_retry.add_mutually_exclusive_group()
-    retry_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately; result arrives via auto-callback (default for Tern ACP callers)")
+    retry_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately; result arrives via auto-callback (default when the caller is a Tern agent)")
     retry_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block until the retried turn finishes (default for shell callers)")
     p_retry.set_defaults(func=cmd_retry)
 

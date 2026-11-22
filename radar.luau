@@ -720,26 +720,46 @@ local function collect(cx: WindowCx, b: Bridge): ({ Row }, { [number]: Row })
 	if scope == "all" then
 		rows = all
 	else
-		-- The panel's tab (before it opens: the focused pane's, where it opens), plus every wingman of an in-tab owner
-		-- (parked or in another tab; the owner may be a plain terminal) and the owner of an in-tab wingman.
+		-- The panel's tab (before it opens: the focused pane's, where it opens) as seeds: its agents and the plain
+		-- terminals in it that own wingmen. Kept are every seed, all of its transitive wingmen (parked or in another
+		-- tab), and its whole ancestry path up to the root, so a chain A→B→C stays connected. Siblings hanging off an
+		-- out-of-tab ancestor are on no such path and stay out.
 		local anchor = panel_pane or focused
 		local tab = if anchor ~= nil then cx.session:tab_of(anchor) else nil
 		local keep: { [number]: boolean } = {}
 		if tab ~= nil then
-			for _, r in all do
-				if r.tab == tab then
-					keep[r.pane] = true
-					for _, id in r.workers do
-						keep[id] = true
-					end
-					if r.owner ~= nil then
-						keep[r.owner] = true
+			local function descend(id: number)
+				if keep[id] then
+					return
+				end
+				keep[id] = true
+				local workers = workers_of[id]
+				if workers then
+					for _, w in workers do
+						descend(w)
 					end
 				end
 			end
-			for worker, owner in owner_of do
-				if not keep[worker] and all_by[worker] ~= nil and owner_tab(owner) == tab then
-					keep[worker] = true
+			local seeds: { number } = {}
+			for _, r in all do
+				if r.tab == tab then
+					table.insert(seeds, r.pane)
+				end
+			end
+			for owner in workers_of do
+				if all_by[owner] == nil and cx.session:tab_of(owner) == tab then
+					table.insert(seeds, owner) -- a plain terminal owner
+				end
+			end
+			for _, id in seeds do
+				descend(id)
+				-- Ancestry: a legacy binding cycle (no longer creatable) is cut by the visited set.
+				local up: { [number]: boolean } = { [id] = true }
+				local o = owner_of[id]
+				while o ~= nil and not up[o] do
+					up[o] = true
+					keep[o] = true
+					o = owner_of[o]
 				end
 			end
 		end
@@ -1274,7 +1294,7 @@ local function topology(rows: { Row }, by_pane: { [number]: Row }, by_tool: { [n
 	end
 	for _, r in rows do
 		if not placed[r.pane] then
-			add(r) -- a binding cycle has no head
+			add(r) -- defensive, legacy only: a stored binding cycle has no head (native now rejects new ones)
 		end
 	end
 	if #rows == 0 then

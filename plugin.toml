@@ -1,6 +1,6 @@
 schema = 1
 id = "wingman"
 name = "Wingman"
-version = "0.5.0"
-description = "Native Tern TSP bridge for concurrent omp wingmen in splits, PiP, background tabs, or parked panes, with callbacks and a Live Panel."
+version = "0.6.0"
+description = "Native Tern TSP bridge for concurrent omp and ACP wingmen, with automatic callbacks, nested delegation, and a Live Panel."
 window = "window.luau"
