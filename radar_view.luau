@@ -230,6 +230,8 @@ export type Frame = {
 	hues: Hues,
 	scope: Scope,
 	placement: Placement,
+	panel_sx: number,
+	panel_sy: number,
 	mode: string, -- "rich" | "lite"
 	lite_until: number,
 	lite_reason: string,
@@ -265,10 +267,19 @@ type FileRow = {
 
 type Budget = { left: number }
 
-local LOOM = 24 -- blocks in an agent's activity strip
-local FEED_ROWS = 8 -- max rows of the activity feed
-local VIEWPORT_LINES = 24 -- target combined content lines for agents + living files + activity
 local HOT_MS = 30000 -- a file touched this recently glows
+
+local function loom_cap(f: Frame): number
+	return math.clamp(math.floor(f.panel_sx * 100), 14, 36)
+end
+
+local function viewport_lines(f: Frame): number
+	return math.clamp(math.floor(24 * f.panel_sy), 12, 28)
+end
+
+local function feed_cap(f: Frame): number
+	return math.clamp(math.floor(viewport_lines(f) / 3), 4, 10)
+end
 local SEARCH: { [string]: boolean } = { grep = true, find = true, glob = true, ast_grep = true, search = true, lsp = true,
 	grep_search = true, find_by_name = true, codebase_search = true }
 
@@ -320,17 +331,26 @@ local function basename(path: string): string
 	return string.match(path, "([^/\\]+)[/\\]*$") or path
 end
 
+local function norm_sep(p: string): string
+	return (string.gsub(p, "\\", "/"))
+end
+
 local function display_path(abs: string, roots: { string }, home: string?): string
+	local norm_abs = norm_sep(abs)
 	for _, root in roots do
-		if string.sub(abs, 1, #root + 1) == root .. "/" then
-			local rel = string.sub(abs, #root + 2)
-			return if #roots > 1 then basename(root) .. "/" .. rel else rel
+		local nr = norm_sep(root)
+		if string.sub(norm_abs, 1, #nr + 1) == nr .. "/" then
+			local rel = string.sub(norm_abs, #nr + 2)
+			return if #roots > 1 then basename(nr) .. "/" .. rel else rel
 		end
 	end
-	if home and string.sub(abs, 1, #home + 1) == home .. "/" then
-		return "~" .. string.sub(abs, #home + 1)
+	if home then
+		local nh = norm_sep(home)
+		if string.sub(norm_abs, 1, #nh + 1) == nh .. "/" then
+			return "~" .. string.sub(norm_abs, #nh + 1)
+		end
 	end
-	return abs
+	return norm_abs
 end
 
 local function count_nodes(n: Node): number
@@ -534,7 +554,8 @@ local function agent_parts(f: Frame, hue: (number) -> string, r: Row, ts: { Tool
 			txt("span", "wr-time", tool_dur(cur, now_ms)),
 		}, { actions = { click = "focus=" .. pane }, title = cur.target }))
 		local blocks: { Node } = {}
-		for i = math.max(1, #ts - LOOM + 1), #ts do
+		local max_blocks = loom_cap(f)
+		for i = math.max(1, #ts - max_blocks + 1), #ts do
 			local t = ts[i]
 			local a: { [string]: any } = { ["data-k"] = category(t) }
 			if running(t) then
@@ -790,7 +811,8 @@ local function living_files(f: Frame, budget_left: number): Section
 		end
 		return x.abs < y.abs
 	end)
-	-- Dynamic vertical line budget: expand when agents/activity are light, tighten when busy so all sections share the viewport.
+	-- Dynamic vertical line budget: derived from the panel's actual vertical share, active agents, and feed rows.
+	local max_feed = feed_cap(f)
 	local agent_lines = 0
 	for _, r in f.rows do
 		agent_lines += if r.state == "idle" and r.fault == nil and r.queued == 0 then 1 else 3
@@ -800,12 +822,13 @@ local function living_files(f: Frame, budget_left: number): Section
 		local t = f.tools[id]
 		if t and by_pane[t.pane] ~= nil then
 			feed_lines += 1
-			if feed_lines >= FEED_ROWS then
+			if feed_lines >= max_feed then
 				break
 			end
 		end
 	end
-	local file_line_cap = math.clamp(VIEWPORT_LINES - agent_lines - feed_lines, 6, 18)
+	local vp = viewport_lines(f)
+	local file_line_cap = math.clamp(vp - agent_lines - feed_lines, 6, math.max(8, vp - 6))
 	local has_changes = false
 	for _, row in list do
 		if row.code ~= nil or row.edits > 0 then
@@ -895,9 +918,10 @@ local function activity(f: Frame, budget_left: number): Section
 	table.sort(list, function(x: ToolRec, y: ToolRec): boolean
 		return if x.seen ~= y.seen then x.seen > y.seen else x.seq > y.seq
 	end)
+	local max_feed = feed_cap(f)
 	local kids: { Node } = {}
 	for _, t in list do
-		if #kids >= FEED_ROWS then
+		if #kids >= max_feed then
 			break
 		end
 		local a: { [string]: any }? = if running(t) then { ["data-run"] = true } elseif t.status == "lost" then { ["data-lost"] = true } else nil
@@ -924,7 +948,7 @@ local function activity(f: Frame, budget_left: number): Section
 	if #list == 0 then
 		table.insert(kids, txt("div", "wr-empty", "No tool calls yet."))
 	end
-	local node = el("div", "wr-sec", { section_head("Activity", if #list > 0 then "last " .. math.min(#list, FEED_ROWS) else nil), el("div", nil, kids) })
+	local node = el("div", "wr-sec", { section_head("Activity", if #list > 0 then "last " .. math.min(#list, max_feed) else nil), el("div", nil, kids) })
 	return { node = node, grants = grants }
 end
 

@@ -18,11 +18,12 @@
 local tsp = require("./tsp")
 local view = require("./radar_view")
 
--- The panel's placement: the right sidebar takes TAB_SHARE of its tab's width; a float takes FLOAT_SIZE (a value
--- above 1 is terminal cells, up to 1 a share of the pane it floats over).
-local TAB_SHARE = 0.24
+-- The panel's placement: right sidebar share adapts to the user's last dragged width (default 24% of tab),
+-- and floating size scales dynamically against the pane it floats over rather than fixed cell counts.
+local DEFAULT_SIDEBAR_SHARE = 0.24
+local SIDEBAR_MIN_SHARE, SIDEBAR_MAX_SHARE = 0.16, 0.40
 local RATIO_MIN, RATIO_MAX = 0.22, 0.45
-local FLOAT_SIZE = { 46, 0.85 }
+local sidebar_share = DEFAULT_SIDEBAR_SHARE
 
 export type Bridge = {
 	--- A copy of the wingman (worker) → owner map; an owner may have several wingmen.
@@ -739,6 +740,9 @@ local function kick_git(cx: WindowCx, rows: { Row }): { string }
 	return roots
 end
 
+local shares_of: (cx: WindowCx, pane: number) -> (number?, number?)
+local save_prefs: () -> ()
+
 -- Collects, samples, starts git reads and builds the view within `node_cap` nodes; `phases` gets each step's
 -- "wall/native" ms.
 local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }): (Node, Node, number, number)
@@ -774,6 +778,18 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 			placement = if info.floating then "float" else "right"
 		end
 	end
+	local panel_sx, panel_sy = sidebar_share, 0.85
+	if self_pane ~= nil and placement == "right" then
+		local sx, sy = shares_of(cx, self_pane)
+		if sx ~= nil and sy ~= nil then
+			panel_sx, panel_sy = sx, sy
+			local clamped = math.clamp(sx, SIDEBAR_MIN_SHARE, SIDEBAR_MAX_SHARE)
+			if math.abs(clamped - sidebar_share) >= 0.02 then
+				sidebar_share = clamped
+				save_prefs()
+			end
+		end
+	end
 	local now_ms = tern.now()
 	local function build(cap: number): (Node, Node, number)
 		local avail = cap - 60 -- stage, section heads and dock
@@ -790,6 +806,8 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 			hues = { of = hue_of, next = next_hue },
 			scope = scope,
 			placement = placement,
+			panel_sx = panel_sx,
+			panel_sy = panel_sy,
 			mode = mode,
 			lite_until = lite_until,
 			lite_reason = lite_reason,
@@ -1013,9 +1031,14 @@ local function adopt(cx: WindowCx)
 	end
 end
 
-local function save_prefs()
+save_prefs = function()
 	pcall(function()
-		tern.kv.set(KV_RADAR, { scope = scope, placement = placement, corner = corner })
+		tern.kv.set(KV_RADAR, {
+			scope = scope,
+			placement = placement,
+			corner = corner,
+			sidebar_share = sidebar_share,
+		})
 	end)
 end
 
@@ -1053,50 +1076,63 @@ local function rightmost(node: TabTree, share: number, skip: number?): (number?,
 end
 
 -- Where the sidebar goes in the focused pane's tab: beside its rightmost leaf, at the split share that makes it
--- TAB_SHARE of the tab's width (kept within RATIO_MIN..RATIO_MAX of the leaf it splits).
+-- `sidebar_share` of the tab's width (kept within RATIO_MIN..RATIO_MAX of the leaf it splits).
 local function right_edge(cx: WindowCx, skip: number?): (number?, number)
 	local focused = cx.session:focused()
 	local tab = if focused ~= nil then cx.session:tab_of(focused) else nil
 	local layout = if tab ~= nil then cx.session:layout(tab) else nil
 	if layout == nil then
-		return nil, TAB_SHARE
+		return nil, sidebar_share
 	end
 	local pane, share = rightmost(layout.root, 1, skip)
-	return pane, math.clamp(TAB_SHARE / math.max(share, 0.01), RATIO_MIN, RATIO_MAX)
+	return pane, math.clamp(sidebar_share / math.max(share, 0.01), RATIO_MIN, RATIO_MAX)
 end
 
-local function float_panel(cx: WindowCx, pane: number): (boolean, string?)
-	local over = right_edge(cx, pane)
-	return cx.layout:float(pane, over, corner, { focus = false, size = FLOAT_SIZE })
-end
-
--- `pane`'s share of its tab's width, or nil when it isn't tiled there.
-local function share_of(cx: WindowCx, pane: number): number?
+-- `pane`'s horizontal and vertical shares of its tab, or nil when it isn't tiled there.
+shares_of = function(cx: WindowCx, pane: number): (number?, number?)
 	local tab = cx.session:tab_of(pane)
 	local layout = if tab ~= nil then cx.session:layout(tab) else nil
 	if layout == nil then
-		return nil
+		return nil, nil
 	end
-	local function walk(node: TabTree, share: number): number?
+	local function walk(node: TabTree, sx: number, sy: number): (number?, number?)
 		if node.pane ~= nil then
-			return if node.pane == pane then share else nil
+			if node.pane == pane then
+				return sx, sy
+			end
+			return nil, nil
 		end
 		local ratio = node.ratio or 0.5
 		local horizontal = node.split == "right"
 		local first, second = node[1], node[2]
-		local found: number? = nil
 		if first ~= nil then
-			found = walk(first, if horizontal then share * ratio else share)
+			local x1, y1 = walk(first, if horizontal then sx * ratio else sx, if horizontal then sy else sy * ratio)
+			if x1 ~= nil then
+				return x1, y1
+			end
 		end
-		if found == nil and second ~= nil then
-			found = walk(second, if horizontal then share * (1 - ratio) else share)
+		if second ~= nil then
+			return walk(second, if horizontal then sx * (1 - ratio) else sx, if horizontal then sy else sy * (1 - ratio))
 		end
-		return found
+		return nil, nil
 	end
-	return walk(layout.root, 1)
+	return walk(layout.root, 1, 1)
 end
 
--- A sidebar split from a narrow rightmost pane gets less than TAB_SHARE. Tern reports no widths in cells, so take
+local function share_of(cx: WindowCx, pane: number): number?
+	local sx = shares_of(cx, pane)
+	return sx
+end
+
+local function float_panel(cx: WindowCx, pane: number): (boolean, string?)
+	local over = right_edge(cx, pane)
+	local sx, sy = if over ~= nil then shares_of(cx, over) else 1, 1
+	local w = math.clamp(sidebar_share / math.max(sx or 1, 0.25), 0.24, 0.62)
+	local h = math.clamp(0.85 / math.max(sy or 1, 0.5), 0.65, 0.92)
+	return cx.layout:float(pane, over, corner, { focus = false, size = { w, h } })
+end
+
+-- A sidebar split from a narrow rightmost pane gets less than `sidebar_share`. Tern reports no widths in cells, so take
 -- the rest from the group on the left of the panel's group: probe-shrink that group's rightmost leaf (its edge is
 -- the divider), read how far that moved the panel's share, and shrink it by the cells the rest needs.
 local WIDEN_PROBE = 4
@@ -1104,7 +1140,7 @@ local function widen(cx: WindowCx, pane: number)
 	local before = share_of(cx, pane)
 	local tab = cx.session:tab_of(pane)
 	local layout = if tab ~= nil then cx.session:layout(tab) else nil
-	if before == nil or layout == nil or before >= TAB_SHARE * 0.95 then
+	if before == nil or layout == nil or before >= sidebar_share * 0.95 then
 		return
 	end
 	-- The path to the panel; the last step is its own split (the leaf it was opened beside, then the panel).
@@ -1143,7 +1179,7 @@ local function widen(cx: WindowCx, pane: number)
 	if after == nil or after <= before then
 		return
 	end
-	local cells = math.floor((TAB_SHARE - after) / ((after - before) / WIDEN_PROBE) + 0.5)
+	local cells = math.floor((sidebar_share - after) / ((after - before) / WIDEN_PROBE) + 0.5)
 	if cells > 0 then
 		cx.layout:resize(left, "right", -cells)
 	end
@@ -1382,6 +1418,9 @@ function M.attach(b: Bridge)
 		end
 		if saved.corner == "tl" or saved.corner == "tr" or saved.corner == "bl" or saved.corner == "br" then
 			corner = saved.corner
+		end
+		if type(saved.sidebar_share) == "number" then
+			sidebar_share = math.clamp(saved.sidebar_share, SIDEBAR_MIN_SHARE, SIDEBAR_MAX_SHARE)
 		end
 	end
 
