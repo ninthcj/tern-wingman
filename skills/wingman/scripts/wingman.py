@@ -685,7 +685,7 @@ def select_wingman_pane_from_status(
 
     raise SystemExit(
         "error: no wingman pane is bound to this pane or open in this tab "
-        "(pass an explicit `<pane>` id from `wingman.py info` to target another pane)"
+        "(pass an explicit `<pane>` id from `wingman info` to target another pane)"
     )
 
 
@@ -719,7 +719,7 @@ def select_owner_pane_from_status(
 
     raise SystemExit(
         "error: no supervisor/owner pane is bound to this pane "
-        "(pass `--pane <id>` from `wingman.py info` to specify the target owner pane)"
+        "(pass `--pane <id>` from `wingman info` to specify the target owner pane)"
     )
 
 

@@ -386,6 +386,24 @@ local function flush_queued_callbacks(cx: WindowCx, owner_pane: number): boolean
 	return false
 end
 
+local CALLBACK_BODY_MAX_BYTES = 3600
+
+local function clip_utf8_bytes(s: string, max_bytes: number): string
+	if #s <= max_bytes then
+		return s
+	end
+	local cut = max_bytes
+	-- Walk back past any UTF-8 continuation bytes (0x80..0xBF) so we never split a multi-byte character.
+	while cut > 0 do
+		local b = string.byte(s, cut + 1)
+		if b == nil or b < 0x80 or b >= 0xC0 then
+			break
+		end
+		cut -= 1
+	end
+	return string.sub(s, 1, cut)
+end
+
 local function deliver_to_owner(
 	cx: WindowCx,
 	owner_pane: number,
@@ -393,7 +411,16 @@ local function deliver_to_owner(
 	tag: string,
 	body: string
 ): (boolean, boolean, number)
-	local formatted = string.format("[Wingman %s · pane %d]\n%s", tag, worker_pane, body)
+	local delivered_body = body
+	if #delivered_body > CALLBACK_BODY_MAX_BYTES then
+		delivered_body = clip_utf8_bytes(delivered_body, CALLBACK_BODY_MAX_BYTES)
+			.. string.format(
+				"\n\n… (truncated from %d bytes; run `wingman transcript --pane %d --last 2` for full output)",
+				#body,
+				worker_pane
+			)
+	end
+	local formatted = string.format("[Wingman %s · pane %d]\n%s", tag, worker_pane, delivered_body)
 	local existing_q = queued_callbacks[owner_pane]
 	local ainfo = find_agent_info(cx, owner_pane)
 	if ainfo ~= nil and ainfo.state == "idle" and (existing_q == nil or #existing_q == 0) then
@@ -538,6 +565,14 @@ local function build_waiting_summary(cx: WindowCx, pane_id: number): (string, st
 	if ok_tree and type(tree) == "table" then
 		root_id, role = find_interactive_root(tree)
 		local target_node = if root_id ~= nil then find_node_by_id(tree, root_id) else nil
+		if target_node == nil and type(tree.layer) == "table" then
+			-- Generic fallback for non-omp ACP approval/dialog overlays rendered in the TSP `layer` region.
+			target_node = tree.layer
+			root_id = if target_node.id ~= nil then tostring(target_node.id) else "layer"
+			role = if type(target_node.p) == "table" and type(target_node.p.role) == "string"
+				then target_node.p.role
+				else "layer"
+		end
 		if target_node ~= nil then
 			local lines: { string } = {}
 			format_tsp_subtree(target_node, "", lines, 0)
@@ -687,7 +722,7 @@ local function deliver_fault_if_needed(cx: WindowCx, worker_pane: number, fallba
 	notified_waiting[worker_pane] = key :: string
 	save_waiting()
 	local body = tostring(summary)
-		.. "\n\nRecover: run `wingman.py retry --pane " .. worker_pane .. "` (sends native `/retry`, equivalent to F5) for transient stream/network/edit-preview glitches (up to 2-3 retries), or consult the user if it is a persistent quota/auth/config error."
+		.. "\n\nRecover: run `wingman retry --pane " .. worker_pane .. "` (sends native `/retry`, equivalent to F5) for transient stream/network/edit-preview glitches (up to 2-3 retries), or consult the user if it is a persistent quota/auth/config error."
 	deliver_to_owner(cx, owner, worker_pane, "fault · retryable", body)
 	return true
 end
@@ -1805,7 +1840,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				ok = false,
 				status = "waiting_input",
 				pane = target_pane,
-				error = "target wingman pane is waiting_input; inspect via `wingman.py surface` and answer/cancel via `wingman.py event` instead of `send`",
+				error = "target wingman pane is waiting_input; inspect via `wingman surface` and answer/cancel via `wingman event` instead of `send`",
 			}, false)
 			return
 		end
