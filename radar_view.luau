@@ -266,9 +266,8 @@ type FileRow = {
 type Budget = { left: number }
 
 local LOOM = 24 -- blocks in an agent's activity strip
-local FEED_ROWS = 8 -- rows of the activity feed
-local READ_ROWS = 5
-local FILE_LINES = 2 * READ_ROWS -- a file in a new directory takes two lines
+local FEED_ROWS = 8 -- max rows of the activity feed
+local VIEWPORT_LINES = 24 -- target combined content lines for agents + living files + activity
 local HOT_MS = 30000 -- a file touched this recently glows
 local SEARCH: { [string]: boolean } = { grep = true, find = true, glob = true, ast_grep = true, search = true, lsp = true,
 	grep_search = true, find_by_name = true, codebase_search = true }
@@ -791,6 +790,31 @@ local function living_files(f: Frame, budget_left: number): Section
 		end
 		return x.abs < y.abs
 	end)
+	-- Dynamic vertical line budget: expand when agents/activity are light, tighten when busy so all sections share the viewport.
+	local agent_lines = 0
+	for _, r in f.rows do
+		agent_lines += if r.state == "idle" and r.fault == nil and r.queued == 0 then 1 else 3
+	end
+	local feed_lines = 0
+	for _, id in f.tool_ids do
+		local t = f.tools[id]
+		if t and by_pane[t.pane] ~= nil then
+			feed_lines += 1
+			if feed_lines >= FEED_ROWS then
+				break
+			end
+		end
+	end
+	local file_line_cap = math.clamp(VIEWPORT_LINES - agent_lines - feed_lines, 6, 18)
+	local has_changes = false
+	for _, row in list do
+		if row.code ~= nil or row.edits > 0 then
+			has_changes = true
+			break
+		end
+	end
+	local read_cap = if has_changes then math.max(2, math.floor(file_line_cap * 0.5)) else file_line_cap
+
 	type Shown = { dir: string, name: string, node: Node }
 	local shown: { Shown } = {}
 	local hidden = 0
@@ -798,7 +822,7 @@ local function living_files(f: Frame, budget_left: number): Section
 	local reads, lines = 0, 0
 	for _, row in list do
 		local read_only = row.code == nil and row.edits == 0
-		if (read_only and reads >= READ_ROWS) or lines >= FILE_LINES then
+		if (read_only and reads >= read_cap) or lines >= file_line_cap then
 			hidden += 1
 			continue
 		end
@@ -806,7 +830,7 @@ local function living_files(f: Frame, budget_left: number): Section
 		local parent, basename = string.match(path, "^(.*[/\\])([^/\\]+)$")
 		local dir, name = parent or "", basename or path
 		local cost = if dir == "" or dirs[dir] then 1 else 2
-		if lines + cost > FILE_LINES then
+		if lines + cost > file_line_cap then
 			hidden += 1
 			continue
 		end

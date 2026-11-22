@@ -812,11 +812,67 @@ local function down_target(cx: WindowCx, anchor: number, moving: number?): numbe
 	return worker or anchor
 end
 
--- Readable glance size for floating wingman panes (share of the owner frame; Tern clamps to bounds).
-local WORKER_PIP_SIZE = { 0.44, 0.46 }
+-- Dynamic PiP placement & size: scale to the owner's actual share of the tab and avoid overlapping sibling floats.
+local PIP_CORNER_ORDER: { Corner } = { "br", "tr", "bl", "tl" }
 
-local function float_worker(cx: WindowCx, pane: number, over: number?, corner: Corner?): (boolean, string?)
-	return cx.layout:float(pane, over, corner or "br", { focus = false, size = WORKER_PIP_SIZE })
+local function pane_shares(cx: WindowCx, pane: number): (number, number)
+	local tab = cx.session:tab_of(pane)
+	local layout = if tab then cx.session:layout(tab) else nil
+	if not layout then
+		return 1, 1
+	end
+	local function walk(node: TabTree?, sx: number, sy: number): (number?, number?)
+		if not node then
+			return nil, nil
+		end
+		if node.pane then
+			if node.pane == pane then
+				return sx, sy
+			end
+			return nil, nil
+		end
+		local r = node.ratio or 0.5
+		local horiz = node.split == "right"
+		local x1, y1 = walk(node[1], if horiz then sx * r else sx, if horiz then sy else sy * r)
+		if x1 ~= nil then
+			return x1, y1
+		end
+		return walk(node[2], if horiz then sx * (1 - r) else sx, if horiz then sy else sy * (1 - r))
+	end
+	local sx, sy = walk(layout.root, 1, 1)
+	return sx or 1, sy or 1
+end
+
+local function float_worker(cx: WindowCx, pane: number, over: number?, requested: Corner?): (boolean, string?)
+	local sx, sy = if over ~= nil then pane_shares(cx, over) else 1, 1
+	local used: { [string]: boolean } = {}
+	local peers = 0
+	if over ~= nil then
+		local tab = cx.session:tab_of(over)
+		local layout = if tab then cx.session:layout(tab) else nil
+		if layout and layout.floats then
+			for _, fl in layout.floats do
+				if fl.over == over and fl.pane ~= pane then
+					peers += 1
+					used[fl.corner] = true
+				end
+			end
+		end
+	end
+	local chosen: Corner = requested or "br"
+	if requested == nil then
+		for _, c in PIP_CORNER_ORDER do
+			if not used[c] then
+				chosen = c
+				break
+			end
+		end
+	end
+	-- Target ~36% of the full tab width so PiP stays readable over narrow splits; shrink height when sibling floats share `over`.
+	local w = math.clamp(0.36 / math.max(sx, 0.25), 0.34, 0.68)
+	local base_h = if peers >= 1 then 0.38 else 0.46
+	local h = math.clamp(base_h / math.max(sy, 0.4), 0.34, 0.56)
+	return cx.layout:float(pane, over, chosen, { focus = false, size = { w, h } })
 end
 
 -- Choose a tiled slot beside `anchor` without crushing `anchor`: stack `"down"` under an existing
@@ -1642,7 +1698,7 @@ if radar_loaded then
 				return string.match(rest, "^[^:]*:(.+)$") or rest
 			end,
 			pip = function(cx: WindowCx, pane: number): (boolean, string?)
-				return float_worker(cx, pane, state.owner_of_pane(cx, pane), "br")
+				return float_worker(cx, pane, state.owner_of_pane(cx, pane), nil)
 			end,
 			dock = function(cx: WindowCx, pane: number): (boolean, string?)
 				return dock_worker(cx, pane, state.owner_of_pane(cx, pane), nil)
