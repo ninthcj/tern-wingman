@@ -3,6 +3,7 @@
 
 local tsp = require("./tsp")
 local ownership = require("./state")
+local Queue = require("./queue")
 
 local is_windows = (tern.runtime.os == "windows")
 local SEP = if is_windows then "\\" else "/"
@@ -52,16 +53,10 @@ type WaitEntry = {
 	idle_since: number?,
 }
 
-type QueuedDispatch = {
-	cid: number?,
-	anchor: number,
-	prompt: string,
-}
-
--- Active in-flight turn waits keyed by wingman pane_id
 local pending_waits: { [number]: WaitEntry } = {}
--- Native per-pane FIFO dispatch queue when target_pane is busy (`working`)
-local queued_dispatches: { [number]: { QueuedDispatch } } = {}
+local dispatches = Queue.new(tern.now)
+local dispatch_ids_loaded = false
+local dispatch_inflight: { [number]: number } = {}
 -- Native per-owner FIFO callback queue when owner_pane is busy (`working` / `waiting_input`)
 local queued_callbacks: { [number]: { string } } = {}
 -- Tracks whether a wingman pane is executing an unsolicited turn (no active `pending_waits` waiter)
@@ -74,6 +69,29 @@ local manual_interrupt: { [number]: boolean } = {}
 local mux_child: Child? = nil
 local unloading = false
 local watchdog_armed = false
+
+local WATCHDOG_MS = 500
+local DISPATCH_GRACE_MS = 2 * WATCHDOG_MS
+
+local function load_dispatch_ids(cx: WindowCx)
+	if dispatch_ids_loaded then
+		return
+	end
+	-- Prompts are transient, but a reloaded window must never reuse a previously issued ID.
+	local key = "queue_id_v1:" .. cx:window_key()
+	local last = tern.kv.get(key)
+	if last ~= nil and (type(last) ~= "number" or last < 0 or last % 1 ~= 0) then
+		error("invalid saved Wingman queue ID")
+	end
+	dispatches = Queue.new(tern.now, last, function(id: number): (boolean, string?)
+		local ok, err = pcall(function(): any
+			tern.kv.set(key, id)
+			return nil
+		end)
+		return ok, if ok then nil else "could not reserve queue ID: " .. tostring(err)
+	end)
+	dispatch_ids_loaded = true
+end
 
 local function same_daemon(req_socket: any): boolean
 	if req_socket == nil or req_socket == tern.json.null or req_socket == "" then
@@ -136,8 +154,26 @@ end
 
 local ensure_watchdog: () -> ()
 
+local function has_pending_dispatch(pane: number): boolean
+	local deadline = dispatch_inflight[pane]
+	return pending_waits[pane] ~= nil or (deadline ~= nil and tern.now() < deadline)
+end
+
+local function ask_worker(cx: WindowCx, pane: number, prompt: string): (boolean, any)
+	dispatch_inflight[pane] = tern.now() + DISPATCH_GRACE_MS
+	local ok, err = pcall(function(): any
+		cx.agents:ask(pane, prompt)
+		return nil
+	end)
+	if not ok then
+		dispatch_inflight[pane] = nil
+	end
+	ensure_watchdog()
+	return ok, err
+end
+
 local function has_active_timers(): boolean
-	return next(pending_waits) ~= nil or next(queued_dispatches) ~= nil or next(queued_callbacks) ~= nil
+	return next(pending_waits) ~= nil or dispatches.has_any() or next(queued_callbacks) ~= nil or next(dispatch_inflight) ~= nil
 end
 
 local function flush_queued_callbacks(cx: WindowCx, owner_pane: number): boolean
@@ -151,13 +187,11 @@ local function flush_queued_callbacks(cx: WindowCx, owner_pane: number): boolean
 		return false
 	end
 	local ainfo = find_agent_info(cx, owner_pane)
-	if not ainfo or ainfo.state ~= "idle" then
+	if not ainfo or ainfo.state ~= "idle" or has_pending_dispatch(owner_pane) then
 		return false
 	end
 	local combined = table.concat(q, "\n\n---\n\n")
-	local ok_ask = pcall(function()
-		cx.agents:ask(owner_pane, combined)
-	end)
+	local ok_ask = ask_worker(cx, owner_pane, combined)
 	if ok_ask then
 		queued_callbacks[owner_pane] = nil
 		return true
@@ -186,10 +220,9 @@ local function deliver_to_owner(
 	local formatted = string.format("[Wingman %s · pane %d]\n%s", tag, worker_pane, delivered_body)
 	local existing_q = queued_callbacks[owner_pane]
 	local ainfo = find_agent_info(cx, owner_pane)
-	if ainfo ~= nil and ainfo.state == "idle" and (existing_q == nil or #existing_q == 0) then
-		local ok_ask = pcall(function()
-			cx.agents:ask(owner_pane, formatted)
-		end)
+	if ainfo ~= nil and ainfo.state == "idle" and not has_pending_dispatch(owner_pane)
+		and dispatches.count(owner_pane) == 0 and (existing_q == nil or #existing_q == 0) then
+		local ok_ask = ask_worker(cx, owner_pane, formatted)
 		if ok_ask then
 			return true, false, 0
 		end
@@ -243,49 +276,49 @@ local function deliver_fault_if_needed(cx: WindowCx, worker_pane: number, fallba
 	return true
 end
 
-local function promote_next_queued(cx: WindowCx, pane_id: number)
-	local q = queued_dispatches[pane_id]
-	if not q or #q == 0 then
-		queued_dispatches[pane_id] = nil
-		return
-	end
-	local item = table.remove(q, 1) :: QueuedDispatch
-	if #q == 0 then
-		queued_dispatches[pane_id] = nil
-	end
-
-	local ok_ask, err_ask = pcall(function()
-		cx.agents:ask(pane_id, item.prompt)
-	end)
-	if not ok_ask then
+local function reply_to_queued(items: { Queue.Item }, status: string, reason: string, last_message: string?, transcript: any?)
+	for _, item in items do
 		if item.cid ~= nil then
 			send_mux(item.cid, {
 				ok = false,
-				pane = pane_id,
-				status = "failed",
-				error = "queued cx.agents:ask failed: " .. tostring(err_ask),
-				last_message = "",
-				transcript = tern.json.array(),
+				pane = item.pane,
+				queue_id = item.id,
+				status = status,
+				error = reason,
+				last_message = last_message or "",
+				transcript = transcript or tern.json.array(),
 			}, false)
-		else
-			deliver_to_owner(cx, item.anchor, pane_id, "auto-callback · failed", "queued cx.agents:ask failed: " .. tostring(err_ask))
 		end
-		promote_next_queued(cx, pane_id)
-		return
 	end
+end
 
-	reported_in_turn[pane_id] = false
-	if item.cid ~= nil then
-		unsolicited_working[pane_id] = false
-		pending_waits[pane_id] = {
-			cids = { item.cid },
-			started_ms = tern.now(),
-			saw_working = false,
-			idle_since = nil,
-		}
-		ensure_watchdog()
-	else
-		unsolicited_working[pane_id] = true
+local function promote_next_queued(cx: WindowCx, pane_id: number): number?
+	while true do
+		local item = dispatches.pop_next(pane_id)
+		if not item then
+			return nil
+		end
+		local ok, err = ask_worker(cx, pane_id, item.prompt)
+		if ok then
+			reported_in_turn[pane_id] = false
+			unsolicited_working[pane_id] = item.cid == nil
+			if item.cid ~= nil then
+				pending_waits[pane_id] = {
+					cids = { item.cid },
+					started_ms = tern.now(),
+					saw_working = false,
+					idle_since = nil,
+				}
+				ensure_watchdog()
+			end
+			return item.id
+		end
+		local reason = "queued cx.agents:ask failed: " .. tostring(err)
+		if item.cid ~= nil then
+			reply_to_queued({ item }, "failed", reason)
+		else
+			deliver_to_owner(cx, item.anchor, pane_id, "auto-callback · failed", reason)
+		end
 	end
 end
 
@@ -322,22 +355,7 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 	if status == "done" or status == "idle" then
 		promote_next_queued(cx, pane_id)
 	else
-		local q = queued_dispatches[pane_id]
-		if q then
-			queued_dispatches[pane_id] = nil
-			for _, item in ipairs(q) do
-				if item.cid ~= nil then
-					send_mux(item.cid, {
-						ok = false,
-						pane = pane_id,
-						status = status,
-						error = err_msg or ("queued dispatch aborted: " .. status),
-						last_message = last_msg or "",
-						transcript = transcript,
-					}, false)
-				end
-			end
-		end
+		reply_to_queued(dispatches.clear_pane(pane_id), status, err_msg or ("queued dispatch aborted: " .. status), last_msg, transcript)
 	end
 end
 
@@ -366,19 +384,7 @@ local function drop_disconnected_cid(cid: number, cx: WindowCx?)
 			w.cids = kept
 		end
 	end
-	for pane_id, q in pairs(queued_dispatches) do
-		local kept: { QueuedDispatch } = {}
-		for _, item in ipairs(q) do
-			if item.cid ~= cid then
-				table.insert(kept, item)
-			end
-		end
-		if #kept == 0 then
-			queued_dispatches[pane_id] = nil
-		else
-			queued_dispatches[pane_id] = kept
-		end
-	end
+	dispatches.drop_cid(cid)
 end
 
 local function watchdog_step(cx: WindowCx?)
@@ -388,6 +394,11 @@ local function watchdog_step(cx: WindowCx?)
 	end
 	if cx then
 		local now = tern.now()
+		for pane, deadline in dispatch_inflight do
+			if now >= deadline then
+				dispatch_inflight[pane] = nil
+			end
+		end
 		for pane_id, w in pairs(pending_waits) do
 			local ainfo = find_agent_info(cx, pane_id)
 			if not ainfo then
@@ -416,26 +427,13 @@ local function watchdog_step(cx: WindowCx?)
 		end
 
 		-- Promote queued dispatches for panes whose active turn wasn't started via `pending_waits`
-		for pane_id, _ in pairs(queued_dispatches) do
-			if pending_waits[pane_id] == nil then
+		for _, pane_id in dispatches.panes() do
+			if not has_pending_dispatch(pane_id) then
 				local ainfo = find_agent_info(cx, pane_id)
 				if not ainfo and cx.session:pane(pane_id) == nil then
-					local q = queued_dispatches[pane_id]
-					queued_dispatches[pane_id] = nil
-					if q then
-						for _, item in ipairs(q) do
-							if item.cid ~= nil then
-								send_mux(item.cid, {
-									ok = false,
-									pane = pane_id,
-									status = "closed",
-									error = "Agent pane disappeared",
-									last_message = "",
-									transcript = tern.json.array(),
-								}, false)
-							end
-						end
-					end
+					reply_to_queued(dispatches.clear_pane(pane_id), "closed", "Agent pane disappeared")
+				elseif ainfo and ainfo.state == "exited" then
+					reply_to_queued(dispatches.clear_pane(pane_id), "exited", "Agent process exited")
 				elseif ainfo and ainfo.state == "idle" then
 					promote_next_queued(cx, pane_id)
 				end
@@ -444,14 +442,14 @@ local function watchdog_step(cx: WindowCx?)
 
 		-- Flush queued owner callbacks once the owner pane becomes idle
 		for owner_pane, _ in pairs(queued_callbacks) do
-			if pending_waits[owner_pane] == nil and queued_dispatches[owner_pane] == nil then
+			if pending_waits[owner_pane] == nil and dispatches.count(owner_pane) == 0 then
 				flush_queued_callbacks(cx, owner_pane)
 			end
 		end
 	end
 	if has_active_timers() and not watchdog_armed then
 		watchdog_armed = true
-		tern.timer(500, watchdog_step)
+		tern.timer(WATCHDOG_MS, watchdog_step)
 	end
 	notify_radar()
 end
@@ -459,14 +457,14 @@ end
 ensure_watchdog = function()
 	if not watchdog_armed and has_active_timers() then
 		watchdog_armed = true
-		tern.timer(500, watchdog_step)
+		tern.timer(WATCHDOG_MS, watchdog_step)
 	end
 end
 
 local function seed_inflight_unsolicited_turns(cx: WindowCx)
 	state.prune_notifications(cx)
 	for _, a in ipairs(cx.agents:list()) do
-		if a.state == "working" and pending_waits[a.pane] == nil and queued_dispatches[a.pane] == nil then
+		if a.state == "working" and pending_waits[a.pane] == nil and dispatches.count(a.pane) == 0 then
 			if state.owner_of_pane(cx, a.pane) ~= nil then
 				unsolicited_working[a.pane] = true
 			end
@@ -502,6 +500,9 @@ local function settle_stalled_fault(cx: WindowCx, pane: number)
 end
 
 tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
+	if ev.new ~= "idle" then
+		dispatch_inflight[ev.pane] = nil
+	end
 	if ev.new == "working" then
 		manual_interrupt[ev.pane] = nil
 		state.clear_waiting(ev.pane)
@@ -528,7 +529,7 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 		end
 	elseif ev.old == "waiting_input" and ev.new == "working" and state.owner_of_pane(cx, ev.pane) ~= nil then
 		unsolicited_working[ev.pane] = true
-	elseif ev.new == "working" and ev.old ~= "working" and queued_dispatches[ev.pane] == nil then
+	elseif ev.new == "working" and ev.old ~= "working" and dispatches.count(ev.pane) == 0 then
 		if state.owner_of_pane(cx, ev.pane) ~= nil then
 			unsolicited_working[ev.pane] = true
 			reported_in_turn[ev.pane] = false
@@ -536,17 +537,18 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 	elseif ev.old == "working" and ev.new == "idle" and state.owner_of_pane(cx, ev.pane) ~= nil then
 		settle_stalled_fault(cx, ev.pane)
 	end
-	if ev.new == "idle" and queued_callbacks[ev.pane] ~= nil and queued_dispatches[ev.pane] == nil then
+	if ev.new == "idle" and queued_callbacks[ev.pane] ~= nil and dispatches.count(ev.pane) == 0 then
 		flush_queued_callbacks(cx, ev.pane)
 	end
 end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
+	dispatch_inflight[ev.pane] = nil
 	if ev.result == "done" then
 		state.clear_waiting(ev.pane)
 	end
 	-- 1. If this pane is an owner with pending wingman callbacks, flush them as soon as its turn finishes cleanly
-	if queued_callbacks[ev.pane] ~= nil and ev.result == "done" and queued_dispatches[ev.pane] == nil then
+	if queued_callbacks[ev.pane] ~= nil and ev.result == "done" and dispatches.count(ev.pane) == 0 then
 		flush_queued_callbacks(cx, ev.pane)
 	end
 
@@ -578,7 +580,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		local already_reported = reported_in_turn[ev.pane] == true
 		reported_in_turn[ev.pane] = false
 		local owner = state.owner_of_pane(cx, ev.pane)
-		local has_next_q = queued_dispatches[ev.pane] ~= nil and #queued_dispatches[ev.pane] > 0 and ev.result == "done"
+		local has_next_q = dispatches.count(ev.pane) > 0 and ev.result == "done"
 		if
 			owner ~= nil
 			and not already_reported
@@ -596,27 +598,12 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		end
 	end
 
-	-- 4. Queued `send` dispatches promote in FIFO order
-	if queued_dispatches[ev.pane] then
+	-- 4. Queued `send` dispatches promote from the head
+	if dispatches.count(ev.pane) > 0 then
 		if ev.result == "done" then
 			promote_next_queued(cx, ev.pane)
 		else
-			local q = queued_dispatches[ev.pane]
-			queued_dispatches[ev.pane] = nil
-			if q then
-				for _, item in ipairs(q) do
-					if item.cid ~= nil then
-						send_mux(item.cid, {
-							ok = false,
-							pane = ev.pane,
-							status = ev.result,
-							error = "Previous turn ended with " .. ev.result,
-							last_message = "",
-							transcript = tern.json.array(),
-						}, false)
-					end
-				end
-			end
+			reply_to_queued(dispatches.clear_pane(ev.pane), ev.result, "Previous turn ended with " .. ev.result)
 		end
 		return
 	end
@@ -628,7 +615,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 			if not later_cx then
 				return
 			end
-			if pending_waits[finished_pane] == nil and queued_dispatches[finished_pane] == nil then
+			if pending_waits[finished_pane] == nil and dispatches.count(finished_pane) == 0 then
 				local ainfo = find_agent_info(later_cx, finished_pane)
 				if ainfo and ainfo.state == "working" and state.owner_of_pane(later_cx, finished_pane) ~= nil then
 					unsolicited_working[finished_pane] = true
@@ -639,6 +626,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
+	dispatch_inflight[ev.pane] = nil
 	state.unbind_pane(ev.pane)
 	state.clear_waiting(ev.pane)
 	unsolicited_working[ev.pane] = nil
@@ -647,23 +635,8 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	manual_interrupt[ev.pane] = nil
 	if pending_waits[ev.pane] then
 		finish_wait(cx, ev.pane, "closed", "Agent pane was closed")
-	elseif queued_dispatches[ev.pane] then
-		local q = queued_dispatches[ev.pane]
-		queued_dispatches[ev.pane] = nil
-		if q then
-			for _, item in ipairs(q) do
-				if item.cid ~= nil then
-					send_mux(item.cid, {
-						ok = false,
-						pane = ev.pane,
-						status = "closed",
-						error = "Agent pane was closed",
-						last_message = "",
-						transcript = tern.json.array(),
-					}, false)
-				end
-			end
-		end
+	else
+		reply_to_queued(dispatches.clear_pane(ev.pane), "closed", "Agent pane was closed")
 	end
 end)
 
@@ -719,40 +692,18 @@ local function interrupt_pane(cx: WindowCx, tp: number): (boolean, string?)
 	return ok_i, if not ok_i then tostring(err_i) else nil
 end
 
--- Cancels one queued prompt (1-based `position`) or all of them, failing every cancelled caller's wait.
-local function cancel_queued(tp: number, position: number?): (number, string?)
-	local q = queued_dispatches[tp]
-	if not q or #q == 0 then
-		return 0, nil
-	end
-	local function cancel(item: QueuedDispatch)
-		if item.cid ~= nil then
-			send_mux(item.cid, {
-				ok = false,
-				pane = tp,
-				status = "cancelled",
-				error = "Cancelled from queue via unqueue",
-				last_message = "",
-				transcript = tern.json.array(),
-			}, false)
+local function cancel_queued(pane: number, position: number?, id: number?): (number, string?)
+	if id ~= nil then
+		local item, err = dispatches.cancel_by_id(id, pane)
+		if not item then
+			return 0, err
 		end
-	end
-	if position then
-		local idx = math.floor(position)
-		if idx < 1 or idx > #q then
-			return 0, string.format("queue position %d out of range (1..%d)", idx, #q)
-		end
-		cancel(table.remove(q, idx) :: QueuedDispatch)
-		if #q == 0 then
-			queued_dispatches[tp] = nil
-		end
+		reply_to_queued({ item }, "cancelled", "Cancelled from queue via unqueue")
 		return 1, nil
 	end
-	queued_dispatches[tp] = nil
-	for _, item in ipairs(q) do
-		cancel(item)
-	end
-	return #q, nil
+	local items, err = dispatches.cancel_at(pane, position)
+	reply_to_queued(items, "cancelled", "Cancelled from queue via unqueue")
+	return #items, err
 end
 
 -- Sends `/retry` (F5) to an idle/failed pane; the third value is the busy state that refused it.
@@ -761,9 +712,10 @@ local function retry_pane(cx: WindowCx, tp: number): (boolean, string?, string?)
 	if ainfo and (ainfo.state == "working" or ainfo.state == "waiting_input") then
 		return false, "target pane is " .. ainfo.state .. " (not idle/failed)", ainfo.state
 	end
-	local ok_r, err_r = pcall(function()
-		cx.agents:ask(tp, "/retry")
-	end)
+	if has_pending_dispatch(tp) then
+		return false, "target pane has a dispatch in flight", "working"
+	end
+	local ok_r, err_r = ask_worker(cx, tp, "/retry")
 	if not ok_r then
 		return false, "cx.agents:ask /retry failed: " .. tostring(err_r), nil
 	end
@@ -863,7 +815,7 @@ local function float_worker(cx: WindowCx, pane: number, over: number?, requested
 	if requested == nil then
 		for _, c in PIP_CORNER_ORDER do
 			if not used[c] then
-				chosen = c
+				chosen = c :: Corner
 				break
 			end
 		end
@@ -877,7 +829,7 @@ end
 
 -- Choose a tiled slot beside `anchor` without crushing `anchor`: stack `"down"` under an existing
 -- right-column worker when one already exists, otherwise split `"right"` beside `anchor`.
-local function tiled_slot(cx: WindowCx, anchor: number, moving: number?): (number, Dir)
+local function tiled_slot(cx: WindowCx, anchor: number, moving: number?): (number, "right" | "down")
 	local existing = down_target(cx, anchor, moving)
 	if existing ~= anchor then
 		return existing, "down"
@@ -888,7 +840,7 @@ end
 local function dock_worker(cx: WindowCx, pane: number, over: number?, dir: Dir?): (boolean, string?)
 	if over ~= nil and (dir == nil or dir == "right") then
 		local slot_target, slot_dir = tiled_slot(cx, over, pane)
-		return cx.layout:dock(pane, slot_target, slot_dir, { focus = false })
+		return cx.layout:dock(pane, slot_target, slot_dir :: Dir, { focus = false })
 	end
 	return cx.layout:dock(pane, over, dir or "right", { focus = false })
 end
@@ -907,7 +859,7 @@ local function unpark_pane(cx: WindowCx, pane: number): (boolean, string?)
 	if owner ~= nil and cx.session:tab_of(owner) == cx.session:tab_of(pane) then
 		local slot_target, slot_dir = tiled_slot(cx, owner, pane)
 		if slot_target ~= pane then
-			cx.layout:move(pane, slot_target, slot_dir, { focus = false })
+			cx.layout:move(pane, slot_target, slot_dir :: Dir, { focus = false })
 		end
 	end
 	return true, nil
@@ -1012,14 +964,181 @@ local function stop_worker(cx: WindowCx, pane: number): (boolean, string?)
 	return ok, if ok then nil else tostring(err)
 end
 
+local function supplied(value: any): boolean
+	return value ~= nil and value ~= tern.json.null
+end
+
+local function positive_integer(value: any): number?
+	local n = tonumber(value)
+	return if n ~= nil and n > 0 and n <= 9007199254740991 and n % 1 == 0 then n else nil
+end
+
+local function queue_access(cx: WindowCx, anchor: number, pane: number): string?
+	if cx.session:pane(pane) == nil then
+		return "queue pane is not live: " .. pane
+	end
+	local cycle = state.ownership_cycle(anchor, pane)
+	if cycle then
+		return cycle
+	end
+	local owner = state.owner_of_pane(cx, pane)
+	return if owner ~= nil and owner ~= anchor then "queue pane is bound to pane " .. owner else nil
+end
+
+local function queue_source(cx: WindowCx, anchor: number, req: any, id: number?): (number?, string?)
+	if id ~= nil then
+		local pane = dispatches.find(id)
+		if pane == nil then
+			return nil, "queue item " .. id .. " is no longer queued"
+		end
+		if supplied(req.target_pane) and tonumber(req.target_pane) ~= pane then
+			return nil, "queue item is not on the expected pane"
+		end
+		return pane, nil
+	end
+	return select_worker(cx, anchor, req.target_pane, req.cwd)
+end
+
+local function queue_request(cx: WindowCx, anchor: number?, req: any): any
+	if not anchor then
+		return { ok = false, error = "missing anchor_pane" }
+	end
+	local legacy = req.op == "unqueue"
+	local action = if legacy then "cancel" else req.action
+	if action ~= "list" and action ~= "edit" and action ~= "cancel" and action ~= "move" and action ~= "reorder" then
+		return { ok = false, error = "unknown queue action" }
+	end
+	local function cwd_matches(pane: number): boolean
+		if not supplied(req.cwd) then
+			return true
+		end
+		local info = cx.session:pane(pane)
+		return info ~= nil and info.cwd == req.cwd
+	end
+	if action == "list" and req.all == true then
+		if supplied(req.target_pane) then
+			return { ok = false, error = "queue list --all cannot select a pane" }
+		end
+		local panes = state.workers_of_owner(cx, anchor)
+		local matching: { number } = {}
+		for _, pane in panes do
+			if cwd_matches(pane) then
+				table.insert(matching, pane)
+			end
+		end
+		return { ok = true, items = tern.json.array(dispatches.list_panes(matching)) }
+	end
+
+	local id = if supplied(req.id) then positive_integer(req.id) else nil
+	if (supplied(req.id) or action == "edit" or action == "move") and id == nil then
+		return { ok = false, error = "queue id must be a positive integer" }
+	end
+	local order = req.ordered_ids
+	if action == "reorder" and type(order) ~= "table" then
+		return { ok = false, error = "ordered_ids must be an array of queue IDs" }
+	end
+	local first_id = if action == "reorder" and not supplied(req.target_pane) and type(order[1]) == "number"
+		then order[1] else id
+	local pane, source_error = queue_source(cx, anchor, req, first_id)
+	if not pane then
+		return { ok = false, error = source_error }
+	end
+	local access_error = queue_access(cx, anchor, pane)
+	if access_error then
+		return { ok = false, error = access_error }
+	end
+	if (not legacy or id ~= nil) and not cwd_matches(pane) then
+		return { ok = false, error = "queue pane does not match cwd" }
+	elseif action == "list" then
+		return { ok = true, pane = pane, items = tern.json.array(dispatches.list(pane)) }
+	elseif action == "edit" then
+		if type(req.prompt) ~= "string" then
+			return { ok = false, error = "queue prompt is empty" }
+		end
+		local item, err, position = dispatches.edit(id :: number, req.prompt, pane)
+		return if item then { ok = true, pane = pane, id = item.id, position = position, prompt = item.prompt }
+			else { ok = false, error = err }
+	elseif action == "cancel" then
+		local position = if supplied(req.position) then positive_integer(req.position) else nil
+		if supplied(req.position) and position == nil then
+			return { ok = false, error = "queue position must be a positive integer" }
+		end
+		local selectors = (if id then 1 else 0) + (if position then 1 else 0) + (if req.all == true then 1 else 0)
+		if selectors > 1 or (not legacy and selectors ~= 1) then
+			return { ok = false, error = "choose one of queue id, position, or all" }
+		end
+		if legacy and id == nil and dispatches.count(pane) == 0 then
+			return { ok = true, pane = pane, cancelled = 0, remaining = 0 }
+		end
+		local cancelled, err = cancel_queued(pane, position, id)
+		return if err then { ok = false, error = err }
+			else { ok = true, pane = pane, cancelled = cancelled, remaining = dispatches.count(pane) }
+	elseif action == "reorder" then
+		-- Positional pane selection follows the IDs and is only unambiguous if it is not in the permutation.
+		local last = order[#order]
+		if req.allow_trailing_pane == true and not supplied(req.target_pane) and #order == dispatches.count(pane) + 1
+			and last == pane and dispatches.find(last) == nil then
+			local ids = table.clone(order)
+			table.remove(ids)
+			order = ids
+		end
+		local ok, err = dispatches.reorder(pane, order)
+		return if ok then { ok = true, pane = pane, items = tern.json.array(dispatches.list(pane)) }
+			else { ok = false, error = err }
+	end
+
+	local to_pos = if supplied(req.to_pos) then positive_integer(req.to_pos) else nil
+	local dst = if supplied(req.to_pane) then positive_integer(req.to_pane) else pane
+	if not dst or (supplied(req.to_pos) and not to_pos) then
+		return { ok = false, error = "destination pane and position must be positive integers" }
+	end
+	local destination: AgentBlock? = nil
+	if dst ~= pane then
+		local err = queue_access(cx, anchor, dst)
+		if err then
+			return { ok = false, error = err }
+		end
+		destination = find_agent_info(cx, dst)
+		if not destination or destination.state == "waiting_input" or destination.state == "exited" then
+			return { ok = false, error = "destination pane is " .. (if destination then destination.state else "not an agent") }
+		end
+	end
+	local item, err, position = dispatches.move(id :: number, to_pos, dst, pane)
+	if not item then
+		return { ok = false, error = err }
+	end
+	local dispatched = false
+	if destination then
+		if state.owner_of_pane(cx, dst) == nil then
+			state.bind_wingman(anchor, dst)
+		end
+		if destination.state == "idle" and not has_pending_dispatch(dst) then
+			dispatched = promote_next_queued(cx, dst) == item.id
+			if not dispatched then
+				local _, current_position = dispatches.find(item.id)
+				if not current_position then
+					return { ok = false, error = "moved queue item could not be dispatched", id = item.id, pane = dst }
+				end
+				position = current_position
+			end
+		end
+	end
+	ensure_watchdog()
+	return { ok = true, id = item.id, from_pane = pane, to_pane = dst, pane = dst, position = position, dispatched = dispatched }
+end
+
 local TARGETED_OPS = {
 	pip = true, dock = true, park = true, unpark = true, interrupt = true,
-	unqueue = true, retry = true, stop = true, transcript = true, surface = true, event = true, await = true,
+	retry = true, stop = true, transcript = true, surface = true, event = true, await = true,
 }
 
 local function handle_request(cx: WindowCx, cid: number, req: any)
 	local op = req.op
 	local anchor = tonumber(req.anchor_pane)
+	if op == "queue" or op == "unqueue" then
+		send_mux(cid, queue_request(cx, anchor, req), false)
+		return
+	end
 	local target: number? = nil
 	if TARGETED_OPS[op] then
 		local err: string?
@@ -1054,12 +1173,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			local info = cx.session:pane(a.pane)
 			local atab = if info then info.tab else nil
 			local owner = state.owner_of_pane(cx, a.pane)
-			local q = queued_dispatches[a.pane]
-			local q_count = if q then #q else 0
-			local q_preview: string? = nil
-			if q and #q > 0 then
-				q_preview = string.sub(q[1].prompt, 1, 120)
-			end
+			local items = dispatches.compact(a.pane)
 			local cb_q = queued_callbacks[a.pane]
 			local cb_q_count = if cb_q then #cb_q else 0
 			table.insert(out, {
@@ -1072,8 +1186,9 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				floating = info ~= nil and info.floating == true,
 				bound_owner = owner,
 				auto_callback = if owner ~= nil then state.is_auto_callback_enabled(owner) else state.is_auto_callback_enabled(a.pane),
-				queued_count = q_count,
-				queued_preview = q_preview,
+				queued_count = #items,
+				queued_preview = if items[1] then items[1].preview else nil,
+				queued_items = tern.json.array(items),
 				queued_callbacks_count = cb_q_count,
 				cwd = a.cwd,
 				state = a.state,
@@ -1195,19 +1310,6 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		local tp = target :: number
 		local ok_i, err_i = interrupt_pane(cx, tp)
 		send_mux(cid, { ok = ok_i, error = err_i }, false)
-		return
-	end
-
-	if op == "unqueue" then
-		local tp = target :: number
-		local pos = if req.position ~= nil and req.position ~= tern.json.null then tonumber(req.position) else nil
-		local cancelled, err_q = cancel_queued(tp, pos)
-		if err_q then
-			send_mux(cid, { ok = false, error = err_q }, false)
-			return
-		end
-		local rem = if queued_dispatches[tp] then #queued_dispatches[tp] else 0
-		send_mux(cid, { ok = true, pane = tp, cancelled = cancelled, remaining = rem }, false)
 		return
 	end
 
@@ -1396,6 +1498,11 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = "dispatch prompt is empty" }, false)
 			return
 		end
+		local position = if supplied(req.position) then positive_integer(req.position) else nil
+		if supplied(req.position) and position == nil then
+			send_mux(cid, { ok = false, error = "queue position must be a positive integer" }, false)
+			return
+		end
 		local form: WorkerLayout? = nil
 		local requested = req.layout
 		local corner: Corner? = corner_of(req.pip_corner)
@@ -1459,9 +1566,18 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			}, false)
 			return
 		end
-		local busy = agent ~= nil and agent.state == "working"
+		if agent and agent.state == "exited" then
+			send_mux(cid, { ok = false, pane = target_pane, status = "exited", error = "Agent process exited" }, false)
+			return
+		end
+		local busy = target_pane ~= nil and (has_pending_dispatch(target_pane) or dispatches.count(target_pane) > 0
+			or (agent ~= nil and agent.state == "working"))
 		if busy and req.queue == false then
-			send_mux(cid, { ok = false, error = "target agent pane is currently busy (working)" }, false)
+			send_mux(cid, { ok = false, error = "target agent pane is currently busy" }, false)
+			return
+		end
+		if busy and position and target_pane and position > dispatches.count(target_pane) + 1 then
+			send_mux(cid, { ok = false, error = string.format("queue position %d out of range (1..%d)", position, dispatches.count(target_pane) + 1) }, false)
 			return
 		end
 
@@ -1485,11 +1601,19 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			pane = spawned
 		end
 
-		if not busy then
+		local queued_item: Queue.Item?
+		local queued_position: number?
+		if busy then
+			load_dispatch_ids(cx)
+			local err: string?
+			queued_item, err, queued_position = dispatches.enqueue(pane, { cid = if async_cb then nil else cid, anchor = anchor, prompt = prompt }, position)
+			if not queued_item then
+				send_mux(cid, { ok = false, error = err }, false)
+				return
+			end
+		else
 			-- Tern queues the prompt until the composer is sendable, including on a freshly parked pane.
-			local ok, err = pcall(function()
-				cx.agents:ask(pane, prompt)
-			end)
+			local ok, err = ask_worker(cx, pane, prompt)
 			if not ok then
 				if new_worker then
 					cx.layout:close(pane)
@@ -1506,17 +1630,11 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			state.set_callback(anchor, req.auto_callback)
 		end
 
-		if busy then
-			local q = queued_dispatches[pane]
-			if not q then
-				q = {}
-				queued_dispatches[pane] = q
-			end
-			table.insert(q, { cid = if async_cb then nil else cid, anchor = anchor, prompt = prompt })
+		if queued_item then
 			if async_cb then
-				send_mux(cid, { ok = true, async_callback = true, pane = pane, queued = true, position = #q }, false)
+				send_mux(cid, { ok = true, async_callback = true, pane = pane, queued = true, queue_id = queued_item.id, position = queued_position }, false)
 			else
-				send_mux(cid, { _ack = true, pane = pane, queued = true, position = #q }, true)
+				send_mux(cid, { _ack = true, pane = pane, queued = true, queue_id = queued_item.id, position = queued_position }, true)
 			end
 			ensure_watchdog()
 		elseif async_cb then
@@ -1679,8 +1797,7 @@ if radar_loaded then
 		radar.attach({
 			owners = state.owners,
 			queued_dispatches = function(pane: number): number
-				local q = queued_dispatches[pane]
-				return if q then #q else 0
+				return dispatches.count(pane)
 			end,
 			queued_callbacks = function(pane: number): number
 				local q = queued_callbacks[pane]

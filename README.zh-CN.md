@@ -17,7 +17,7 @@
 
 - **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 Agent 输入框 `sendable=true` 后单次原子投递。
 - **零轮询 `AF_UNIX` 原生事件总线（`tern.process.spawn` + `agent_finished`）**：0 磁盘 `.jsonl` 轮询、0 定时器扫目录、0 临时 TCP 端口；通过本地 `0600` UNIX Domain Socket 原生跨线程唤醒 UI 虚拟机（Wayland 后台失焦同样稳定 `2~10 ms` 响应），并支持插件热重载不断连恢复。
-- **显式 `anchor → wingman` 归属绑定与原生排队（`unqueue`）**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机；显式把 pane 绑定到自身或其祖先会在产生任何副作用之前以环路错误拒绝。僚机忙碌时继续派单会在 `window.luau` 内存队列自动排队并在 `agent_finished` 时按序推进，支持随时 `unqueue` 撤回。
+- **显式 `anchor → wingman` 归属绑定与可编辑队列**：僚机忙碌时，Wingman 会将新任务加入队列。`send --position N` 可指定从 1 开始的插入位置；`queue list --all` 可查看自己所有僚机的待派发任务。通过稳定任务 ID 可编辑、撤回或转派，也可提交同一 pane 上的完整 ID 次序来重排。绑定自身或祖先会在产生任何副作用之前被拒绝。
 - **全双工双向回推（`report` 主动汇报 + 异步轮次自动唤醒）**：当僚机内部后台长任务（如 `bg_x`）跑完自动开启新一轮并结束时，即便主控早已进入 `idle`，插件也会自动把本轮结果回推唤醒主控（若主控正忙则自动缓冲合并投递；超过 3,600 字节时会按 UTF-8 边界安全截断并附带 `wingman transcript` 提示）；同时僚机也可随时调用 `wingman report -m "..."`（或 `-m -` 从标准输入管道读取）沿着 `boundOwner` 主动上报进度或提问。
 - **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片，并在 `waiting_input` 时原生提取 ACP `layer` 弹窗摘要。
 - **零抢焦点分屏 & 动态画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；多个右侧分屏自动垂直叠放，画中画按主控 Tab 占比与同类浮窗数量动态缩放并自动挑空角落（`br → tr → bl → tl`），`unpark` 恢复回主控身旁而不误切实时面板。

@@ -25,8 +25,16 @@ wingman info [--cwd DIR] [--limit 6]
 wingman send <new|same|latest|sessionId> (-m TEXT | --prompt-file FILE|-) \
   [--agent ID] [--cwd DIR] [--pane ID] [--replace] [--layout split|down|pip|tab|park] \
   [--pip tl|tr|bl|br] [--model M] [--thinking L] [--max-time 30m] \
-  [--mode auto|tui|headless] [--no-queue] [--async | --wait] \
+  [--mode auto|tui|headless] [--no-queue | --position N] [--async | --wait] \
   [--auto-callback | --no-auto-callback] [--takeover-idle] [--allow-fork]
+
+# Pending tasks only; each action accepts [pane | --pane ID] and [--cwd DIR]
+wingman queue list [--all]
+wingman queue edit ID (-m TEXT | --prompt-file FILE|-)
+wingman queue move ID [--to POS] [--to-pane PANE_ID]
+wingman queue reorder ID [ID ...]
+wingman queue cancel ID | --position POS | --all
+wingman unqueue [--id ID | --position POS]
 
 # Read structured TSP chat transcript from Tern memory, or tail-peek .jsonl
 wingman transcript [pane | --pane ID] [--last 8] [--cwd DIR]
@@ -65,7 +73,7 @@ wingman callback [status|on|off|reset] [--global] [--pane OWNER_ID]
 ## Runtime Behavior
 
 - **Async default when the caller is a Tern agent** (e.g. `agy`, `claude`, `codex`, detected by the caller's ID in Tern's agent list): `send` and `retry` return immediately after dispatch and Tern submits `[Wingman auto-callback · pane <id>]` back into your composer when the worker finishes. Do not poll or sleep; pass `--wait` only to force blocking stdout.
-- **Native queueing**: `send same` while the worker is `working` queues inside Tern and promotes automatically on finish (`--no-queue` fails fast; `unqueue` cancels).
+- **Editable queue**: Busy workers queue prompts in Wingman and promote from the head on completion. `send --position N` inserts into a 1-based slot; otherwise it appends. Use the returned queue ID rather than the slot to edit, move, or cancel; promoted or removed IDs are rejected. `queue list --all` lists your workers' pending tasks in this window, and `reorder` requires every ID on one pane exactly once. Moving to an idle worker can dispatch immediately. Pending prompts do not survive plugin reload.
 - **`[Wingman waiting_input · pane <id>]`**: `send` onto a `waiting_input` pane is refused. Inspect with `surface`, answer with `event` (auto-rearms callback unless `--no-rearm`; simple option pick: `'{"ev":"action","id":"ui","act":"pick:0:0"}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'`). Decide technical/architectural questions yourself; consult the user on product/scope/cost trade-offs.
 - **`[Wingman fault · retryable · pane <id>]`**: worker exhausted internal recovery and is waiting on `F5 to retry`. Run `retry --pane <id>` for transient stream/network/edit-preview glitches (up to 2–3 tries); consult the user on persistent quota/auth/config errors.
 - **1-to-N and multi-level**: `send new` adds a worker; `send new --replace` stops only the selected bound worker before launching a fresh one. `info` lists `boundWingmanPanes`. With one worker, `send same` and controls select it automatically. With several, pass `--pane ID` or an explicit `--cwd DIR` matching exactly one; ambiguity errors list the bound IDs. Workers may themselves own wingmen (nested trees); explicitly binding a pane to itself or an ancestor is rejected with a cycle error before any effect, leaving the graph unchanged.

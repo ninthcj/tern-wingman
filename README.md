@@ -24,7 +24,7 @@ Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across
 
 - **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until the agent reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
 - **Zero-polling `AF_UNIX` event bus (`tern.process.spawn` + `agent_finished`)** — zero `.jsonl` polling, zero timer directory scans, and zero ephemeral TCP ports; `window.luau` wakes `wingman.py` over a `0600` UNIX domain socket in `2–10 ms` (even when occluded on Wayland) and survives live `tern plugin reload`.
-- **Explicit `anchor → wingman` ownership graph & FIFO queueing** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs; binding a pane to itself or an ancestor is rejected with a cycle error before any effect. Sending to a busy worker queues natively in `window.luau` (`unqueue` cancels pending slots), and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
+- **Explicit `anchor → wingman` ownership and editable queues** — sending to a busy worker queues in Wingman. Use `send --position N` to insert at a 1-based slot, or `queue list --all` to inspect pending tasks across your workers. Edit, cancel, or move a task by stable ID; reorder by supplying the pane’s complete ID sequence. Self and ancestor bindings are rejected before any effect.
 - **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if a worker finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if busy, and adding an explicit UTF-8-safe truncation notice past 3,600 bytes pointing to `wingman transcript`); workers can also push mid-turn progress or questions proactively via `wingman report -m "..."` (or `-m -` for piped stdin).
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
 - **Non-intrusive Splits & Dynamic Picture-in-Picture (`--pip`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), stacks additional right-column workers cleanly, scales PiP windows dynamically to the owner's tab share with automatic free-corner selection (`br → tr → bl → tl`), and `unpark`s workers beside their owner.
@@ -38,7 +38,7 @@ sequenceDiagram
     participant L as Lead Agent (ACP agy / claude / codex / …)
     participant W as wingman.py (AF_UNIX client)
     participant M as mux.py (0600 AF_UNIX <-> stdio)
-    participant P as Tern Plugin (window / state / tsp / radar · WindowCx.agents)
+    participant P as Tern Plugin (window / state / queue / tsp / radar · WindowCx.agents)
     participant O as Wingman (omp or tern acp <id> · Split / PiP)
 
     L->>W: wingman send <new|same|id> --prompt-file spec.md
@@ -52,7 +52,7 @@ sequenceDiagram
     W-->>L: stdout reply + exit status (0=done, 2=waiting_input)
 ```
 
-The Tern plugin is split into five acyclic Luau modules: `window.luau` (RPC router, turn/queue/callback state machine, dynamic worker placement), `state.luau` (`owners_v1` 1-to-N graph, `bindings_v1` migration, cycle guard), `tsp.luau` (stateless TSP/surface helpers, ACP `layer` dialog extraction, UTF-8 clipping), `radar.luau` (Live Panel controller & 50 ms budget guard), and `radar_view.luau` (pure declarative CSS + UI renderer).
+The Tern plugin is split into six acyclic Luau modules: `window.luau` (RPC, turn and callback orchestration, layouts), `queue.luau` (stable pending-task IDs and per-pane ordering), `state.luau` (ownership and persistent preferences), `tsp.luau` (stateless TSP and surface helpers), `radar.luau` (Live Panel controller and 50 ms budget guard), and `radar_view.luau` (declarative CSS and rendering).
 
 ## Install
 

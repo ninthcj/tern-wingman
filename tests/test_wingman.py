@@ -12,6 +12,14 @@ import unittest
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+def mock_stdout(buf):
+    from unittest import mock
+
+    return mock.patch("sys.stdout", buf)
+
+
 MUX_PATH = ROOT_DIR / "mux.py"
 SCRIPT_PATH = ROOT_DIR / "skills" / "wingman" / "scripts" / "wingman.py"
 
@@ -1005,6 +1013,174 @@ class WingmanMultiWorkerTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 wingman.find_omp_bin()
 
+    def _run_cli(self, argv: list[str], reply: dict | None = None) -> tuple[list[dict], str | int | None, str]:
+        import io
+
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(argv)
+        out = io.StringIO()
+        with self._patched({"ok": True, "agents": []}, calls, reply):
+            with mock_stdout(out):
+                try:
+                    ns.func(ns)
+                    code = None
+                except SystemExit as exc:
+                    code = exc.code
+        return calls, code, out.getvalue()
+
+    def test_queue_cli_parsing_and_forwarding(self) -> None:
+        reply = {"ok": True, "items": [{"id": 11}], "pane": 105, "cancelled": 1, "remaining": 0}
+        calls, code, out = self._run_cli(["queue", "list", "--all"], reply)
+        self.assertIsNone(code)
+        req = calls[0]
+        self.assertEqual((req["op"], req["action"], req["anchor_pane"], req["all"]), ("queue", "list", 100, True))
+        self.assertNotIn("target_pane", req)
+        self.assertEqual(json.loads(out), [{"id": 11}])
+
+        calls, _, _ = self._run_cli(["queue", "list", "105", "--cwd", "/tmp/x"], reply)
+        self.assertEqual(calls[0]["target_pane"], 105)
+        self.assertEqual(calls[0]["cwd"], str(Path("/tmp/x").resolve()))
+
+        calls, _, _ = self._run_cli(["queue", "edit", "11", "--pane", "105", "-m", " new text "], reply)
+        self.assertEqual((calls[0]["action"], calls[0]["id"], calls[0]["prompt"], calls[0]["target_pane"]), ("edit", 11, "new text", 105))
+
+        calls, code, out = self._run_cli(
+            ["queue", "move", "11", "--to", "1", "--to-pane", "106"],
+            {"ok": True, "id": 11, "from_pane": 105, "to_pane": 106, "position": 1, "dispatched": True},
+        )
+        self.assertIsNone(code)
+        self.assertTrue(json.loads(out)["dispatched"])
+        self.assertEqual((calls[0]["action"], calls[0]["to_pos"], calls[0]["to_pane"]), ("move", 1, 106))
+        self.assertNotIn("target_pane", calls[0])
+
+        calls, _, _ = self._run_cli(["queue", "reorder", "--pane", "105", "12", "11"], reply)
+        self.assertEqual((calls[0]["action"], calls[0]["ordered_ids"], calls[0]["target_pane"]), ("reorder", [12, 11], 105))
+
+        calls, _, _ = self._run_cli(["queue", "reorder", "12", "11", "105"], reply)
+        self.assertEqual(calls[0]["ordered_ids"], [12, 11, 105])
+        self.assertTrue(calls[0]["allow_trailing_pane"])
+        self.assertNotIn("target_pane", calls[0])
+
+    def test_queue_cancel_positionals(self) -> None:
+        reply = {"ok": True, "pane": 105, "cancelled": 1, "remaining": 0}
+        calls, _, out = self._run_cli(["queue", "cancel", "11"], reply)
+        self.assertEqual((calls[0]["id"], "target_pane" in calls[0]), (11, False))
+        self.assertEqual(json.loads(out)["cancelled"], 1)
+        calls, _, _ = self._run_cli(["queue", "cancel", "11", "105"], reply)
+        self.assertEqual((calls[0]["id"], calls[0]["target_pane"]), (11, 105))
+        calls, _, _ = self._run_cli(["queue", "cancel", "11", "--pane", "105"], reply)
+        self.assertEqual(calls[0]["target_pane"], 105)
+        calls, _, _ = self._run_cli(["queue", "cancel", "105", "--all"], reply)
+        self.assertEqual((calls[0]["target_pane"], calls[0]["all"], "id" in calls[0]), (105, True, False))
+        calls, _, _ = self._run_cli(["queue", "cancel", "105", "--position", "2"], reply)
+        self.assertEqual((calls[0]["target_pane"], calls[0]["position"]), (105, 2))
+        _, code, _ = self._run_cli(["queue", "cancel"], reply)
+        self.assertIsInstance(code, str)
+        _, code, _ = self._run_cli(["queue", "cancel", "--all", "--position", "1"], reply)
+        self.assertIsInstance(code, str)
+
+    def test_queue_cli_errors(self) -> None:
+        calls, code, _ = self._run_cli(["queue", "edit", "11", "-m", "x"], {"ok": False, "error": "no such id"})
+        self.assertEqual(code, "error: no such id")
+        _, code, _ = self._run_cli(["queue", "move", "11"])
+        self.assertIn("--to", str(code))
+        _, code, _ = self._run_cli(["queue", "list", "100"])
+        self.assertIn("own pane", str(code))
+
+    def test_unqueue_by_id_routes_without_pane_and_send_position(self) -> None:
+        calls, _, out = self._run_cli(["unqueue", "--id", "19"], {"ok": True, "pane": 106, "cancelled": 1, "remaining": 2})
+        self.assertEqual([c["op"] for c in calls], ["unqueue"])
+        self.assertEqual((calls[0]["id"], calls[0]["target_pane"]), (19, None))
+        self.assertEqual(json.loads(out)["pane"], 106)
+        req = self._dispatch(["same", "--position", "1"], _multi_status([105]))
+        self.assertEqual(req["position"], 1)
+        self.assertNotIn("position", self._dispatch(["same"], _multi_status([105])))
+
+    def test_send_surfaces_queue_id_for_async_and_wait(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        queued = {"pane": 105, "queued": True, "position": 2, "queue_id": 42}
+        with self._patched(_multi_status([105]), [], {"ok": True, "async_callback": True, **queued}):
+            buf = io.StringIO()
+            with mock_stdout(buf), self.assertRaises(SystemExit) as done:
+                wingman.cmd_send(wingman.build_parser().parse_args(["send", "same", "-m", "go", "--async"]))
+            self.assertEqual(done.exception.code, 0)
+            self.assertIn("#2 id=42", buf.getvalue())
+
+        def bridge(req, timeout=None, on_ack=None):
+            if req["op"] == "status":
+                return _multi_status([105])
+            on_ack(queued)
+            return {"ok": True, "last_message": "done"}
+
+        buf = io.StringIO()
+        with self._patched(_multi_status([105]), []), mock.patch.object(wingman, "call_bridge", bridge), redirect_stderr(buf):
+            with self.assertRaises(SystemExit) as done:
+                wingman.cmd_send(wingman.build_parser().parse_args(["send", "same", "-m", "go", "--wait"]))
+        self.assertEqual(done.exception.code, 0)
+        self.assertIn("#2 id=42", buf.getvalue())
+
+    def test_info_reports_queued_items(self) -> None:
+        status = _multi_status([105])
+        next(a for a in status["agents"] if a["pane"] == 105)["queued_items"] = [{"id": 11, "position": 1}]
+        import io
+        from unittest import mock
+
+        buf = io.StringIO()
+        ns = wingman.build_parser().parse_args(["info"])
+        with self._patched(status, [], None), mock_stdout(buf), mock.patch.object(
+            wingman, "find_ovnfs_bin", lambda: None
+        ), mock.patch.object(wingman, "find_omp_bin", lambda required=True: None):
+            ns.func(ns)
+        agent = next(a for a in json.loads(buf.getvalue())["ternAgents"] if a["pane"] == 105)
+        self.assertEqual(agent["queuedItems"], [{"id": 11, "position": 1}])
+
+    def test_call_bridge_queued_reload_fails_instead_of_reattaching(self) -> None:
+        from unittest import mock
+
+        def run(ack: dict, frames_after: list) -> tuple[dict, list]:
+            sent: list[dict] = []
+            seq = iter([ack, *frames_after])
+
+            class FakeSock:
+                def __init__(self, *a, **k): ...
+                def settimeout(self, _t): ...
+                def connect(self, _a): ...
+                def sendall(self, data): sent.append(json.loads(data))
+                def close(self): ...
+
+            with tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "w-1.sock").write_text("")
+                with mock.patch.object(wingman, "bridge_ipc_dir", lambda: Path(tmp)), mock.patch.object(
+                    wingman.socket, "socket", FakeSock
+                ), mock.patch.object(wingman, "_read_json_line", lambda *a, **k: next(seq)), mock.patch.object(
+                    wingman.time, "sleep", lambda _s: None
+                ):
+                    return wingman.call_bridge({"op": "dispatch", "anchor_pane": 100}, timeout=5), sent
+
+        reply, sent = run({"_ack": True, "pane": 105, "queued": True}, [{"_reload": True}])
+        self.assertFalse(reply["ok"])
+        self.assertEqual([s["op"] for s in sent], ["dispatch"])
+        reply, sent = run({"_ack": True, "pane": 105, "queued": True}, [None])
+        self.assertFalse(reply["ok"])
+        self.assertEqual(len(sent), 1)
+        # Non-queued ack still re-attaches via `await`
+        reply, sent = run({"_ack": True, "pane": 105}, [{"_reload": True}, {"ok": True, "last_message": "done"}])
+        self.assertTrue(reply["ok"])
+        self.assertEqual([s["op"] for s in sent], ["dispatch", "await"])
+
+    def test_luau_queue_fixture(self) -> None:
+        import shutil
+
+        luau = shutil.which("luau")
+        if luau is None:
+            self.skipTest("`luau` runner is not on PATH; cannot execute tests/queue_fixture.luau")
+        fixture = ROOT_DIR / "tests" / "queue_fixture.luau"
+        proc = subprocess.run([luau, str(fixture)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
     def test_window_luau_ownership_fixture(self) -> None:
         import shutil
 
@@ -1014,7 +1190,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         fixture = (ROOT_DIR / "tests" / "ownership_fixture.luau").read_text(encoding="utf-8")
         window = (ROOT_DIR / "window.luau").read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as tmp:
-            for module in ("state.luau", "tsp.luau"):
+            for module in ("state.luau", "tsp.luau", "queue.luau"):
                 shutil.copy(ROOT_DIR / module, Path(tmp) / module)
             script = Path(tmp) / "ownership_fixture_run.luau"
             script.write_text(fixture.replace("-- @WINDOW_PLUGIN@", window), encoding="utf-8")

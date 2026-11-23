@@ -2,6 +2,15 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
+## [Unreleased]
+
+### Added
+- Editable pending-task queues with stable IDs: `wingman queue list`, `edit`, `cancel`, `move`, and `reorder`; `send --position`, `unqueue --id`, and per-agent `queuedItems` in `info`.
+
+### Fixed
+- Rapid sends queue in Wingman while the first prompt is entering the native agent, so subsequent tasks remain editable.
+- The Live Panel’s viewport calculation reads the current transcript tool records.
+
 ## [0.6.0] - 2026-11-22
 
 ### Added

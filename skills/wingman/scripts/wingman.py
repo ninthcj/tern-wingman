@@ -227,6 +227,15 @@ def _read_json_line(
         buf.extend(chunk)
 
 
+def _queued_wait_lost(reason: str) -> dict[str, Any]:
+    """A queued item's position/turn is not recoverable by pane after a reload (it may have moved), so fail instead of re-attaching."""
+    return {
+        "ok": False,
+        "status": "failed",
+        "error": f"{reason} while the prompt was queued; the queue may still hold it. Check `queue list` instead of re-sending.",
+    }
+
+
 def call_bridge(
     payload: dict[str, Any],
     timeout: float | None = DEFAULT_BRIDGE_TIMEOUT,
@@ -240,6 +249,7 @@ def call_bridge(
     cur_payload = dict(payload)
     cur_payload.setdefault("daemon_socket", daemon_sock)
     ack_pane: int | None = None
+    ack_queued = False
     notified_ack = False
 
     while True:
@@ -293,6 +303,8 @@ def call_bridge(
                 while True:
                     frame = _read_json_line(sock, buf, deadline)
                     if frame is None:
+                        if ack_queued:
+                            return _queued_wait_lost("Tern wingman bridge disconnected")
                         if ack_pane is not None:
                             need_reload_retry = True
                         break
@@ -300,11 +312,14 @@ def call_bridge(
                         break
                     if frame.get("_ack"):
                         ack_pane = int(frame["pane"])
+                        ack_queued = bool(frame.get("queued"))
                         if on_ack is not None and not notified_ack:
                             notified_ack = True
                             on_ack(frame)
                         continue
                     if frame.get("_reload"):
+                        if ack_queued:
+                            return _queued_wait_lost("Tern wingman plugin reloaded")
                         need_reload_retry = True
                         break
                     return frame
@@ -787,6 +802,7 @@ def cmd_info(args: argparse.Namespace) -> None:
                     "boundOwner": a.get("bound_owner"),
                     "autoCallback": a.get("auto_callback"),
                     "queuedCount": int(a.get("queued_count") or 0),
+                    "queuedItems": a.get("queued_items") or [],
                     "queuedPreview": a.get("queued_preview"),
                     "queuedCallbacksCount": int(a.get("queued_callbacks_count") or 0),
                     "sameTab": a.get("same_tab"),
@@ -914,6 +930,8 @@ def cmd_send(args: argparse.Namespace) -> None:
     use_tui = args.mode == "tui" or (args.mode == "auto" and my_pane is not None)
     explicit_pane, layout, pip_corner = parse_send_options(args, my_pane, use_tui)
     validate_agent_options(args, use_tui)
+    if args.position is not None and (not use_tui or args.no_queue):
+        raise SystemExit("error: --position requires Tern queueing (not --mode headless or --no-queue)")
     is_omp = args.agent == "omp"
 
     tern_bin = find_tern_bin()
@@ -1006,6 +1024,8 @@ def cmd_send(args: argparse.Namespace) -> None:
             "async_callback": use_async_cb,
             "cwd": str(cwd),
         }
+        if args.position is not None:
+            req["position"] = args.position
         if launching:
             req["command"] = format_command_line(cmd_parts)
         req["prompt"] = prompt
@@ -1027,8 +1047,9 @@ def cmd_send(args: argparse.Namespace) -> None:
             pane_id = int(frame["pane"])
             if frame.get("queued"):
                 pos = frame.get("position", 1)
+                qid = f" id={frame['queue_id']}" if frame.get("queue_id") else ""
                 print(
-                    f"[wingman] Native TSP queued (#{pos}, {len(prompt)} chars) -> pane {pane_id} (waiting on agent_finished)",
+                    f"[wingman] Native TSP queued (#{pos}{qid}, {len(prompt)} chars) -> pane {pane_id} (waiting on agent_finished)",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -1057,10 +1078,11 @@ def cmd_send(args: argparse.Namespace) -> None:
             dispatched_pane = int(reply["pane"])
             if reply.get("queued"):
                 pos = int(reply.get("position") or 1)
+                qid = f" id={reply['queue_id']}" if reply.get("queue_id") else ""
                 print(
-                    f"[wingman] Queued (#{pos}, {len(prompt)} chars) onto wingman pane {dispatched_pane} (async callback armed).\n"
-                    f"When pane {dispatched_pane} finishes this turn, Tern will automatically submit `[Wingman auto-callback · pane {dispatched_pane}]` "
-                    "into your chat composer as a visible turn. Do NOT poll or sleep; end your turn now and wait for the callback."
+                    f"[wingman] Queued (#{pos}{qid}, {len(prompt)} chars) onto wingman pane {dispatched_pane} (async callback armed).\n"
+                    "When this task completes, Wingman sends the auto-callback tagged with the pane that ran it. "
+                    "Do NOT poll or sleep; end your turn now and wait for the callback."
                 )
             else:
                 print(
@@ -1218,32 +1240,108 @@ def cmd_interrupt(args: argparse.Namespace) -> None:
     print(json.dumps({"pane": pane, "interrupted": True}, indent=2))
 
 
+def _queue_number(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if not 1 <= number <= (1 << 53) - 1:
+        raise argparse.ArgumentTypeError("expected a positive safe integer")
+    return number
+
+
 def cmd_unqueue(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `unqueue` requires running inside Tern")
-    pane = _resolve_explicit_or_bound_pane(args, my_pane)
-    reply = call_bridge(
-        {
-            "op": "unqueue",
-            "anchor_pane": my_pane,
-            "target_pane": pane,
-            "position": args.position,
-        },
-        timeout=DEFAULT_BRIDGE_TIMEOUT,
-    )
+    if args.id is not None:
+        raw = getattr(args, "pane_flag", None) or getattr(args, "pane", None)
+        pane = _parse_pane_id(raw, my_pane) if raw is not None and str(raw).strip() else None
+    else:
+        pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    req: dict[str, Any] = {"op": "unqueue", "anchor_pane": my_pane, "target_pane": pane, "position": args.position}
+    if args.id is not None:
+        req["id"] = args.id
+    if args.cwd:
+        req["cwd"] = str(Path(args.cwd).resolve())
+    reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT)
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     print(
         json.dumps(
             {
-                "pane": pane,
+                "pane": reply.get("pane", pane),
                 "cancelled": reply.get("cancelled", 0),
                 "remaining": reply.get("remaining", 0),
             },
             indent=2,
         )
     )
+
+
+def _queue_request(args: argparse.Namespace, my_pane: int, action: str, raw_pane: Any = None, **fields: Any) -> dict[str, Any]:
+    """Build a `queue` bridge request; `target_pane`/`cwd` are sent only when the caller named them."""
+    req: dict[str, Any] = {"op": "queue", "action": action, "anchor_pane": my_pane}
+    pane_raw = getattr(args, "pane_flag", None) or raw_pane
+    if pane_raw is not None and str(pane_raw).strip():
+        req["target_pane"] = _parse_pane_id(pane_raw, my_pane)
+    if getattr(args, "cwd", None):
+        req["cwd"] = str(Path(args.cwd).resolve())
+    req.update({k: v for k, v in fields.items() if v is not None})
+    return req
+
+
+def _queue_call(req: dict[str, Any]) -> dict[str, Any]:
+    reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT)
+    if not reply.get("ok"):
+        raise SystemExit(f"error: {reply.get('error')}")
+    return reply
+
+
+def _queue_output(reply: dict[str, Any], *keys: str) -> None:
+    print(json.dumps({k: reply[k] for k in keys if k in reply}, ensure_ascii=False, indent=2))
+
+
+def cmd_queue(args: argparse.Namespace) -> None:
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `queue` requires running inside Tern")
+    action = args.queue_action
+    if action == "list":
+        reply = _queue_call(_queue_request(args, my_pane, "list", args.pane, all=True if args.all else None))
+        print(json.dumps(reply.get("items", []), ensure_ascii=False, indent=2))
+    elif action == "edit":
+        prompt = _read_prompt_input(args.prompt, args.prompt_file, label="prompt")
+        req = _queue_request(args, my_pane, "edit", args.target, id=args.id, prompt=prompt)
+        _queue_output(_queue_call(req), "id", "pane", "position", "prompt")
+    elif action == "move":
+        if args.to_pos is None and args.to_pane is None:
+            raise SystemExit("error: `queue move` requires --to and/or --to-pane")
+        to_pane = _parse_pane_id(args.to_pane, my_pane) if args.to_pane is not None else None
+        req = _queue_request(args, my_pane, "move", args.target, id=args.id, to_pos=args.to_pos, to_pane=to_pane)
+        _queue_output(_queue_call(req), "id", "from_pane", "to_pane", "pane", "position", "dispatched")
+    elif action == "reorder":
+        req = _queue_request(args, my_pane, "reorder", ordered_ids=args.ids)
+        if args.pane_flag is None and len(args.ids) > 1:
+            req["allow_trailing_pane"] = True
+        _queue_output(_queue_call(req), "pane", "items")
+    else:
+        first, second = args.first, args.second
+        if args.all or args.position is not None:
+            if args.all and args.position is not None:
+                raise SystemExit("error: --all and --position are mutually exclusive")
+            if second is not None:
+                raise SystemExit("error: `queue cancel --all/--position` takes at most one positional (the pane)")
+            req = _queue_request(args, my_pane, "cancel", first, position=args.position, all=True if args.all else None)
+        else:
+            if first is None:
+                raise SystemExit("error: `queue cancel` requires <id>, --all, or --position")
+            try:
+                item_id = _queue_number(first)
+            except argparse.ArgumentTypeError as exc:
+                raise SystemExit(f"error: queue id: {exc}") from None
+            req = _queue_request(args, my_pane, "cancel", second, id=item_id)
+        _queue_output(_queue_call(req), "pane", "cancelled", "remaining", "items")
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
@@ -1522,6 +1620,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--takeover-idle", action="store_true")
     p_send.add_argument("--allow-fork", action="store_true")
     p_send.add_argument("--no-queue", action="store_true", help="Fail immediately if target wingman pane is busy instead of queueing natively")
+    p_send.add_argument("--position", type=_queue_number, help="1-based queue slot to insert at when the target pane is busy (default: append)")
     deliv_grp = p_send.add_mutually_exclusive_group()
     deliv_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately after TSP dispatch and deliver reply via `cx.agents:ask` callback (default when the caller is a Tern agent)")
     deliv_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block synchronously until wingman turn finishes (default for shell callers)")
@@ -1573,8 +1672,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_unq = sub.add_parser("unqueue", help="Cancel queued (not-yet-sent) prompts waiting on a busy wingman pane")
     _add_pane_args(p_unq)
-    p_unq.add_argument("--position", type=int, help="Optional 1-based queue slot to cancel (default: cancel all)")
+    unqueue_selector = p_unq.add_mutually_exclusive_group()
+    unqueue_selector.add_argument("--position", type=_queue_number, help="Optional 1-based queue slot to cancel (default: cancel all)")
+    unqueue_selector.add_argument("--id", type=_queue_number, help="Cancel one queued prompt by queue id (routes by id without an explicit pane)")
     p_unq.set_defaults(func=cmd_unqueue)
+
+    p_q = sub.add_parser("queue", help="Inspect and edit queued (not-yet-sent) prompts: list, edit, move, reorder, cancel")
+    qsub = p_q.add_subparsers(dest="queue_action", required=True)
+
+    def _queue_common(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--pane", dest="pane_flag", help="Agent pane id")
+        sp.add_argument("--cwd", help="Workspace directory constraint for pane selection")
+
+    q_list = qsub.add_parser("list", help="List queued prompts (bound/selected pane, or every owned pane with --all)")
+    q_list.add_argument("pane", nargs="?", help="Agent pane id")
+    q_list.add_argument("--all", action="store_true", help="List queues of every pane you own")
+    _queue_common(q_list)
+
+    q_edit = qsub.add_parser("edit", help="Replace the prompt text of a queued item")
+    q_edit.add_argument("id", type=_queue_number, help="Queue id")
+    q_edit.add_argument("target", nargs="?", help="Agent pane id (optional)")
+    q_edit_grp = q_edit.add_mutually_exclusive_group(required=True)
+    q_edit_grp.add_argument("--prompt", "--message", "-m", dest="prompt", help="New prompt text (or '-' for stdin)")
+    q_edit_grp.add_argument("--prompt-file", help="Path to new prompt file (or '-' for stdin)")
+    _queue_common(q_edit)
+
+    q_move = qsub.add_parser("move", help="Move a queued item to another slot and/or pane")
+    q_move.add_argument("id", type=_queue_number, help="Queue id")
+    q_move.add_argument("target", nargs="?", help="Source agent pane id (optional)")
+    q_move.add_argument("--to", "--to-pos", dest="to_pos", type=_queue_number, help="1-based destination slot")
+    q_move.add_argument("--to-pane", help="Destination agent pane id")
+    _queue_common(q_move)
+
+    q_reorder = qsub.add_parser("reorder", help="Reorder a pane's queue to match the given ids")
+    q_reorder.add_argument("ids", nargs="+", type=_queue_number, help="Queue ids in the desired order, optionally followed by the source pane id")
+    _queue_common(q_reorder)
+
+    q_cancel = qsub.add_parser("cancel", help="Cancel by id (`cancel <id> [pane]`), or with --all/--position (`cancel [pane] --all`)")
+    q_cancel.add_argument("first", nargs="?", help="Queue id; with --all/--position this is the pane instead")
+    q_cancel.add_argument("second", nargs="?", help="Agent pane id (id cancel only)")
+    q_cancel.add_argument("--all", action="store_true", help="Cancel every queued item on the pane")
+    q_cancel.add_argument("--position", type=_queue_number, help="Cancel the item at this 1-based slot")
+    _queue_common(q_cancel)
+    p_q.set_defaults(func=cmd_queue)
 
     p_stop = sub.add_parser("stop", help="Close worker pane and terminate process via `cx.agents:stop`")
     _add_pane_args(p_stop)

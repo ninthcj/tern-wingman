@@ -818,9 +818,9 @@ local function living_files(f: Frame, budget_left: number): Section
 		agent_lines += if r.state == "idle" and r.fault == nil and r.queued == 0 then 1 else 3
 	end
 	local feed_lines = 0
-	for _, id in f.tool_ids do
-		local t = f.tools[id]
-		if t and by_pane[t.pane] ~= nil then
+	for _, id in tools.ids do
+		local t = tools.by_id[id]
+		if t and f.by_pane[t.pane] ~= nil then
 			feed_lines += 1
 			if feed_lines >= max_feed then
 				break
