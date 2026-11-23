@@ -6,6 +6,7 @@ All notable changes to `tern-wingman` are documented in this file.
 
 ### Added
 - **Standalone Workbench:** Wingman Live now gives any Tern agent, bound or unbound, PiP, Park, and an editable task queue. **Wingman: Queue Prompt for Agent** sends or queues a prompt using Tern’s native picker/input. Queue rows support Top, Edit, and Cancel by stable ID; shell queue commands can select the tab’s sole unowned live agent.
+- **Live Panel open by default:** Wingman Live opens automatically (unfocused) whenever a live agent is present, and remembers your open/closed preference in `radar_v1` once you close or reopen it.
 
 ## [0.7.0] - 2026-11-23
 

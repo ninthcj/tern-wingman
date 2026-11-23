@@ -157,6 +157,7 @@ local widget_sig = ""
 
 -- Panel state.
 local panel_pane: number? = nil
+local auto_open = true
 local scope: Scope = "tab"
 local placement: Placement = "right"
 local corner: Corner = "br"
@@ -1245,6 +1246,7 @@ end
 save_prefs = function()
 	pcall(function()
 		tern.kv.set(KV_RADAR, {
+			open = auto_open,
 			scope = scope,
 			placement = placement,
 			corner = corner,
@@ -1434,6 +1436,23 @@ local function open_panel(cx: WindowCx, b: Bridge)
 	arm_tick()
 end
 
+local function has_live_agent(): boolean
+	for _, st in states do
+		if st ~= "exited" then
+			return true
+		end
+	end
+	return false
+end
+
+local function maybe_auto_open(cx: WindowCx)
+	local b = bridge
+	if not auto_open or shutting_down or panel_pane ~= nil or b == nil or not has_live_agent() then
+		return
+	end
+	open_panel(cx, b)
+end
+
 local function toggle(cx: WindowCx)
 	local b = bridge
 	if b == nil then
@@ -1442,6 +1461,8 @@ local function toggle(cx: WindowCx)
 	adopt(cx)
 	local pane = panel_pane
 	if pane ~= nil then
+		auto_open = false
+		save_prefs()
 		forget_panel()
 		pcall(function()
 			cx.layout:close(pane)
@@ -1451,6 +1472,8 @@ local function toggle(cx: WindowCx)
 		end
 		return
 	end
+	auto_open = true
+	save_prefs()
 	open_panel(cx, b)
 end
 
@@ -1778,6 +1801,9 @@ local function seed(cx: WindowCx)
 		refresh_widget(widget)
 	end
 	adopt(cx)
+	if panel_pane == nil then
+		maybe_auto_open(cx)
+	end
 	if panel_pane ~= nil or subagents.config().enabled then
 		render(cx)
 	end
@@ -1821,6 +1847,9 @@ function M.attach(b: Bridge)
 	end
 	local ok_kv, saved = pcall(tern.kv.get, KV_RADAR)
 	if ok_kv and type(saved) == "table" then
+		if type(saved.open) == "boolean" then
+			auto_open = saved.open
+		end
 		if saved.scope == "tab" or saved.scope == "all" then
 			scope = saved.scope
 		end
@@ -1904,6 +1933,9 @@ function M.attach(b: Bridge)
 				end
 				schedule_render()
 			end
+			if ev.new ~= "exited" and panel_pane == nil then
+				maybe_auto_open(cx)
+			end
 			if panel_pane ~= nil then
 				tool_dirty[ev.pane] = true
 			end
@@ -1940,6 +1972,8 @@ function M.attach(b: Bridge)
 	tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 		local ok, err = try(function()
 			if ev.pane == panel_pane then
+				auto_open = false
+				save_prefs()
 				forget_panel()
 				if subagents.config().enabled then
 					schedule_render()
