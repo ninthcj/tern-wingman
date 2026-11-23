@@ -2,7 +2,7 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
-## [Unreleased]
+## [0.8.0] - 2026-11-23
 
 ### Removed
 - **Removed out-of-band `wingman report` CLI/RPC (`op == "report"`, `reported_in_turn`)**: Workers no longer inject mid-turn `progress`/`question` messages into a supervisor's composer while continuing to run (`working`), eliminating state/message desynchronization and queued-reply deadlocks. All upward communication now aligns strictly with Tern's native agent states (`agent_finished` auto-callback on turn end and `waiting_input` surface escalation).
