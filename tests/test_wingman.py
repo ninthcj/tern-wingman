@@ -1212,6 +1212,16 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         proc = subprocess.run([luau, str(fixture)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
 
+    def test_luau_native_ui_fixture(self) -> None:
+        import shutil
+
+        luau = shutil.which("luau")
+        if luau is None:
+            self.skipTest("`luau` runner is not on PATH; cannot execute tests/native_ui_fixture.luau")
+        fixture = ROOT_DIR / "tests" / "native_ui_fixture.luau"
+        proc = subprocess.run([luau, str(fixture)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
     def test_window_luau_ownership_fixture(self) -> None:
         import shutil
 

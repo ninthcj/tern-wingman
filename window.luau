@@ -1063,6 +1063,58 @@ local function queue_source(cx: WindowCx, anchor: number, req: any, id: number?)
 	return select_worker(cx, anchor, req.target_pane, req.cwd)
 end
 
+type Relocation = { id: number, position: number?, dispatched: boolean }
+
+-- The one validated path that moves a queued item (to another slot or pane) and promotes it when the
+-- destination can take it now. `owner` is the supervisor that adopts an unowned destination; nil moves the
+-- item without creating any ownership edge.
+local function relocate_queued(
+	cx: WindowCx,
+	id: number,
+	pane: number,
+	dst: number,
+	to_pos: number?,
+	owner: number?
+): (Relocation?, string?)
+	local destination: AgentBlock? = nil
+	local adopts = false
+	if dst ~= pane then
+		destination = find_agent_info(cx, dst)
+		if not destination or destination.state == "waiting_input" or destination.state == "exited" then
+			return nil, "destination pane is " .. (if destination then destination.state else "not an agent")
+		end
+		adopts = owner ~= nil and state.owner_of_pane(cx, dst) == nil
+		if adopts then
+			local cycle = state.ownership_cycle(owner :: number, dst)
+			if cycle then
+				return nil, cycle
+			end
+		end
+	end
+	local item, err, position = dispatches.move(id, to_pos, dst, pane)
+	if not item then
+		return nil, err
+	end
+	local dispatched = false
+	if destination then
+		if adopts then
+			state.bind_wingman(owner :: number, dst)
+		end
+		if destination.state == "idle" and not has_pending_dispatch(dst) then
+			dispatched = promote_next_queued(cx, dst) == item.id
+			if not dispatched then
+				local _, current_position = dispatches.find(item.id)
+				if not current_position then
+					return nil, "moved queue item could not be dispatched"
+				end
+				position = current_position
+			end
+		end
+	end
+	ensure_watchdog()
+	return { id = item.id, position = position, dispatched = dispatched }, nil
+end
+
 local function queue_request(cx: WindowCx, anchor: number?, req: any): any
 	if not anchor then
 		return { ok = false, error = "missing anchor_pane" }
@@ -1156,39 +1208,20 @@ local function queue_request(cx: WindowCx, anchor: number?, req: any): any
 	if not dst or (supplied(req.to_pos) and not to_pos) then
 		return { ok = false, error = "destination pane and position must be positive integers" }
 	end
-	local destination: AgentBlock? = nil
 	if dst ~= pane then
 		local err = queue_access(cx, anchor, dst)
 		if err then
 			return { ok = false, error = err }
 		end
-		destination = find_agent_info(cx, dst)
-		if not destination or destination.state == "waiting_input" or destination.state == "exited" then
-			return { ok = false, error = "destination pane is " .. (if destination then destination.state else "not an agent") }
-		end
 	end
-	local item, err, position = dispatches.move(id :: number, to_pos, dst, pane)
-	if not item then
-		return { ok = false, error = err }
+	local moved, move_error = relocate_queued(cx, id :: number, pane, dst, to_pos, anchor)
+	if not moved then
+		return { ok = false, error = move_error }
 	end
-	local dispatched = false
-	if destination then
-		if state.owner_of_pane(cx, dst) == nil then
-			state.bind_wingman(anchor, dst)
-		end
-		if destination.state == "idle" and not has_pending_dispatch(dst) then
-			dispatched = promote_next_queued(cx, dst) == item.id
-			if not dispatched then
-				local _, current_position = dispatches.find(item.id)
-				if not current_position then
-					return { ok = false, error = "moved queue item could not be dispatched", id = item.id, pane = dst }
-				end
-				position = current_position
-			end
-		end
-	end
-	ensure_watchdog()
-	return { ok = true, id = item.id, from_pane = pane, to_pane = dst, pane = dst, position = position, dispatched = dispatched }
+	return {
+		ok = true, id = moved.id, from_pane = pane, to_pane = dst, pane = dst,
+		position = moved.position, dispatched = moved.dispatched,
+	}
 end
 
 local TARGETED_OPS = {
@@ -1891,6 +1924,35 @@ local function enqueue_prompt(cx: WindowCx, pane: number, prompt: string): (bool
 	return true, nil, false
 end
 
+-- Every queued prompt on a live pane, sorted by pane then slot.
+local function all_queued(cx: WindowCx): { Queue.Snapshot }
+	local live: { number } = {}
+	for _, pane in dispatches.panes() do
+		if cx.session:pane(pane) ~= nil then
+			table.insert(live, pane)
+		end
+	end
+	return dispatches.list_panes(live)
+end
+
+-- A user's explicit move from the panel. The window is the authority here, so no anchor pane is needed; the
+-- shared relocation adopts an unowned destination only for an owned source, and never invents an owner
+-- for a queue nobody owns.
+local function move_queued(cx: WindowCx, id: number, to_pane: number): (boolean, string?, boolean?)
+	local pane = dispatches.find(id)
+	if pane == nil then
+		return false, "queue item " .. id .. " is no longer queued"
+	elseif pane == to_pane then
+		return false, "queue item is already on pane " .. pane
+	end
+	local moved, err = relocate_queued(cx, id, pane, to_pane, nil, state.owner_of_pane(cx, pane))
+	if not moved then
+		return false, err
+	end
+	notify_radar()
+	return true, nil, moved.dispatched
+end
+
 local function mutate_queued(action: "edit" | "top" | "cancel", id: number, prompt: string?): (boolean, string?)
 	local item: Queue.Item?
 	local err: string?
@@ -1921,6 +1983,8 @@ end
 if radar_loaded then
 	local ok_attach, err_attach = pcall(function(): any
 		radar.attach({
+			all_queued = all_queued,
+			move_queued = move_queued,
 			owners = state.owners,
 			can_pip = can_pip,
 			queue_items = function(pane: number): { Queue.Compact }

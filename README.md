@@ -102,6 +102,10 @@ Toggle it from the palette (**Wingman: Toggle Live Panel**) or add the **Wingman
 - **Activity** — each working agent's card shows its current tool and a loom strip of recent calls colored by kind (read / search / edit / run / error, the running one pulsing), with strip length and recent-call feed count adapting dynamically to the panel's width/height share (`cx.agents:transcript`, for `omp` and ACP panes alike).
 - **Stage & dock** — working / waiting / queued / fault tiles under a glow that follows the agents' mood, *Tab* / *All* scope (persisted), *Open Git*, *Clear reads*, and a health dot whose tooltip shows the panel's measured cost per render.
 
+### Switch / Search Agents, Manage Queue & Files
+
+**Wingman: Switch / Search Agents** searches all live agents in the window and restores parked agents before focusing them. **Wingman: Search / Manage Queue** searches pending tasks, then offers actions to reorder, edit, move, cancel, or focus the agent. The Files pane’s **Send selection to Agent** button prefills a prompt with selected paths (or the folder when nothing is selected). Tern’s **Plugin segments** widget shows fault, waiting, queue, and callback indicators only for the focused agent; clicking opens Wingman Live or queue management.
+
 ### Subagent Panes (opt-in)
 
 Off by default. Use **Wingman: Toggle Subagent Panes** and **Wingman: Cycle Subagent Pane Limit** in the command palette, or the Subagents controls in the Live Panel dock. The per-window limit cycles **3 → 2 → 4 → Unlimited → 1**. Working subagents pop out below their parent without taking focus after 1.5 s of activity. Finished panes linger for 20 s; new tasks can reuse unpinned slots in place. **Pin** preserves a pane and counts toward the limit, **+N more** cycles hidden tasks, and **Close** dismisses the current task.

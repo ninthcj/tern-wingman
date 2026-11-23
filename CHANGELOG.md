@@ -5,6 +5,7 @@ All notable changes to `tern-wingman` are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Native agent switching & queue management:** **Switch / Search Agents** across the window, a two-step **Search / Manage Queue** flow, and **Send selection to Agent** in the Files pane header (prefills path context). Tern's existing Plugins segments widget stays focus-only, showing fault / waiting / queue / callback.
 - **Standalone Workbench:** Wingman Live now gives any Tern agent, bound or unbound, PiP, Park, and an editable task queue. **Wingman: Queue Prompt for Agent** sends or queues a prompt using Tern’s native picker/input. Queue rows support Top, Edit, and Cancel by stable ID; shell queue commands can select the tab’s sole unowned live agent.
 - **Live Panel open by default:** Wingman Live opens automatically (unfocused) whenever a live agent is present, and remembers your open/closed preference in `radar_v1` once you close or reopen it.
 

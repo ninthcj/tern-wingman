@@ -354,3 +354,47 @@ local sync_cid = request_id
 assert(sync._ack and sync.queued)
 assert(radar_bridge.cancel_queued_id(sync.queue_id))
 assert(replies[sync_cid].reply.status == "cancelled" and not replies[sync_cid].keep_open)
+
+-- The panel's native queue view and move: live panes only, sorted, through the shared validated relocation.
+start()
+local busy_two = { pane = 2, cwd = "/work", state = "working" }
+local target_three = { pane = 3, cwd = "/work", state = "idle" }
+local busy_four = { pane = 4, cwd = "/work", state = "working" }
+agents = { busy_two, target_three, busy_four }
+local _, _, _, four_id = radar_bridge.enqueue_prompt(cx, 4, "four")
+local _, _, _, two_a = radar_bridge.enqueue_prompt(cx, 2, "two a")
+local _, _, _, two_b = radar_bridge.enqueue_prompt(cx, 2, "two b")
+local overview = radar_bridge.all_queued(cx)
+assert(#overview == 3 and overview[1].id == two_a and overview[1].pane == 2 and overview[1].position == 1)
+assert(overview[2].id == two_b and overview[2].position == 2 and overview[3].id == four_id and overview[3].pane == 4)
+panes[4] = nil
+assert(#radar_bridge.all_queued(cx) == 2 and radar_bridge.all_queued(cx)[2].id == two_b)
+panes[4] = { pane = 4, tab = 42, cwd = "/work" }
+
+local before_native = #effects
+local before_notice = notifications
+target_three.state = "waiting_input"
+local native_ok, native_err = radar_bridge.move_queued(cx, two_a, 3)
+assert(not native_ok and string.find(native_err, "waiting_input", 1, true))
+target_three.state = "exited"
+assert(not radar_bridge.move_queued(cx, two_a, 3))
+assert(not radar_bridge.move_queued(cx, two_a, 2) and not radar_bridge.move_queued(cx, 9999, 3))
+assert(#effects == before_native and #radar_bridge.queue_items(2) == 2 and notifications == before_notice)
+target_three.state = "working"
+local deferred_ok, _, deferred = radar_bridge.move_queued(cx, two_a, 3)
+assert(deferred_ok and deferred == false and #effects == before_native and radar_bridge.queue_items(3)[1].id == two_a)
+assert(notifications > before_notice)
+assert(radar_bridge.cancel_queued_id(two_a) and #radar_bridge.queue_items(3) == 0)
+target_three.state = "idle"
+local immediate_ok, immediate_err, immediate = radar_bridge.move_queued(cx, two_b, 3)
+assert(immediate_ok and immediate_err == nil and immediate == true)
+assert(effects[before_native + 1].target == 3 and effects[before_native + 1].prompt == "two b")
+assert(rpc("status", 3).owner_pane == nil and (store.owners_v1 == nil or next(store.owners_v1) == nil),
+    "moving an unowned queue must not create an ownership edge")
+
+-- An owned queue keeps its supervisor: the unowned destination is adopted by that same owner.
+start({ owners_v1 = { ["2"] = 1 } })
+agents = { busy_two, target_three }
+target_three.state = "idle"
+local _, _, _, owned_item = radar_bridge.enqueue_prompt(cx, 2, "owned")
+assert(radar_bridge.move_queued(cx, owned_item, 3) and rpc("status", 3).owner_pane == 1)
