@@ -6,7 +6,7 @@
 -- Budget (tern.d.luau): every window-half call may run 50 ms of Lua (native calls — `cx.*`, `tern.ui`, `tern.json` —
 -- excluded) and ten budgets of wall time; past either, Tern pauses that hook for 5 s, doubling to 5 min, and every
 -- timer callback shares one hook with wingman's watchdog. So the radar bounds itself:
---   * Panel closed: event handlers keep O(1) per-agent state for the widget. No timer, no transcript, no git.
+--   * Both views disabled or closed: event handlers only. Popouts alone sample working parents without git or a panel render.
 --   * Panel open: event-driven renders coalesce into one timer; a tick runs only while an in-scope agent works, spaced
 --     so the radar's average share of the window thread stays under MAX_DUTY.
 --   * Each render times its Lua and native parts. Past SAFE_MS of Lua (or SAFE_WALL_MS of wall time) the next renders
@@ -17,6 +17,8 @@
 
 local tsp = require("./tsp")
 local view = require("./radar_view")
+local Subagents = require("./subagents")
+local subagent_view = require("./subagents_view")
 
 -- The panel's placement: right sidebar share adapts to the user's last dragged width (default 24% of tab),
 -- and floating size scales dynamically against the pane it floats over rather than fixed cell counts.
@@ -64,7 +66,7 @@ local ABOUT = "Live view of this window's coding agents (omp and ACP) and their 
 	.. "and Unpark brings it into the current tab; Interrupt sends "
 	.. "Ctrl-C to that agent's turn; Retry sends /retry to a stalled agent; Unqueue cancels prompts queued for it. "
 	.. "Clicking a file opens it beside; Open Git opens the git block; Clear Reads hides read/search touches; Tab/All "
-	.. "picks which agents show. Nothing runs on its own."
+	.. "picks which agents show. Popouts toggles automatic Subagent Panes; its limit button cycles capacity."
 
 local BUDGET_MS = 50 -- window-half Lua budget per call (tern.d.luau)
 local SAFE_MS = BUDGET_MS * 0.2 -- the radar's share of any one call's Lua time
@@ -152,6 +154,13 @@ local next_hue = 0
 local render_armed = false
 local tick_handle: TimerHandle? = nil
 local catchup_handle: TimerHandle? = nil
+local expiry_handle: TimerHandle? = nil
+local expiry_at: number? = nil
+local shutting_down = false
+local seeded = false
+local KV_SUBAGENTS = "subagent_panes_v1"
+local subagents = Subagents.new(nil)
+local terminal_subagents: { [number]: "done" | "error" } = {}
 local any_working = false
 local primary_root: string? = nil
 local cwd_of: { [number]: string } = {}
@@ -591,27 +600,47 @@ local function trip(reason: string, ms: number?)
 	tern.log.warn(string.format("wingman radar: %s; transcript sampling paused for %ds", reason, math.floor(pause_ms / 1000)))
 end
 
+local sample_start = 1
+
 -- Samples the transcripts that may have changed; stops once the render since `t0` nears SAFE_MS of Lua time.
-local function sample(cx: WindowCx, rows: { Row }, t0: number)
-	for _, r in rows do
-		local cold = window_ids[r.pane] == nil
-		if cold or tool_dirty[r.pane] or r.state == "working" then
+local function sample(cx: WindowCx, rows: { Row }, t0: number, full: boolean, popouts: boolean)
+	for offset = 0, #rows - 1 do
+		local index = (sample_start - 1 + offset) % #rows + 1
+		local r = rows[index]
+		local cold = sample_last[r.pane] == nil
+		if (full and window_ids[r.pane] == nil) or tool_dirty[r.pane] or r.state == "working" then
 			local n0 = tern.now()
 			local ok, msgs = pcall(function(): { AgentMessage }
 				return cx.agents:transcript(r.pane, { last = if cold then COLD_MSGS else sample_last[r.pane] or WARM_MSGS })
 			end)
 			native_ms += tern.now() - n0
 			if ok then
-				ingest(r.pane, msgs, tern.now(), cold)
+				local now = tern.now()
+				if full then
+					ingest(r.pane, msgs, now, window_ids[r.pane] == nil)
+				end
+				if popouts then
+					local hue = hue_of[r.pane]
+					if hue == nil then
+						hue = next_hue % 6
+						hue_of[r.pane], next_hue = hue, next_hue + 1
+					end
+					local depth = subagents.observe(r.pane, r.title, hue, msgs, now)
+					if not full then
+						sample_last[r.pane] = math.clamp(depth + WARM_MSGS, WARM_MSGS, MAX_MSGS)
+					end
+				end
 				tool_dirty[r.pane] = nil
 			end
 			local wall = tern.now() - t0
 			if wall - native_ms > SAFE_MS or wall > SAFE_WALL_MS then
+				sample_start = index % #rows + 1
 				trip(string.format("sampling took %.1f ms Lua, %.1f ms wall", wall - native_ms, wall))
 				return
 			end
 		end
 	end
+	sample_start = 1
 end
 
 local schedule_render: () -> ()
@@ -741,11 +770,107 @@ local function kick_git(cx: WindowCx, rows: { Row }): { string }
 end
 
 local shares_of: (cx: WindowCx, pane: number) -> (number?, number?)
+
+local SUBAGENT_TITLE = "Wingman Subagent"
+local SUBAGENT_ABOUT = "Wingman subagent activity. Parent focuses its agent; Pin preserves the pane; Close dismisses the task; More cycles pending tasks."
+
+local function subagent_driver(cx: WindowCx, now: number): Subagents.Driver
+	return {
+		open = function(record, previous, unlimited, overflow)
+			local n0 = tern.now()
+			if previous ~= nil and cx.session:pane(previous) ~= nil
+				and cx.session:tab_of(previous) ~= cx.session:tab_of(record.parent_pane) then
+				previous = nil
+			end
+			local share = shares_of(cx, previous or record.parent_pane)
+			native_ms += tern.now() - n0
+			-- A pane created in this hook may not be in the tab replica until the next hook.
+			if share == nil then
+				return nil
+			end
+			local target, dir, ratio = Subagents.placement(record.parent_pane, previous, share, unlimited)
+			local page, dock = subagent_view.render(record, false, overflow, now)
+			local opened_at = tern.now()
+			local ok, pane, err = pcall(function(): (number?, string?)
+				return cx.canvas:open({ title = SUBAGENT_TITLE, about = SUBAGENT_ABOUT, view = page, dock = dock,
+					how = "beside", target = target, dir = dir :: Dir, ratio = ratio, focus = false })
+			end)
+			native_ms += tern.now() - opened_at
+			if not ok or pane == nil then
+				log_once("subagent open", if ok then err else pane)
+				return nil
+			end
+			return pane
+		end,
+		update = function(pane, record, pinned, overflow)
+			local page, dock = subagent_view.render(record, pinned, overflow, now)
+			local n0 = tern.now()
+			local ok, err = try(function()
+				cx.canvas:set(pane, { view = page, dock = dock })
+			end)
+			if not ok and cx.canvas:get(pane) ~= nil then
+				log_once("subagent update", err)
+			end
+			native_ms += tern.now() - n0
+			return ok
+		end,
+		close = function(pane)
+			local n0 = tern.now()
+			local ok, err = try(function() cx.layout:close(pane) end)
+			native_ms += tern.now() - n0
+			if not ok then
+				log_once("subagent close", err)
+			end
+		end,
+		focus = function(parent)
+			local ok, err = try(function()
+				if cx.session:pane(parent) ~= nil then
+					cx.layout:focus(parent)
+				end
+			end)
+			if not ok then
+				log_once("subagent parent focus", err)
+			end
+		end,
+	}
+end
+
+local function close_subagent_canvases(cx: WindowCx)
+	local driver = subagent_driver(cx, tern.now())
+	for _, info in cx.canvas:list() do
+		if info.owner == tern.plugin.id and info.title == SUBAGENT_TITLE and info.about == SUBAGENT_ABOUT then
+			driver.close(info.pane)
+		end
+	end
+end
+
+local function sync_subagents(cx: WindowCx, rows: { Row }, t0: number, enabled: boolean): boolean
+	local now = tern.now()
+	for pane, result in terminal_subagents do
+		if states[pane] ~= "working" then
+			subagents.finish_parent(pane, result :: ("done" | "error"), now)
+		end
+		terminal_subagents[pane] = nil
+	end
+	local eligible: { [number]: boolean } = {}
+	if enabled and mode == "rich" then
+		for _, row in rows do
+			if row.state == "working" and row.tab ~= nil and not row.parked and not row.floating then
+				eligible[row.pane] = true
+			end
+		end
+	end
+	return subagents.reconcile(now, eligible, subagent_driver(cx, now), function()
+		local wall = tern.now() - t0
+		return wall - native_ms >= SAFE_MS or wall >= SAFE_WALL_MS
+	end)
+end
+
 local save_prefs: () -> ()
 
 -- Collects, samples, starts git reads and builds the view within `node_cap` nodes; `phases` gets each step's
 -- "wall/native" ms.
-local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }): (Node, Node, number, number)
+local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }): (Node, Node, number, number, { Row })
 	local t, nat = t0, native_ms
 	local function lap(name: string)
 		local now = tern.now()
@@ -764,7 +889,7 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 		mode = "rich"
 	end
 	if mode == "rich" then
-		sample(cx, rows, t0)
+		sample(cx, rows, t0, true, subagents.config().enabled)
 	end
 	lap("sample")
 	local roots = kick_git(cx, rows)
@@ -842,6 +967,8 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 			last_phases = last_phases,
 			budget_ms = BUDGET_MS,
 			safe_ms = SAFE_MS,
+			subagents_enabled = subagents.config().enabled,
+			subagent_limit = subagents.config().limit,
 		})
 		return page, dock, view.count_nodes(page) + view.count_nodes(dock)
 	end
@@ -859,7 +986,7 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 		native_ms += tern.now() - n1
 	end
 	lap("encode")
-	return page, dock, nodes, bytes
+	return page, dock, nodes, bytes, rows
 end
 
 local function cancel_timers()
@@ -880,7 +1007,10 @@ local function forget_panel()
 	panel_pane = nil
 	render_armed = false
 	cancel_timers()
-	tools, tool_ids, window_ids, sample_last, tool_dirty, cleared = {}, {}, {}, {}, {}, {}
+	tools, tool_ids, window_ids, cleared = {}, {}, {}, {}
+	if not subagents.config().enabled then
+		sample_last, tool_dirty = {}, {}
+	end
 	any_working = false
 end
 
@@ -926,11 +1056,46 @@ end
 
 local render: (cx: WindowCx) -> ()
 
-local function arm_tick()
-	if tick_handle ~= nil or panel_pane == nil or not any_working then
+local reconcile_pending = false
+
+local function arm_expiry(deferred: boolean?)
+	local now = tern.now()
+	reconcile_pending = deferred == true
+	local deadline = subagents.next_expiry()
+	if reconcile_pending then
+		deadline = math.min(deadline or math.huge, now + TICK_MIN_MS)
+	end
+	if deadline == expiry_at and not deferred then
 		return
 	end
-	tick_handle = tern.timer(math.max(TICK_MIN_MS, last_wall / MAX_DUTY), function(later: WindowCx?)
+	if expiry_handle ~= nil then
+		expiry_handle:cancel()
+		expiry_handle = nil
+	end
+	expiry_at = deadline
+	if deadline ~= nil then
+		expiry_handle = tern.timer(math.max(if deferred then TICK_MIN_MS else 0, deadline - now), function(cx: WindowCx?)
+			expiry_handle, expiry_at = nil, nil
+			if cx ~= nil then
+				render(cx)
+			end
+		end)
+	end
+end
+
+local function arm_tick()
+	if not any_working then
+		if tick_handle ~= nil then
+			tick_handle:cancel()
+			tick_handle = nil
+		end
+		return
+	end
+	if tick_handle ~= nil or (panel_pane == nil and not subagents.config().enabled) then
+		return
+	end
+	local cooldown = if panel_pane == nil and mode == "lite" then lite_until - tern.now() else 0
+	tick_handle = tern.timer(math.max(TICK_MIN_MS, last_wall / MAX_DUTY, cooldown), function(later: WindowCx?)
 		tick_handle = nil
 		if later ~= nil then
 			render(later)
@@ -941,41 +1106,68 @@ end
 render = function(cx: WindowCx)
 	local b = bridge
 	local pane = panel_pane
-	if b == nil or pane == nil then
+	local popouts = subagents.config().enabled
+	if shutting_down or b == nil or (pane == nil and not popouts and not reconcile_pending) then
 		return
 	end
-	local sig_ok, sig = pcall(placement_sig, cx, b)
-	if sig_ok then
-		placement_last = sig
+	if pane ~= nil then
+		local sig_ok, sig = pcall(placement_sig, cx, b)
+		if sig_ok then
+			placement_last = sig
+		end
 	end
 	local ok, err = try(function()
 		native_ms = 0
-		local phases: { string } = {}
 		local t0 = tern.now()
-		local page, dock, nodes, bytes = compose(cx, b, t0, phases)
-		local n0 = tern.now()
-		cx.canvas:set(pane, { view = page, dock = dock })
-		local set_ms = tern.now() - n0
-		native_ms += set_ms
-		table.insert(phases, string.format("set %.1f", set_ms))
-		adapt(tern.now() - t0, nodes, bytes, phases)
+		local rows: { Row }
+		if pane ~= nil then
+			local phases: { string } = {}
+			local page, dock, nodes, bytes, panel_rows = compose(cx, b, t0, phases)
+			rows = panel_rows
+			local n0 = tern.now()
+			cx.canvas:set(pane, { view = page, dock = dock })
+			local set_ms = tern.now() - n0
+			native_ms += set_ms
+			table.insert(phases, string.format("set %.1f", set_ms))
+			adapt(tern.now() - t0, nodes, bytes, phases)
+		else
+			rows = collect(cx, b)
+			any_working = false
+			for _, row in rows do
+				if row.state == "working" then
+					any_working = true
+					break
+				end
+			end
+			if mode == "lite" and t0 >= lite_until then
+				mode = "rich"
+			end
+			if popouts and mode == "rich" then
+				sample(cx, rows, t0, false, true)
+			end
+		end
+		if popouts or reconcile_pending then
+			arm_expiry(sync_subagents(cx, rows, t0, popouts))
+		end
+		if pane == nil then
+			last_wall = tern.now() - t0
+		end
 	end)
 	if not ok then
-		if cx.canvas:get(pane) == nil then
-			-- Not in this window's replica: a canvas opened earlier in this same call (a re-dock) shows up in the
-			-- next one. A closed panel is dropped by `pane_closed`, which also stops this retry.
+		if pane ~= nil and cx.canvas:get(pane) == nil then
+			-- A newly opened panel may only appear in the next window replica.
 			if panel_pane == pane then
 				schedule_render()
 			end
-			return
+		else
+			log_once("render", err)
 		end
-		log_once("render", err)
 	end
 	arm_tick()
 end
 
 schedule_render = function()
-	if panel_pane == nil or render_armed then
+	if shutting_down or render_armed or (panel_pane == nil and not subagents.config().enabled) then
 		return
 	end
 	render_armed = true
@@ -1235,6 +1427,9 @@ local function toggle(cx: WindowCx)
 		pcall(function()
 			cx.layout:close(pane)
 		end)
+		if subagents.config().enabled then
+			schedule_render()
+		end
 		return
 	end
 	open_panel(cx, b)
@@ -1261,6 +1456,31 @@ local function place(cx: WindowCx, b: Bridge, want: Placement)
 		end)
 		open_panel(cx, b)
 	end
+end
+
+local function configure_subagents(cx: WindowCx, cycle: boolean)
+	if cycle then
+		subagents.cycle_limit()
+	else
+		subagents.toggle()
+	end
+	local config = subagents.config()
+	local ok, err = try(function() tern.kv.set(KV_SUBAGENTS, config) end)
+	if not ok then
+		log_once("save subagent preferences", err)
+	end
+	local limit = if config.limit == 0 then "Unlimited" else tostring(config.limit)
+	cx:toast("info", "Wingman: Subagent Panes " .. (if config.enabled then "on" else "off"), "Limit: " .. limit)
+	native_ms = 0
+	local now = tern.now()
+	if not config.enabled then
+		any_working = false
+		arm_tick()
+		if panel_pane == nil then
+			sample_last, tool_dirty = {}, {}
+		end
+	end
+	arm_expiry(sync_subagents(cx, {}, now, false))
 end
 
 local function handle_action(ev: CanvasAction, cx: WindowCx, b: Bridge)
@@ -1313,6 +1533,8 @@ local function handle_action(ev: CanvasAction, cx: WindowCx, b: Bridge)
 		save_prefs()
 	elseif act == "place" and want ~= nil then
 		place(cx, b, want)
+	elseif act == "subagent_toggle" or act == "subagent_limit" then
+		configure_subagents(cx, act == "subagent_limit")
 	elseif act == "git" then
 		local root = primary_root
 		if root == nil then
@@ -1336,9 +1558,19 @@ local function handle_action(ev: CanvasAction, cx: WindowCx, b: Bridge)
 end
 
 local function on_canvas_action(ev: CanvasAction, cx: WindowCx): boolean
-	-- `title` is optional on the event: without one, the panel's pane identifies it.
+	if shutting_down or ev.owner ~= tern.plugin.id then
+		return false
+	end
+	local now = tern.now()
+	if subagents.action(ev.pane, ev.act, now, subagent_driver(cx, now)) then
+		arm_expiry()
+		if ev.act == "pin" and subagents.config().enabled then
+			schedule_render()
+		end
+		return true
+	end
 	local ours = if ev.title ~= nil then ev.title == TITLE else ev.pane == panel_pane
-	if ev.owner ~= tern.plugin.id or not ours then
+	if not ours then
 		return false
 	end
 	local b = bridge
@@ -1361,6 +1593,11 @@ end
 -- Events
 
 local function seed(cx: WindowCx)
+	if seeded then
+		return
+	end
+	seeded = true
+	close_subagent_canvases(cx)
 	for _, a in cx.agents:list() do
 		local info = cx.session:pane(a.pane)
 		if info ~= nil then
@@ -1374,7 +1611,7 @@ local function seed(cx: WindowCx)
 		refresh_widget(widget)
 	end
 	adopt(cx)
-	if panel_pane ~= nil then
+	if panel_pane ~= nil or subagents.config().enabled then
 		render(cx)
 	end
 end
@@ -1392,7 +1629,9 @@ function M.on_state_change()
 	refresh_widget(widget)
 	if panel ~= change_sig then
 		change_sig = panel
-		schedule_render()
+		if panel_pane ~= nil then
+			schedule_render()
+		end
 	elseif panel_pane ~= nil then
 		-- Layout-only operations (pip, dock, park, unpark, tab moves) change no signature above and raise no native
 		-- event of their own; the open panel re-reads placements, throttled to the tick's spacing.
@@ -1408,6 +1647,11 @@ function M.attach(b: Bridge)
 	end
 	bridge = b
 	pcall(tern.css, "radar", view.CSS)
+	pcall(tern.css, "subagent-panes", subagent_view.CSS)
+	local loaded, popout_prefs = pcall(tern.kv.get, KV_SUBAGENTS)
+	if loaded then
+		subagents = Subagents.new(popout_prefs)
+	end
 	local ok_kv, saved = pcall(tern.kv.get, KV_RADAR)
 	if ok_kv and type(saved) == "table" then
 		if saved.scope == "tab" or saved.scope == "all" then
@@ -1438,6 +1682,20 @@ function M.attach(b: Bridge)
 			end
 		end,
 	})
+	for _, option in {
+		{ id = "toggle_subagent_panes", title = "Wingman: Toggle Subagent Panes", cycle = false },
+		{ id = "cycle_subagent_limit", title = "Wingman: Cycle Subagent Pane Limit", cycle = true },
+	} do
+		tern.command({ id = option.id, title = option.title, icon = "layers", run = function(cx: WindowCx)
+			local ok, err = try(function()
+				configure_subagents(cx, option.cycle)
+				render(cx)
+			end)
+			if not ok then
+				log_once("subagent preferences", err)
+			end
+		end })
+	end
 
 	tern.chrome.widget(WIDGET, {
 		name = "Wingman",
@@ -1472,6 +1730,13 @@ function M.attach(b: Bridge)
 			if ev.new == "working" then
 				finished[ev.pane] = nil
 			end
+			if subagents.config().enabled then
+				tool_dirty[ev.pane] = true
+				if ev.new == "idle" or ev.new == "exited" then
+					terminal_subagents[ev.pane] = if ev.new == "exited" or finished[ev.pane] == "failed" then "error" else "done"
+				end
+				schedule_render()
+			end
 			if panel_pane ~= nil then
 				tool_dirty[ev.pane] = true
 			end
@@ -1488,6 +1753,11 @@ function M.attach(b: Bridge)
 				return
 			end
 			finished[ev.pane] = ev.result
+			if subagents.config().enabled then
+				tool_dirty[ev.pane] = true
+				terminal_subagents[ev.pane] = if ev.result == "done" then "done" else "error"
+				schedule_render()
+			end
 			if panel_pane ~= nil then
 				tool_dirty[ev.pane] = true
 				mark_git_dirty(ev.pane)
@@ -1500,13 +1770,26 @@ function M.attach(b: Bridge)
 		end
 	end)
 
-	tern.on("pane_closed", function(ev: PaneEvent, _cx: WindowCx)
+	tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 		local ok, err = try(function()
 			if ev.pane == panel_pane then
 				forget_panel()
+				if subagents.config().enabled then
+					schedule_render()
+				end
+				return
+			end
+			if subagents.pane_closed(ev.pane) then
+				arm_expiry()
 				return
 			end
 			if states[ev.pane] ~= nil then
+				terminal_subagents[ev.pane] = nil
+				subagents.parent_closed(ev.pane, subagent_driver(cx, tern.now()))
+				arm_expiry()
+				if subagents.config().enabled then
+					schedule_render()
+				end
 				forget_agent(ev.pane)
 				M.on_state_change()
 			end
@@ -1521,6 +1804,13 @@ function M.attach(b: Bridge)
 			local ok, err = try(schedule_render)
 			if not ok then
 				log_once("focus", err)
+			end
+		elseif subagents.config().enabled then
+			for _, state in states do
+				if state == "working" then
+					schedule_render()
+					break
+				end
 			end
 		end
 	end)
@@ -1557,8 +1847,18 @@ function M.attach(b: Bridge)
 		end
 	end)
 
-	tern.on("unload", function()
+	tern.on("unload", function(cx: WindowCx?)
+		shutting_down = true
 		cancel_timers()
+		if expiry_handle ~= nil then
+			expiry_handle:cancel()
+		end
+		if cx ~= nil then
+			local ok, err = try(function() close_subagent_canvases(cx) end)
+			if not ok then
+				log_once("subagent unload", err)
+			end
+		end
 	end)
 
 	tern.on("window_start", function(cx: WindowCx)

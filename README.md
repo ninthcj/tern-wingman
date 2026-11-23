@@ -52,7 +52,7 @@ sequenceDiagram
     W-->>L: stdout reply + exit status (0=done, 2=waiting_input)
 ```
 
-The Tern plugin is split into six acyclic Luau modules: `window.luau` (RPC, turn and callback orchestration, layouts), `queue.luau` (stable pending-task IDs and per-pane ordering), `state.luau` (ownership and persistent preferences), `tsp.luau` (stateless TSP and surface helpers), `radar.luau` (Live Panel controller and 50 ms budget guard), and `radar_view.luau` (declarative CSS and rendering).
+The Tern plugin uses acyclic Luau modules: `window.luau` for RPC and turn control, `queue.luau` for pending tasks, `state.luau` for ownership and preferences, and `tsp.luau` for transcript helpers. `radar.luau` owns native sampling and the UI budget; `radar_view.luau`, `subagents.luau`, and `subagents_view.luau` keep rendering and popout policy independent of the host.
 
 ## Install
 
@@ -102,7 +102,11 @@ Toggle it from the palette (**Wingman: Toggle Live Panel**) or add the **Wingman
 - **Activity** — each working agent's card shows its current tool and a loom strip of recent calls colored by kind (read / search / edit / run / error, the running one pulsing), with strip length and recent-call feed count adapting dynamically to the panel's width/height share (`cx.agents:transcript`, for `omp` and ACP panes alike).
 - **Stage & dock** — working / waiting / queued / fault tiles under a glow that follows the agents' mood, *Tab* / *All* scope (persisted), *Open Git*, *Clear reads*, and a health dot whose tooltip shows the panel's measured cost per render.
 
-Budget (Tern pauses a window hook whose call runs past 50 ms of Lua, and every timer shares one hook with the wingman watchdog): while closed the panel only keeps per-agent counts for the widget — no timer, transcript or git work. While open it re-renders on agent events and ticks only while an in-scope agent is working, spaced to keep under 2 % of the window thread; `git status` runs once per repository, is never re-issued while pending, and is asked less often the slower it is. Each render times its Lua and native parts; past 10 ms of Lua (or 100 ms wall) it drops transcript sampling ("lite") for a cooldown that doubles like Tern's own pause. It never reads `cx.session:surface` (~20 ms per omp pane).
+### Subagent Panes (opt-in)
+
+Off by default. Use **Wingman: Toggle Subagent Panes** and **Wingman: Cycle Subagent Pane Limit** in the command palette, or the Subagents controls in the Live Panel dock. The per-window limit cycles **3 → 2 → 4 → Unlimited → 1**. Working subagents pop out below their parent without taking focus after 1.5 s of activity. Finished panes linger for 20 s; new tasks can reuse unpinned slots in place. **Pin** preserves a pane and counts toward the limit, **+N more** cycles hidden tasks, and **Close** dismisses the current task.
+
+Budget: Radar and popouts share a single transcript sampler. With the Live Panel closed, enabled popouts sample only while in-scope agents work, with a final event-driven read and a one-shot cleanup for completed panes. No Git work runs for popouts alone. Each render measures Lua and native work and pauses sampling at the existing 10 ms Lua / 100 ms wall safety threshold, below Tern’s 50 ms Lua hook budget.
 
 ## CLI Reference (`wingman.py`)
 

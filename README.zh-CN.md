@@ -57,9 +57,13 @@ ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wing
 - **Activity**：工作中的 Agent 卡片内显示当前工具与色块节拍条（read / search / edit / run / error，进行中的色块脉动），节拍条长度与下方跨 Agent 近期调用条数随面板宽高占比动态调节（数据来自 `cx.agents:transcript`，`omp` 与 ACP pane 通用）。
 - **舞台与 Dock**：随 Agent 状态变色的顶部氛围舞台与 working / waiting / queued / fault 计数格，*Tab* / *All* 作用域（持久化）、*Open Git*、*Clear reads*，以及悬停可见每次渲染实测开销的健康指示点。
 
-插件本身按职责拆分为 5 个无环 Luau 模块：`window.luau`（控制面路由、排队/回推状态机与动态布局）、`state.luau`（`owners_v1` 一对多归属图、`bindings_v1` 迁移与环路检测）、`tsp.luau`（无状态 TSP/surface 工具、ACP `layer` 弹窗提取与 UTF-8 安全截断）、`radar.luau`（Live Panel 控制器与 50 ms 预算守护）及 `radar_view.luau`（纯声明式 CSS 与 UI 渲染器）。
+### Subagent 面板（需手动开启）
 
-预算（Tern 会暂停单次调用 Lua 超过 50 ms 的窗口 hook，且所有定时器与 wingman 看门狗共用一个 hook）：面板关闭时只为组件维护每个 Agent 的计数，无定时器、无 transcript、无 git。打开时随 Agent 事件重绘，仅在作用域内有 Agent 工作时才定时刷新，间隔保证平均占用窗口线程低于 2%；`git status` 按仓库去重、未返回前绝不重发，仓库越慢询问越少。每次渲染分别计时 Lua 与原生调用，Lua 超过 10 ms（或墙钟超过 100 ms）即降级为不采样 transcript 的 lite 模式，冷却期像 Tern 自身暂停一样倍增。从不读取 `cx.session:surface`（omp pane 单次约 20 ms）。
+默认关闭。可在命令面板使用 **Wingman: Toggle Subagent Panes**、**Wingman: Cycle Subagent Pane Limit**，也可通过实时面板底栏控制。窗口级上限按 **3 → 2 → 4 → 不限 → 1** 循环。子代理运行满 1.5 秒后在父 pane 下方打开，不抢焦点；完成后保留 20 秒，新任务可原位复用未固定槽位。**Pin** 保留面板并计入上限，**+N more** 切换溢出任务，**Close** 关闭当前任务且不会自动重开。
+
+插件按职责拆成无环 Luau 模块：`window.luau` 处理 RPC 和轮次，`queue.luau` 管理待派发任务，`state.luau` 管理归属及配置，`tsp.luau` 提供 transcript 工具。`radar.luau` 负责原生采样和 UI 预算；`radar_view.luau`、`subagents.luau` 和 `subagents_view.luau` 将渲染与弹出策略和宿主隔离。
+
+实时面板与子代理面板共用同一套 transcript 采样。实时面板关闭后，仅在作用域内有 Agent 工作时继续采样；结束事件补读一次，已完成面板由一次性定时器清理。只开子代理面板不查询 Git。采样沿用 10 ms Lua / 100 ms 墙钟保护阈值，低于 Tern 的 50 ms Lua hook 预算。
 
 ## 常用命令（`wingman.py`）
 

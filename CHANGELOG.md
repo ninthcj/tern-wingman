@@ -6,6 +6,7 @@ All notable changes to `tern-wingman` are documented in this file.
 
 ### Added
 - Editable pending-task queues with stable IDs: `wingman queue list`, `edit`, `cancel`, `move`, and `reorder`; `send --position`, `unqueue --id`, and per-agent `queuedItems` in `info`.
+- Opt-in **Subagent Panes**: non-focus-stealing canvas strips with a default limit of 3, unlimited wrapping, pinning, and overflow cycling. Radar’s sampler is shared; completed panes expire after a 20-second grace period unless pinned.
 
 ### Fixed
 - Rapid sends queue in Wingman while the first prompt is entering the native agent, so subsequent tasks remain editable.

@@ -141,10 +141,14 @@ local CSS = [==[
 .wr-act[data-lost] { opacity: 0.55; }
 
 /* dock */
-.wr-dock { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.wr-dock { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
 .wr-dock .wr-btn.sf-el { display: flex; align-items: center; gap: 5px; min-height: 0; padding: 3px 9px; border: 0; border-radius: 6px;
 	background-color: transparent; box-shadow: 0 0 0 1px var(--l2); font: 500 11.5px/16px var(--sans); color: var(--t2); cursor: pointer; }
 .wr-dock .wr-btn.sf-el:hover { background-color: var(--l1); color: var(--t1); }
+.wr-dock .wr-btn.wr-quiet.sf-el { padding: 3px 7px; box-shadow: none; font-size: 11px; color: var(--t3); }
+.wr-dock .wr-btn.wr-quiet.sf-el:hover { background-color: var(--l1); color: var(--t1); }
+.wr-dock .wr-btn.wr-quiet.sf-el[data-on] { color: var(--accent); }
+.wr-dock .wr-btn.wr-quiet.sf-el[data-on]:hover { color: var(--accent); }
 .wr-lite { margin-left: auto; padding: 0 6px; border-radius: 4px; font: 600 10px/15px var(--mono); color: var(--warn);
 	background-color: rgb(from var(--warn) r g b / 14%); }
 .wr-health { margin-left: auto; flex: none; width: 7px; height: 7px; border-radius: 4px; background-color: var(--ok); opacity: 0.6; }
@@ -251,6 +255,8 @@ export type DockInfo = {
 	last_phases: string,
 	budget_ms: number,
 	safe_ms: number,
+	subagents_enabled: boolean,
+	subagent_limit: number,
 }
 
 type FileRow = {
@@ -1022,6 +1028,30 @@ local function dock_node(info: DockInfo): Node
 			title = "Hide the read/search touches shown so far",
 		}),
 	}
+	local subs_tip = if info.subagents_enabled
+		then "Subagent panes on: each running subagent gets its own pane. Click to turn off"
+		else "Subagent panes off. Click to show each running subagent in its own pane"
+	local label = if info.subagents_enabled then "Popouts" else "Popouts: Off"
+	table.insert(kids, el("button", "wr-btn wr-quiet", { txt("span", nil, label) }, {
+		actions = { click = "subagent_toggle" },
+		title = subs_tip,
+		attrs = {
+			["aria-label"] = subs_tip,
+			["aria-pressed"] = if info.subagents_enabled then "true" else "false",
+			["data-on"] = if info.subagents_enabled then true else nil,
+		},
+	}))
+	if info.subagents_enabled then
+		local unlimited = info.subagent_limit == 0
+		local limit = if unlimited then "∞" else "≤" .. info.subagent_limit
+		local limit_tip = if unlimited then "Unlimited subagent panes. Click to change"
+			else string.format("At most %d subagent panes in this window (pinned ones count). Click to change", info.subagent_limit)
+		table.insert(kids, el("button", "wr-btn wr-quiet", { txt("span", nil, limit) }, {
+			actions = { click = "subagent_limit" },
+			title = limit_tip,
+			attrs = { ["aria-label"] = limit_tip },
+		}))
+	end
 	if info.mode == "lite" then
 		table.insert(kids, txt("span", "wr-lite", "lite", { title = "Transcript sampling paused: " .. info.lite_reason }))
 	end
@@ -1080,6 +1110,7 @@ end
 return {
 	CSS = CSS,
 	clip = clip,
+	fmt_dur = fmt_dur,
 	count_nodes = count_nodes,
 	topology = topology,
 	living_files = living_files,
