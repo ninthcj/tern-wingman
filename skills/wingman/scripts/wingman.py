@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import contextlib
+import io
 import os
 import re
 import shlex
@@ -743,14 +745,30 @@ def is_caller_tern_agent(status: dict[str, Any], my_pane: int) -> bool:
     return any(int(a["pane"]) == my_pane for a in status.get("agents", []))
 
 
+BUILTIN_AGENT_IDS = ("omp", "claude", "codex", "copilot")
+
+
+def merge_available_agents(custom: Any) -> list[str]:
+    """Builtin ids first (omp, claude, codex, copilot), then validated unique custom ids in reported order."""
+    merged = list(BUILTIN_AGENT_IDS)
+    seen = set(merged)
+    if isinstance(custom, list):
+        for item in custom:
+            raw = item.get("id") if isinstance(item, dict) else item
+            if isinstance(raw, str) and AGENT_ID_RE.fullmatch(raw) and raw not in seen:
+                seen.add(raw)
+                merged.append(raw)
+    return merged
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     omp_bin = find_omp_bin(required=False)
     tern_bin = find_tern_bin()
     ovnfs_bin = find_ovnfs_bin()
     my_pane = current_tern_pane()
     cwd = Path(args.cwd).resolve()
-    bucket = sessions_root() / encode_cwd_bucket(cwd)
-    hosts = get_collab_hosts(omp_bin) if omp_bin else {}
+    skip_sessions = args.no_sessions or args.limit == 0
+    hosts = get_collab_hosts(omp_bin) if omp_bin and not skip_sessions else {}
 
     bridge_status: dict[str, Any] | None = None
     if my_pane is not None:
@@ -763,7 +781,8 @@ def cmd_info(args: argparse.Namespace) -> None:
     pane_files = extract_omp_pane_files(inspect_data)
 
     sessions_out = []
-    if bucket.is_dir():
+    bucket = None if skip_sessions else sessions_root() / encode_cwd_bucket(cwd)
+    if bucket is not None and bucket.is_dir():
         files = sorted(
             (f for f in bucket.glob("*.jsonl") if "__advisor" not in f.name),
             key=lambda f: f.stat().st_mtime,
@@ -831,6 +850,7 @@ def cmd_info(args: argparse.Namespace) -> None:
         "floats": bridge_status.get("floats", []) if bridge_status else [],
         "ternAgents": agents_out,
         "cwd": str(cwd),
+        "availableAgents": merge_available_agents(bridge_status.get("custom_agents") if bridge_status else None),
         "sessions": sessions_out,
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -926,6 +946,50 @@ def validate_agent_options(args: argparse.Namespace, use_tui: bool) -> None:
 
 def cmd_send(args: argparse.Namespace) -> None:
     """Deliver prompt via native Tern TSP `cx.agents` (`wingman` plugin) or headless `-p` fallback."""
+    _run_with_json(args, _send)
+
+
+def _run_with_json(args: argparse.Namespace, body: Callable[[argparse.Namespace, dict[str, Any]], None]) -> None:
+    """Run `body`; with `--json`, keep stdout to one result object (prose becomes `lastMessage`) and exit 0/1/2/124."""
+    res: dict[str, Any] = {}
+    if not getattr(args, "json", False):
+        body(args, res)
+        return
+    buf = io.StringIO()
+    code: Any = 0
+    try:
+        with contextlib.redirect_stdout(buf):
+            body(args, res)
+    except SystemExit as exc:
+        code = exc.code
+    if code is None:
+        code = 0
+    if isinstance(code, str):
+        res.setdefault("status", "error")
+        res.setdefault("error", code.removeprefix("error: "))
+        code = 1
+    elif not isinstance(code, int):
+        code = 1
+    if code not in (0, 2, 124):
+        code = 1
+    last = buf.getvalue().strip()
+    ok = code == 0
+    out: dict[str, Any] = {"ok": ok, "pane": res.get("pane")}
+    if ok and res.get("async"):
+        queued = bool(res.get("queued"))
+        out.update({"async": True, "queued": queued, "position": res.get("position") if queued else 0})
+        if queued:
+            out["queueId"] = res.get("queueId")
+    elif ok:
+        out.update({"async": False, "status": res.get("status", "completed"), "lastMessage": last or None})
+    else:
+        out.update({"status": res.get("status", "failed"), "error": res.get("error") or res.get("status", "failed"), "lastMessage": last or None})
+    print(json.dumps(out, ensure_ascii=False))
+    raise SystemExit(code)
+
+
+def _send(args: argparse.Namespace, res: dict[str, Any]) -> None:
+    """Body of `send`; records outcome fields in `res` for `--json`."""
     my_pane = current_tern_pane()
     use_tui = args.mode == "tui" or (args.mode == "auto" and my_pane is not None)
     explicit_pane, layout, pip_corner = parse_send_options(args, my_pane, use_tui)
@@ -965,6 +1029,7 @@ def cmd_send(args: argparse.Namespace) -> None:
             replace=args.replace,
             cwd_explicit=args.cwd is not None,
         )
+        res["pane"] = target_pane
         use_async_cb = (args.delivery == "async") or (args.delivery == "auto" and is_caller_tern_agent(status, my_pane))
 
         if args.session == "same" and target_pane is None:
@@ -1063,12 +1128,14 @@ def cmd_send(args: argparse.Namespace) -> None:
         try:
             reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT if use_async_cb else timeout_s, on_ack=_on_ack)
         except TimeoutError:
+            res.update(pane=target_pane, status="timeout", error=f"timed out after {args.max_time or DEFAULT_BRIDGE_TIMEOUT} waiting for wingman bridge")
             print(f"[wingman] Timed out after {args.max_time or DEFAULT_BRIDGE_TIMEOUT} waiting for wingman bridge.", file=sys.stderr)
             raise SystemExit(124)
 
         if not reply.get("ok"):
             st = reply.get("status", "failed")
             err = reply.get("error") or st
+            res.update(pane=reply.get("pane", target_pane), status=st, error=err)
             print(f"[wingman] Worker finished with status={st}: {err}", file=sys.stderr)
             if reply.get("last_message"):
                 print(reply["last_message"])
@@ -1076,6 +1143,13 @@ def cmd_send(args: argparse.Namespace) -> None:
 
         if reply.get("async_callback"):
             dispatched_pane = int(reply["pane"])
+            res.update(
+                pane=dispatched_pane,
+                queued=bool(reply.get("queued")),
+                queueId=reply.get("queue_id"),
+                position=int(reply.get("position") or 1) if reply.get("queued") else None,
+                **{"async": True},
+            )
             if reply.get("queued"):
                 pos = int(reply.get("position") or 1)
                 qid = f" id={reply['queue_id']}" if reply.get("queue_id") else ""
@@ -1092,6 +1166,7 @@ def cmd_send(args: argparse.Namespace) -> None:
                 )
             raise SystemExit(0)
 
+        res.update(**{"async": False, "status": reply.get("status") or "completed"})
         if reply.get("last_message"):
             print(reply["last_message"])
         raise SystemExit(0)
@@ -1140,6 +1215,11 @@ def cmd_send(args: argparse.Namespace) -> None:
         print(stderr, file=sys.stderr, end="")
     if stdout:
         print(stdout, end="")
+    res["pane"] = None
+    res["async"] = False
+    res["status"] = "completed" if proc.returncode == 0 else "failed"
+    if proc.returncode != 0:
+        res["error"] = (stderr or "").strip() or f"headless worker exited with code {proc.returncode}"
     raise SystemExit(proc.returncode)
 
 
@@ -1156,6 +1236,90 @@ def _resolve_explicit_or_bound_pane(args: argparse.Namespace, my_pane: int) -> i
     return resolve_same_tab_agent_pane(my_pane, cwd=cwd)
 
 
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
+def _non_negative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return value
+
+
+CLIP_MARK = "… (truncated)"
+CLIP_SCALE = 10000
+
+
+def _collect_text_leaves(node: Any, in_tool: bool, out: list[tuple[Any, Any, str, bool]]) -> None:
+    """Collect (container, key, original, is_tool) for clippable string leaves; tool context propagates downward."""
+    items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
+    for key, val in items:
+        tool = in_tool or (isinstance(key, str) and "tool" in key.lower())
+        if isinstance(val, str):
+            if not isinstance(node, dict) or key != "text":
+                continue
+            out.append((node, key, val, tool))
+        else:
+            _collect_text_leaves(val, tool, out)
+
+
+def bound_transcript_json(messages: list[Any], max_chars: int) -> str:
+    """Serialize `messages` (indent=2) to at most `max_chars` characters of valid JSON.
+
+    Reduction order: tool text is clipped proportionally, then message text;
+    clipped text keeps a prefix plus `… (truncated)`. If keys and structure alone still
+    exceed the bound, the oldest messages are dropped. `[]` takes 2 characters, so smaller
+    bounds are rejected; very small bounds therefore trade content for validity.
+    """
+
+    def dump(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, indent=2)
+
+    full = dump(messages)
+    if len(full) <= max_chars:
+        return full
+    if max_chars < 2:
+        raise SystemExit("error: --max-chars must be at least 2 to hold valid JSON")
+
+    work = json.loads(full)
+    leaves: list[tuple[Any, Any, str, bool]] = []
+    _collect_text_leaves(work, False, leaves)
+
+    def render(tool_num: int, msg_num: int) -> str:
+        for container, key, original, tool in leaves:
+            keep = len(original) * (tool_num if tool else msg_num) // CLIP_SCALE
+            container[key] = original if len(original) <= keep else original[:keep] + CLIP_MARK
+        return dump(work)
+
+    def largest(fits: Callable[[int], bool]) -> int:
+        lo, hi = 0, CLIP_SCALE
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    if len(render(0, CLIP_SCALE)) <= max_chars:
+        tool_num = largest(lambda n: len(render(n, CLIP_SCALE)) <= max_chars)
+        return render(tool_num, CLIP_SCALE)
+    if len(render(0, 0)) <= max_chars:
+        msg_num = largest(lambda n: len(render(0, n)) <= max_chars)
+        return render(0, msg_num)
+
+    render(0, 0)
+    for start in range(len(work) + 1):
+        text = dump(work[start:])
+        if len(text) <= max_chars:
+            return text
+    raise AssertionError("unreachable: [] always fits when max_chars >= 2")
+
+
 def cmd_transcript(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
@@ -1167,7 +1331,11 @@ def cmd_transcript(args: argparse.Namespace) -> None:
     )
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
-    print(json.dumps(reply.get("messages", []), ensure_ascii=False, indent=2))
+    messages = reply.get("messages", [])
+    if args.max_chars is not None:
+        print(bound_transcript_json(messages, args.max_chars))
+    else:
+        print(json.dumps(messages, ensure_ascii=False, indent=2))
 
 
 def cmd_pip(args: argparse.Namespace) -> None:
@@ -1409,10 +1577,15 @@ def cmd_event(args: argparse.Namespace) -> None:
 
 def cmd_retry(args: argparse.Namespace) -> None:
     """Retry a failed/aborted worker turn via native `/retry` (`cx.agents:ask`, identical to F5)."""
+    _run_with_json(args, _retry)
+
+
+def _retry(args: argparse.Namespace, res: dict[str, Any]) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
         raise SystemExit("error: `retry` requires running inside Tern")
     pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    res["pane"] = pane
     use_async = args.delivery == "async"
     if args.delivery == "auto":
         status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
@@ -1425,20 +1598,24 @@ def cmd_retry(args: argparse.Namespace) -> None:
             on_ack=lambda f: print(f"[wingman] Native /retry -> pane {f['pane']}", file=sys.stderr, flush=True),
         )
     except TimeoutError:
+        res.update(status="timeout", error=f"timed out after {args.max_time} waiting for retried turn")
         print(f"[wingman] Timed out after {args.max_time} waiting for retried turn.", file=sys.stderr)
         raise SystemExit(124)
     if not reply.get("ok"):
         st = reply.get("status") or reply.get("state") or "failed"
+        res.update(status=st, error=reply.get("error") or st)
         print(f"[wingman] Retry on pane {pane} ended with status={st}: {reply.get('error') or st}", file=sys.stderr)
         if reply.get("last_message"):
             print(reply["last_message"])
         raise SystemExit(2 if st == "waiting_input" else 1)
     if reply.get("async_callback"):
+        res.update(**{"async": True, "queued": False, "queueId": None, "position": None})
         print(
             f"[wingman] Sent native /retry to pane {pane} (async callback armed). "
             "Do NOT poll or sleep; end your turn now and wait for the callback."
         )
         raise SystemExit(0)
+    res.update(**{"async": False, "status": reply.get("status") or "completed"})
     if reply.get("last_message"):
         print(reply["last_message"])
 
@@ -1597,9 +1774,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Wingman: Native Tern TSP (`WindowCx.agents`) & headless worker bridge.")
     sub = p.add_subparsers(dest="subcmd", required=True)
 
-    p_info = sub.add_parser("info", help="List live Tern TSP agents, ownership bindings, PiP floats, and recent sessions")
+    p_info = sub.add_parser("info", help="List live Tern TSP agents, ownership bindings, PiP floats, available agent ids, and recent sessions")
     p_info.add_argument("--cwd", default=".", help="Workspace directory")
-    p_info.add_argument("--limit", type=int, default=6, help="Max recent sessions to list")
+    p_info.add_argument("--limit", type=_non_negative_int, default=6, help="Max recent sessions to list (0 skips all session, collab and lease lookups)")
+    p_info.add_argument("--no-sessions", action="store_true", help="Fast path: skip session files, collab hosts and lease checks entirely")
     p_info.set_defaults(func=cmd_info)
 
     p_send = sub.add_parser("send", help="Atomic TSP dispatch (`cx.agents:start/ask`) + event-driven wait")
@@ -1627,6 +1805,7 @@ def build_parser() -> argparse.ArgumentParser:
     cb_grp = p_send.add_mutually_exclusive_group()
     cb_grp.add_argument("--auto-callback", dest="auto_callback", action="store_true", default=None, help="Enable unsolicited worker->owner auto-callback (default: on)")
     cb_grp.add_argument("--no-auto-callback", dest="auto_callback", action="store_false", help="Disable unsolicited worker->owner auto-callback for this binding")
+    p_send.add_argument("--json", action="store_true", help="Print a single JSON result object on stdout (exit codes 0/1/2/124)")
     p_send.set_defaults(func=cmd_send)
 
     p_rep = sub.add_parser("report", help="Push a report/progress/question from a wingman pane back up to its bound supervisor")
@@ -1646,6 +1825,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")
     _add_pane_args(p_tr)
     p_tr.add_argument("--last", type=int, default=8, help="Number of recent messages")
+    p_tr.add_argument("--max-chars", type=_positive_int, help="Bound the printed JSON to at most N characters: tool text is clipped first, then message text proportionally (clipped text ends with `…`); if keys and structure alone overflow, oldest messages are dropped. N below 2 cannot hold valid JSON and is rejected")
     p_tr.set_defaults(func=cmd_transcript)
 
     p_pip = sub.add_parser("pip", help="Float worker pane into Picture-in-Picture corner")
@@ -1740,6 +1920,7 @@ def build_parser() -> argparse.ArgumentParser:
     retry_grp = p_retry.add_mutually_exclusive_group()
     retry_grp.add_argument("--async", dest="delivery", action="store_const", const="async", default="auto", help="Return immediately; result arrives via auto-callback (default when the caller is a Tern agent)")
     retry_grp.add_argument("--wait", dest="delivery", action="store_const", const="wait", help="Block until the retried turn finishes (default for shell callers)")
+    p_retry.add_argument("--json", action="store_true", help="Print a single JSON result object on stdout (exit codes 0/1/2/124)")
     p_retry.set_defaults(func=cmd_retry)
 
     p_peek = sub.add_parser("peek", help="O(1) .jsonl tail seek for granular mid-turn tool calls")

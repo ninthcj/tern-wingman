@@ -123,6 +123,9 @@ Wingman Live is a workbench for any Tern agent (`omp`, `claude`, `codex`, `copil
 ```sh
 # Inspect live Tern TSP agents, PiP floats, ovnfs availability, and recent sessions
 python3 skills/wingman/scripts/wingman.py info --cwd /path/to/project
+# Fast path: reads only live Tern state and reports `availableAgents`; no session scan with --no-sessions or --limit 0
+python3 skills/wingman/scripts/wingman.py info --no-sessions
+python3 skills/wingman/scripts/wingman.py info --limit 0
 
 # Dispatch work: 'new' ADDS another wingman (never closes or replaces an existing one); 'same' reuses one
 python3 skills/wingman/scripts/wingman.py send new \
@@ -143,12 +146,14 @@ python3 skills/wingman/scripts/wingman.py send same --pane <id> --prompt "Run py
 python3 skills/wingman/scripts/wingman.py send new --replace --prompt "Start over"   # closes the sole/unique-cwd bound worker; errors if none or ambiguous
 
 # Read structured TSP chat messages & tool cards directly from Tern memory
-python3 skills/wingman/scripts/wingman.py transcript --last 6
+python3 skills/wingman/scripts/wingman.py transcript --last 6 --max-chars 4000   # bounded output
 # Worker blocked on ask/approval (waiting_input): inspect the card, then answer via TSP events
 python3 skills/wingman/scripts/wingman.py surface --pane <id> [--json]
 python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id":"<id>","act":"pick:0:0"}' '{"ev":"action","id":"<submit_id>","act":"submit"}'
 # Worker turn failed/aborted (supervisor gets `[Wingman fault · retryable · pane <id>]`): native `/retry`, same as F5
 python3 skills/wingman/scripts/wingman.py retry --pane <id>
+# `send` / `retry` accept --json for machine-readable results. If a pane id goes stale (closed/replaced), re-run `info` and use the current id
+python3 skills/wingman/scripts/wingman.py send same --pane <id> --prompt "Run pytest -q" --json
 
 # Float to PiP (corner br|bl|tr|tl), dock back, park (hide; omp keeps running) / unpark, interrupt, cancel queued, close
 python3 skills/wingman/scripts/wingman.py pip --corner br

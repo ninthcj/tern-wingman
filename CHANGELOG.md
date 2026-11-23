@@ -4,6 +4,10 @@ All notable changes to `tern-wingman` are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- `info` fast path: live-state only, reports `availableAgents`; `--no-sessions` / `--limit 0` skip session scanning.
+- `send` and `retry` accept `--json`; `transcript --max-chars N` bounds output; stale pane ids are recovered by re-running `info`.
+
 ### Added
 - **Native queue search, Files button & status segments:** two-step **Search / Manage Queue** picker across the window, **Send selection to Agent** in the Files pane header (prefills path context), and Wingman-only `fault` / `Q<n>` / `↩<n>` indicators in Tern's Plugin segments widget (no overlap with Tern's native Agents widget or Git block).
 - **Standalone Workbench:** Wingman Live now gives any Tern agent, bound or unbound, PiP, Park, and an editable task queue. **Wingman: Queue Prompt for Agent** sends or queues a prompt using Tern’s native picker/input. Queue rows support Top, Edit, and Cancel by stable ID; shell queue commands can select the tab’s sole unowned live agent.

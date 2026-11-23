@@ -1122,6 +1122,63 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         self.assertEqual(done.exception.code, 0)
         self.assertIn("#2 id=42", buf.getvalue())
 
+    def test_info_fast_discovery_skips_session_work(self) -> None:
+        import io
+        from unittest import mock
+
+        status = {"ok": True, "agents": [], "custom_agents": ["agy", "claude", "agy", "team.agent"]}
+        for flags in (["--no-sessions"], ["--limit", "0"]):
+            out = io.StringIO()
+            with self.subTest(flags=flags), self._patched(status, []), mock_stdout(out):
+                with mock.patch.object(wingman, "sessions_root", side_effect=AssertionError("session scan")), mock.patch.object(
+                    wingman, "get_collab_hosts", side_effect=AssertionError("collab subprocess")
+                ):
+                    args = wingman.build_parser().parse_args(["info", *flags])
+                    args.func(args)
+                self.assertEqual(json.loads(out.getvalue())["availableAgents"], ["omp", "claude", "codex", "copilot", "agy", "team.agent"])
+                self.assertEqual(json.loads(out.getvalue())["sessions"], [])
+
+    def test_delivery_json_outcomes(self) -> None:
+        import io
+
+        scenarios = [
+            ({"ok": True, "async_callback": True, "queued": True, "queue_id": 17, "position": 2}, 0,
+             {"async": True, "queued": True, "queueId": 17, "position": 2}),
+            ({"ok": True, "async_callback": True}, 0, {"async": True, "queued": False, "position": 0}),
+            ({"ok": True, "status": "done", "last_message": "result"}, 0,
+             {"async": False, "status": "done", "lastMessage": "result"}),
+            ({"ok": False, "status": "waiting_input", "error": "approval needed"}, 2,
+             {"status": "waiting_input", "error": "approval needed"}),
+            ({"ok": False, "status": "failed", "error": "fault"}, 1, {"status": "failed", "error": "fault"}),
+        ]
+        for command in ("send", "retry"):
+            for reply, code, fields in scenarios:
+                if command == "retry" and reply.get("queued"):
+                    continue
+                argv = ["send", "same", "-m", "go"] if command == "send" else ["retry", "105"]
+                with self.subTest(command=command, reply=reply), self._patched(_multi_status([105]), [], {**reply, "pane": 105}):
+                    out = io.StringIO()
+                    args = wingman.build_parser().parse_args([*argv, "--json", "--async" if reply.get("async_callback") else "--wait"])
+                    with mock_stdout(out):
+                        try:
+                            args.func(args)
+                        except SystemExit as exc:
+                            self.assertEqual(exc.code, code)
+                        else:
+                            self.assertEqual(code, 0)
+                    obj = json.loads(out.getvalue())
+                    self.assertEqual((obj["ok"], obj["pane"]), (reply["ok"], 105))
+                    self.assertEqual({key: obj[key] for key in fields}, fields)
+
+    def test_transcript_char_cap_compacts_tool_text_first(self) -> None:
+        messages = [{"role": "assistant", "text": "keep this summary", "tools": [{"name": "read", "text": 'λ\n"' * 2000}]}]
+        _, code, out = self._run_cli(["transcript", "105", "--max-chars", "240"], {"ok": True, "messages": messages})
+        self.assertIsNone(code)
+        self.assertLessEqual(len(out.rstrip("\n")), 240)
+        result = json.loads(out)
+        self.assertEqual(result[0]["text"], "keep this summary")
+        self.assertIn("… (truncated)", result[0]["tools"][0]["text"])
+
     def test_info_reports_queued_items(self) -> None:
         status = _multi_status([105])
         next(a for a in status["agents"] if a["pane"] == 105)["queued_items"] = [{"id": 11, "position": 1}]

@@ -17,7 +17,7 @@ Drive a live Tern agent worker over native TSP (`WindowCx.agents`): `omp` by def
 
 ```bash
 # Inspect live Tern agents, bindings, floats, ovnfs availability, and recent sessions
-wingman info [--cwd DIR] [--limit 6]
+wingman info [--cwd DIR] [--limit 6 | --limit 0 | --no-sessions]   # fast: live state + availableAgents, no session scan
 
 # Dispatch a prompt to a worker
 #   target: new (ADDS a fresh worker) | same (bound/tab worker) | latest | <sessionId/path>
@@ -26,7 +26,7 @@ wingman send <new|same|latest|sessionId> (-m TEXT | --prompt-file FILE|-) \
   [--agent ID] [--cwd DIR] [--pane ID] [--replace] [--layout split|down|pip|tab|park] \
   [--pip tl|tr|bl|br] [--model M] [--thinking L] [--max-time 30m] \
   [--mode auto|tui|headless] [--no-queue | --position N] [--async | --wait] \
-  [--auto-callback | --no-auto-callback] [--takeover-idle] [--allow-fork]
+  [--auto-callback | --no-auto-callback] [--takeover-idle] [--allow-fork] [--json]
 
 # Pending tasks only; each action accepts [pane | --pane ID] and [--cwd DIR]
 wingman queue list [--all]
@@ -37,11 +37,11 @@ wingman queue cancel ID | --position POS | --all
 wingman unqueue [--id ID | --position POS]
 
 # Read structured TSP chat transcript from Tern memory, or tail-peek .jsonl
-wingman transcript [pane | --pane ID] [--last 8] [--cwd DIR]
+wingman transcript [pane | --pane ID] [--last 8] [--max-chars N] [--cwd DIR]
 wingman peek [latest|sessionId] [--cwd DIR] [--bytes 65536] [--lines 25]
 
 # Recover a worker stalled on `F5 to retry` via native `/retry`
-wingman retry [pane | --pane ID] [--cwd DIR] [--async | --wait] [--max-time 30m]   # omp-style fault recovery
+wingman retry [pane | --pane ID] [--cwd DIR] [--async | --wait] [--max-time 30m] [--json]   # omp-style fault recovery
 
 # Inspect & answer a worker blocked on `ask`/approval (`waiting_input`)
 wingman surface [pane | --pane ID] [--cwd DIR] [--root NODE_ID] [--all] [--json]
@@ -59,6 +59,8 @@ wingman interrupt
 wingman stop
 wingman callback [status|on|off|reset] [--global] [--pane OWNER_ID]
 ```
+
+- **Stale pane id** (closed/replaced worker): re-run `wingman info` (add `--no-sessions` for the fast path; it lists `availableAgents` and `boundWingmanPanes`) and retry with the current ID. Use `--json` on `send`/`retry` for machine-readable results and `transcript --max-chars N` to bound output.
 
 ## Agents (`--agent ID`)
 

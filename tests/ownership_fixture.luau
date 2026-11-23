@@ -72,7 +72,9 @@ local focused_pane = 1
 local floated_over: number? = nil
 local moved_next_to: number? = nil
 local live_panel: number? = nil
+local custom_agents: { [any]: any } = { { id = "zeta" } :: any, { name = "alpha.1" } :: any, "zeta" :: any, { id = "Bad" } :: any, bare = {}, ["-x"] = {} }
 local cx = {
+    settings = { get = function(_, key) assert(key == "agents.custom"); return custom_agents end },
     window_key = function() return "" end,
     session = {
         pane = function(_, id) return panes[id] end,
@@ -398,3 +400,6 @@ agents = { busy_two, target_three }
 target_three.state = "idle"
 local _, _, _, owned_item = radar_bridge.enqueue_prompt(cx, 2, "owned")
 assert(radar_bridge.move_queued(cx, owned_item, 3) and rpc("status", 3).owner_pane == 1)
+local advertised = rpc("status", 1).custom_agents
+assert(#advertised == 3 and advertised[1] == "alpha.1" and advertised[2] == "bare" and advertised[3] == "zeta")
+assert(select(2, radar_bridge.move_queued(cx, 9999, 3)) == "queue item 9999 is no longer queued (already dispatched or cancelled); run 'wingman queue list' to inspect current queue")

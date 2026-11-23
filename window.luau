@@ -1030,11 +1030,42 @@ local function queue_access(cx: WindowCx, anchor: number, pane: number): string?
 	return if owner ~= nil and owner ~= anchor then "queue pane is bound to pane " .. owner else nil
 end
 
+local function stale_queue_error(id: number): string
+	return "queue item " .. id .. " is no longer queued (already dispatched or cancelled); run 'wingman queue list' to inspect current queue"
+end
+
+local function available_agents(cx: WindowCx): { string }
+	local ok, configured = pcall(function(): any
+		return cx.settings:get("agents.custom")
+	end)
+	local seen: { [string]: boolean } = {}
+	local out: { string } = {}
+	local function add(id: any)
+		if type(id) == "string" and #id <= 64 and string.match(id, "^[a-z0-9._][a-z0-9._%-]*$") and not seen[id] then
+			seen[id] = true
+			table.insert(out, id)
+		end
+	end
+	if ok and type(configured) == "table" then
+		for key, value in configured do
+			if type(key) == "string" then
+				add(key)
+			elseif type(value) == "string" then
+				add(value)
+			elseif type(value) == "table" then
+				add(value.id or value.name)
+			end
+		end
+	end
+	table.sort(out)
+	return out
+end
+
 local function queue_source(cx: WindowCx, anchor: number, req: any, id: number?): (number?, string?)
 	if id ~= nil then
 		local pane = dispatches.find(id)
 		if pane == nil then
-			return nil, "queue item " .. id .. " is no longer queued"
+			return nil, stale_queue_error(id)
 		end
 		if supplied(req.target_pane) and tonumber(req.target_pane) ~= pane then
 			return nil, "queue item is not on the expected pane"
@@ -1305,6 +1336,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			auto_callback = state.is_auto_callback_enabled(anchor),
 			default_auto_callback = state.default_auto_callback(),
 			agents = tern.json.array(out),
+			custom_agents = tern.json.array(available_agents(cx)),
 			floats = floats,
 		}, false)
 		return
@@ -1941,7 +1973,7 @@ end
 local function move_queued(cx: WindowCx, id: number, to_pane: number): (boolean, string?, boolean?)
 	local pane = dispatches.find(id)
 	if pane == nil then
-		return false, "queue item " .. id .. " is no longer queued"
+		return false, stale_queue_error(id)
 	elseif pane == to_pane then
 		return false, "queue item is already on pane " .. pane
 	end
@@ -1956,6 +1988,9 @@ end
 local function mutate_queued(action: "edit" | "top" | "cancel", id: number, prompt: string?): (boolean, string?)
 	local item: Queue.Item?
 	local err: string?
+	if action ~= "cancel" and dispatches.find(id) == nil then
+		return false, stale_queue_error(id)
+	end
 	if action == "edit" then
 		item, err = dispatches.edit(id, prompt or "")
 	elseif action == "top" then
@@ -1963,7 +1998,7 @@ local function mutate_queued(action: "edit" | "top" | "cancel", id: number, prom
 	else
 		local pane = dispatches.find(id)
 		if pane == nil then
-			return false, "queue item " .. id .. " is no longer queued"
+			return false, stale_queue_error(id)
 		end
 		local removed, why = cancel_queued(pane, nil, id)
 		if removed == 0 then
