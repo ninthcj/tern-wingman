@@ -16,6 +16,7 @@
 -- (~0.1–0.6 ms a pane). `cx.session:surface` is never read here: one omp surface costs ~20 ms.
 
 local tsp = require("./tsp")
+local Queue = require("./queue")
 local view = require("./radar_view")
 local Subagents = require("./subagents")
 local subagent_view = require("./subagents_view")
@@ -46,6 +47,16 @@ export type Bridge = {
 	retry: (cx: WindowCx, pane: number) -> (boolean, string?),
 	--- Cancels every queued prompt of the pane; returns how many.
 	unqueue: (cx: WindowCx, pane: number) -> number,
+	--- Compact snapshot of the pane's queued prompts, in slot order.
+	queue_items: (pane: number) -> { Queue.Compact },
+	--- Full text of a queued prompt, nil once sent or cancelled.
+	queue_prompt: (id: number) -> string?,
+	--- ok, err, queued, id, position
+	enqueue_prompt: (cx: WindowCx, pane: number, prompt: string) -> (boolean, string?, boolean?, number?, number?),
+	edit_queued: (id: number, prompt: string) -> (boolean, string?),
+	promote_queued: (id: number) -> (boolean, string?),
+	cancel_queued_id: (id: number) -> (boolean, string?),
+	can_pip: (cx: WindowCx, pane: number) -> boolean,
 }
 
 type Scope = view.Scope
@@ -316,6 +327,12 @@ local function state_signature(b: Bridge): (string, string)
 	table.sort(panel)
 	for _, pane in sorted_panes() do
 		table.insert(panel, string.format("%d:%d:%s", pane, b.queued_callbacks(pane), b.notified_waiting(pane) or ""))
+		if panel_pane == nil then
+			continue
+		end
+		for _, item in b.queue_items(pane) do
+			table.insert(panel, string.format("q%d:%d:%s", item.id, item.position, item.preview))
+		end
 	end
 	local w = table.concat(widget, "|")
 	return w, w .. "|" .. table.concat(panel, "|")
@@ -331,7 +348,7 @@ end
 ------------------------------------------------------------------------------------------------------------------------
 -- Data: agents, transcripts, git
 
-local function collect(cx: WindowCx, b: Bridge): ({ Row }, { [number]: Row })
+local function collect(cx: WindowCx, b: Bridge, controls: boolean): ({ Row }, { [number]: Row })
 	local owner_of = b.owners()
 	local workers_of: { [number]: { number } } = {}
 	for worker, owner in owner_of do
@@ -376,6 +393,8 @@ local function collect(cx: WindowCx, b: Bridge): ({ Row }, { [number]: Row })
 				workers = workers_of[a.pane] or {},
 				queued = b.queued_dispatches(a.pane),
 				inbox = b.queued_callbacks(a.pane),
+				queue_items = if controls then b.queue_items(a.pane) else {},
+				can_pip = controls and a.state ~= "exited" and b.can_pip(cx, a.pane),
 				fault = b.fault(a.pane),
 				failed = finished[a.pane] == "failed",
 			}
@@ -877,7 +896,7 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 		table.insert(phases, string.format("%s %.1f/%.1f", name, now - t, native_ms - nat))
 		t, nat = now, native_ms
 	end
-	local rows, by_pane = collect(cx, b)
+	local rows, by_pane = collect(cx, b, true)
 	any_working = false
 	for _, r in rows do
 		if r.state == "working" then
@@ -1131,7 +1150,7 @@ render = function(cx: WindowCx)
 			table.insert(phases, string.format("set %.1f", set_ms))
 			adapt(tern.now() - t0, nodes, bytes, phases)
 		else
-			rows = collect(cx, b)
+			rows = collect(cx, b, false)
 			any_working = false
 			for _, row in rows do
 				if row.state == "working" then
@@ -1483,6 +1502,144 @@ local function configure_subagents(cx: WindowCx, cycle: boolean)
 	arm_expiry(sync_subagents(cx, {}, now, false))
 end
 
+local state_changed: () -> () = function() end
+
+local function report_queue(cx: WindowCx, ok: boolean, err: string?, what: string)
+	if not ok then
+		cx:toast("error", "Wingman: " .. what .. " failed", err)
+	end
+	state_changed()
+end
+
+local function pane_title(cx: WindowCx, pane: number): string
+	local info = cx.session:pane(pane)
+	return if info ~= nil and info.title ~= "" then info.title else (titles[pane] or ("pane " .. pane))
+end
+
+-- Prompts for text, then queues it behind the pane's work. The answer arrives with a fresh cx (nil: the window is
+-- gone), so nothing from the click's cx is used after the modal.
+local function ask_queue(cx: WindowCx, b: Bridge, pane: number)
+	cx:prompt({
+		placeholder = "Queue a prompt for " .. pane_title(cx, pane),
+		icon = "list",
+		action = "queue",
+	}):next(function(text: string?, err: string?, later: WindowCx?)
+		if shutting_down or later == nil then
+			return
+		end
+		if err then
+			later:toast("error", "Wingman: Queue Prompt failed", err)
+			return
+		end
+		if text == nil or string.match(text, "^%s*$") then
+			return
+		end
+		local ok, qerr, queued, id, position = b.enqueue_prompt(later, pane, text)
+		if not ok then
+			later:toast("error", "Wingman: Queue Prompt failed", qerr)
+		elseif queued and id ~= nil then
+			later:toast("info", string.format("Wingman: queued #%d · slot %d", id, position or 1), pane_title(later, pane))
+		else
+			later:toast("info", "Wingman: prompt sent", pane_title(later, pane))
+		end
+		state_changed()
+	end)
+end
+
+local function edit_queue(cx: WindowCx, b: Bridge, id: number)
+	local original = b.queue_prompt(id)
+	if original == nil then
+		cx:toast("info", "Wingman: queued prompt #" .. id .. " is no longer queued")
+		state_changed()
+		return
+	end
+	cx:prompt({ value = original, placeholder = "Edit queued prompt #" .. id, icon = "list", action = "save" }):next(
+		function(text: string?, err: string?, later: WindowCx?)
+			if shutting_down or later == nil then
+				return
+			end
+			if err then
+				later:toast("error", "Wingman: Edit failed", err)
+				return
+			end
+			if text == nil or string.match(text, "^%s*$") or text == original then
+				return
+			end
+			local current = b.queue_prompt(id)
+			if current == nil then
+				later:toast("info", "Wingman: queued prompt #" .. id .. " was sent or cancelled before your edit")
+				state_changed()
+				return
+			end
+			if current ~= original then
+				later:toast("info", "Wingman: queued prompt #" .. id .. " changed", "Reopen Edit to see the current prompt.")
+				return
+			end
+			local ok, eerr = b.edit_queued(id, text)
+			report_queue(later, ok, eerr, "Edit")
+			if ok then
+				later:toast("info", "Wingman: updated queued prompt #" .. id)
+			end
+		end
+	)
+end
+
+-- Focused live agent, else the only live agent in the current tab, else the only one in the window, else a picker.
+local function queue_prompt_command(cx: WindowCx, b: Bridge)
+	local live: { { pane: number, title: string, state: string } } = {}
+	for _, a in cx.agents:list() do
+		if a.state ~= "exited" then
+			table.insert(live, { pane = a.pane, title = pane_title(cx, a.pane), state = a.state :: string })
+		end
+	end
+	if #live == 0 then
+		cx:toast("info", "Wingman: no live agent to queue a prompt for")
+		return
+	end
+	local focused = cx.session:focused()
+	local chosen: number? = nil
+	for _, a in live do
+		if a.pane == focused then
+			chosen = a.pane
+		end
+	end
+	if chosen == nil and focused ~= nil then
+		local tab = cx.session:tab_of(focused)
+		local here: { number } = {}
+		for _, a in live do
+			if tab ~= nil and cx.session:tab_of(a.pane) == tab then
+				table.insert(here, a.pane)
+			end
+		end
+		if #here == 1 then
+			chosen = here[1]
+		end
+	end
+	if chosen == nil and #live == 1 then
+		chosen = live[1].pane
+	end
+	if chosen ~= nil then
+		ask_queue(cx, b, chosen)
+		return
+	end
+	local items: { PickItem } = {}
+	for _, a in live do
+		table.insert(items, { label = a.title, detail = a.state .. " · #" .. a.pane, pane = a.pane })
+	end
+	cx:pick({ items = items, placeholder = "Queue a prompt for…", icon = "list", action = "queue" }):next(
+		function(item: PickItem?, err: string?, later: WindowCx?)
+			if shutting_down or later == nil then
+				return
+			end
+			if err then
+				later:toast("error", "Wingman: Queue Prompt failed", err)
+			elseif item ~= nil and type(item.pane) == "number" then
+				ask_queue(later, b, item.pane)
+			end
+		end
+	)
+end
+
 local function handle_action(ev: CanvasAction, cx: WindowCx, b: Bridge)
 	local act: string, value: string = ev.act, ev.value or ""
 	if value == "" then
@@ -1520,6 +1677,16 @@ local function handle_action(ev: CanvasAction, cx: WindowCx, b: Bridge)
 	elseif act == "unqueue" and pane then
 		local n = b.unqueue(cx, pane)
 		cx:toast("info", string.format("Wingman: cancelled %d queued prompt%s", n, if n == 1 then "" else "s"), titles[pane])
+	elseif act == "queue_ask" and pane then
+		ask_queue(cx, b, pane)
+	elseif act == "queue_top" and pane then
+		local ok, err = b.promote_queued(pane)
+		report_queue(cx, ok, err, "Move to top")
+	elseif act == "queue_edit" and pane then
+		edit_queue(cx, b, pane)
+	elseif act == "queue_cancel" and pane then
+		local ok, err = b.cancel_queued_id(pane)
+		report_queue(cx, ok, err, "Cancel queued prompt")
 	elseif act == "open" and value ~= "" then
 		cx:open(value, "beside")
 	elseif act == "park" and pane then
@@ -1869,6 +2036,20 @@ function M.attach(b: Bridge)
 			log_once("seed", err)
 		end
 	end)
+	tern.command({
+		id = "queue_prompt",
+		title = "Wingman: Queue Prompt for Agent",
+		icon = "list",
+		run = function(cx: WindowCx)
+			local ok, err = try(function()
+				queue_prompt_command(cx, b)
+			end)
+			if not ok then
+				log_once("queue_prompt", err)
+				cx:toast("error", "Wingman: Queue Prompt failed", tostring(err))
+			end
+		end,
+	})
 	tern.timer(0, function(cx: WindowCx?)
 		if cx ~= nil then
 			local ok, err = try(function()
@@ -1880,5 +2061,9 @@ function M.attach(b: Bridge)
 		end
 	end)
 end
+
+-- Edits and moves change no count the widget reads; the signature carries queue ids, slots and previews, and this
+-- refreshes both views after any of them.
+state_changed = M.on_state_change
 
 return M

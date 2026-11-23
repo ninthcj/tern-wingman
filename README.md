@@ -108,6 +108,10 @@ Off by default. Use **Wingman: Toggle Subagent Panes** and **Wingman: Cycle Suba
 
 Budget: Radar and popouts share a single transcript sampler. With the Live Panel closed, enabled popouts sample only while in-scope agents work, with a final event-driven read and a one-shot cleanup for completed panes. No Git work runs for popouts alone. Each render measures Lua and native work and pauses sampling at the existing 10 ms Lua / 100 ms wall safety threshold, below Tern’s 50 ms Lua hook budget.
 
+### Workbench (standalone, any agent)
+
+Wingman Live is a workbench for any Tern agent (`omp`, `claude`, `codex`, `copilot`, `agy`, or custom ACP), with no binding required. A standalone agent gets Living Files, Subagent Panes, PiP/Park and an editable task queue; the same panel scales to 1-to-N and nested agent trees. Click **+** on a row or use **Wingman: Queue Prompt for Agent** in the palette. Idle agents receive the prompt immediately; busy agents queue it. Use **Top**, **Edit**, and **Cancel** to manage pending tasks by stable ID. From a shell, `wingman queue list` also finds the tab’s sole unowned live agent without `--pane`.
+
 ## CLI Reference (`wingman.py`)
 
 `wingman.py` requires only Python 3.10+ standard library (**Linux, macOS & Windows**). Outside Tern (or with `--mode headless`), `send` automatically falls back to detached `omp -p --wait-async --auto-approve`; this headless fallback is `omp`-only.

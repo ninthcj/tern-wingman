@@ -86,6 +86,10 @@ wingman callback [status|on|off|reset] [--global] [--pane OWNER_ID]
 - **Second concurrent worker:** `down` stacks below the right-side worker (or below the supervisor if none), or use `pip`.
 - **Three or more workers, or heavy/noisy `omp` runs:** `park` keeps `omp` workers off-screen but live, with callbacks and Live Panel visibility. Use `tab` for a dedicated background tab (ACP agents there queue until shown). `unpark` brings a parked worker back into the current tab without focusing it.
 
+## Workbench
+
+**Wingman Live** works with one standalone Tern agent or a whole ownership tree. The panel provides Living Files, Subagent Panes, PiP/Park, and queue controls. Use **Wingman: Queue Prompt for Agent** or the row’s **+** in Tern; from an agent turn, prefer the CLI.
+
 ## On-Demand References (read only when needed)
 
 - `references/interactive.md`: multi-step TSP `event` JSON recipes for filling free-text `Other…` inputs or attaching option `Note`s.

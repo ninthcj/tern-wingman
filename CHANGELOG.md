@@ -2,6 +2,11 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Standalone Workbench:** Wingman Live now gives any Tern agent, bound or unbound, PiP, Park, and an editable task queue. **Wingman: Queue Prompt for Agent** sends or queues a prompt using Tern’s native picker/input. Queue rows support Top, Edit, and Cancel by stable ID; shell queue commands can select the tab’s sole unowned live agent.
+
 ## [0.7.0] - 2026-11-23
 
 ### Added

@@ -57,6 +57,10 @@ ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wing
 - **Activity**：工作中的 Agent 卡片内显示当前工具与色块节拍条（read / search / edit / run / error，进行中的色块脉动），节拍条长度与下方跨 Agent 近期调用条数随面板宽高占比动态调节（数据来自 `cx.agents:transcript`，`omp` 与 ACP pane 通用）。
 - **舞台与 Dock**：随 Agent 状态变色的顶部氛围舞台与 working / waiting / queued / fault 计数格，*Tab* / *All* 作用域（持久化）、*Open Git*、*Clear reads*，以及悬停可见每次渲染实测开销的健康指示点。
 
+### Workbench（独立工作台，适用任意 Agent）
+
+Wingman Live 是面向任意 Tern Agent 的工作台（`omp`、`claude`、`codex`、`copilot`、`agy` 或自定义 ACP），无需预先绑定。单个 Agent 即可使用文件动态、子代理面板、画中画、停放和任务队列，也可扩展到一对多及多级 Agent 树。点击行内 **+** 或运行命令 **Wingman: Queue Prompt for Agent**；空闲时立即发送，忙碌时进入队列。可按稳定任务 ID 置顶、编辑或撤回。从 shell 执行 `wingman queue list` 时，也可省略标签页内唯一未绑定 Agent 的 `--pane`。
+
 ### Subagent 面板（需手动开启）
 
 默认关闭。可在命令面板使用 **Wingman: Toggle Subagent Panes**、**Wingman: Cycle Subagent Pane Limit**，也可通过实时面板底栏控制。窗口级上限按 **3 → 2 → 4 → 不限 → 1** 循环。子代理运行满 1.5 秒后在父 pane 下方打开，不抢焦点；完成后保留 20 秒，新任务可原位复用未固定槽位。**Pin** 保留面板并计入上限，**+N more** 切换溢出任务，**Close** 关闭当前任务且不会自动重开。

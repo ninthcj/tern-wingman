@@ -317,7 +317,10 @@ local function promote_next_queued(cx: WindowCx, pane_id: number): number?
 		if item.cid ~= nil then
 			reply_to_queued({ item }, "failed", reason)
 		else
-			deliver_to_owner(cx, item.anchor, pane_id, "auto-callback · failed", reason)
+			local owner = state.owner_of_pane(cx, pane_id)
+			if owner ~= nil and state.is_auto_callback_enabled(owner) then
+				deliver_to_owner(cx, owner, pane_id, "auto-callback · failed", reason)
+			end
 		end
 	end
 end
@@ -795,8 +798,46 @@ local function pane_shares(cx: WindowCx, pane: number): (number, number)
 	return sx or 1, sy or 1
 end
 
+local function first_leaf(node: TabTree?, skip: number, avoid: number?): number?
+	if node == nil then
+		return nil
+	elseif node.pane ~= nil then
+		return if node.pane ~= skip and node.pane ~= avoid then node.pane else nil
+	end
+	return first_leaf(node[1], skip, avoid) or first_leaf(node[2], skip, avoid)
+end
+
+local function tab_layout(cx: WindowCx, pane: number): TabLayout?
+	local tab = cx.session:tab_of(pane)
+	return if tab ~= nil then cx.session:layout(tab) else nil
+end
+
+local function live_panel_pane(cx: WindowCx): number?
+	for _, info in cx.canvas:list() do
+		if info.title == "Wingman Live" and info.owner == tern.plugin.id then
+			return info.pane
+		end
+	end
+	return nil
+end
+
+local function can_pip(cx: WindowCx, pane: number): boolean
+	local layout = tab_layout(cx, pane)
+	return layout ~= nil and first_leaf(layout.root, pane, nil) ~= nil
+end
+
 local function float_worker(cx: WindowCx, pane: number, over: number?, requested: Corner?): (boolean, string?)
-	local sx, sy = if over ~= nil then pane_shares(cx, over) else 1, 1
+	if over == nil then
+		local layout = tab_layout(cx, pane)
+		if layout == nil then
+			return false, "agent is not in a tiled tab"
+		end
+		over = first_leaf(layout.root, pane, live_panel_pane(cx)) or first_leaf(layout.root, pane, nil)
+		if over == nil then
+			return false, "no sibling pane to float over"
+		end
+	end
+	local sx, sy = pane_shares(cx, over :: number)
 	local used: { [string]: boolean } = {}
 	local peers = 0
 	if over ~= nil then
@@ -850,14 +891,18 @@ local function park_pane(cx: WindowCx, pane: number): (boolean, string?)
 end
 
 local function unpark_pane(cx: WindowCx, pane: number): (boolean, string?)
+	local focused = cx.session:focused()
+	local current = if focused ~= nil then tab_layout(cx, focused) else nil
+	local panel = if current then live_panel_pane(cx) else nil
+	local sibling = if current and panel and focused == panel then first_leaf(current.root, pane, panel) else nil
 	local ok, err = cx.layout:unpark(pane, { focus = false })
 	if not ok then
 		return false, err
 	end
-	-- Keep unparked workers beside their owner (never splitting a focused Wingman Live sidebar).
 	local owner = state.owner_of_pane(cx, pane)
-	if owner ~= nil and cx.session:tab_of(owner) == cx.session:tab_of(pane) then
-		local slot_target, slot_dir = tiled_slot(cx, owner, pane)
+	local target = if owner ~= nil and current ~= nil and cx.session:tab_of(owner) == current.tab then owner else sibling
+	if target ~= nil then
+		local slot_target, slot_dir = tiled_slot(cx, target, pane)
 		if slot_target ~= pane then
 			cx.layout:move(pane, slot_target, slot_dir :: Dir, { focus = false })
 		end
@@ -995,6 +1040,25 @@ local function queue_source(cx: WindowCx, anchor: number, req: any, id: number?)
 			return nil, "queue item is not on the expected pane"
 		end
 		return pane, nil
+	end
+	if not supplied(req.target_pane) and #state.workers_of_owner(cx, anchor) == 0 then
+		local tab = cx.session:tab_of(anchor)
+		local found: number? = nil
+		if tab ~= nil then
+			for _, agent in cx.agents:list() do
+				local pane = agent.pane
+				if pane ~= anchor and agent.state ~= "exited" and cx.session:tab_of(pane) == tab
+					and state.owner_of_pane(cx, pane) == nil and state.ownership_cycle(anchor, pane) == nil then
+					if found ~= nil then
+						return nil, "multiple unowned agents in this tab; pass --pane <id>"
+					end
+					found = pane
+				end
+			end
+		end
+		if found ~= nil then
+			return found, nil
+		end
 	end
 	return select_worker(cx, anchor, req.target_pane, req.cwd)
 end
@@ -1791,11 +1855,91 @@ end
 tern.on("window_start", start)
 tern.timer(0, start)
 
+local function enqueue_prompt(cx: WindowCx, pane: number, prompt: string): (boolean, string?, boolean?, number?, number?)
+	if not string.find(prompt, "%S") then
+		return false, "prompt is empty"
+	end
+	local agent = find_agent_info(cx, pane)
+	if agent == nil or cx.session:pane(pane) == nil then
+		return false, "agent pane is no longer live"
+	elseif agent.state == "waiting_input" or agent.state == "exited" then
+		return false, "agent is " .. agent.state
+	end
+	if agent.state == "working" or has_pending_dispatch(pane) or dispatches.count(pane) > 0 then
+		local loaded, load_error = pcall(function(): any
+			load_dispatch_ids(cx)
+			return nil
+		end)
+		if not loaded then
+			return false, tostring(load_error)
+		end
+		local item, err, position = dispatches.enqueue(pane, { anchor = state.owner_of_pane(cx, pane) or pane, prompt = prompt })
+		if item == nil then
+			return false, err
+		end
+		ensure_watchdog()
+		notify_radar()
+		return true, nil, true, item.id, position
+	end
+	local ok, err = ask_worker(cx, pane, prompt)
+	if not ok then
+		return false, tostring(err)
+	end
+	unsolicited_working[pane] = true
+	reported_in_turn[pane] = false
+	notify_radar()
+	return true, nil, false
+end
+
+local function mutate_queued(action: "edit" | "top" | "cancel", id: number, prompt: string?): (boolean, string?)
+	local item: Queue.Item?
+	local err: string?
+	if action == "edit" then
+		item, err = dispatches.edit(id, prompt or "")
+	elseif action == "top" then
+		item, err = dispatches.move(id, 1)
+	else
+		local pane = dispatches.find(id)
+		if pane == nil then
+			return false, "queue item " .. id .. " is no longer queued"
+		end
+		local removed, why = cancel_queued(pane, nil, id)
+		if removed == 0 then
+			return false, why
+		end
+		notify_radar()
+		return true, nil
+	end
+	if item == nil then
+		return false, err
+	end
+	notify_radar()
+	return true, nil
+end
+
 -- The live panel's narrow view of this control plane: read-only accessors plus the cores the RPC ops use.
 if radar_loaded then
 	local ok_attach, err_attach = pcall(function(): any
 		radar.attach({
 			owners = state.owners,
+			can_pip = can_pip,
+			queue_items = function(pane: number): { Queue.Compact }
+				return dispatches.compact(pane)
+			end,
+			queue_prompt = function(id: number): string?
+				local _, _, item = dispatches.find(id)
+				return if item then item.prompt else nil
+			end,
+			enqueue_prompt = enqueue_prompt,
+			edit_queued = function(id: number, prompt: string): (boolean, string?)
+				return mutate_queued("edit", id, prompt)
+			end,
+			promote_queued = function(id: number): (boolean, string?)
+				return mutate_queued("top", id, nil)
+			end,
+			cancel_queued_id = function(id: number): (boolean, string?)
+				return mutate_queued("cancel", id, nil)
+			end,
 			queued_dispatches = function(pane: number): number
 				return dispatches.count(pane)
 			end,

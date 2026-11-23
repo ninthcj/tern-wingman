@@ -18,7 +18,7 @@ local function unexpected(message: any)
 end
 local tern = {
     runtime = { os = "macos" },
-    plugin = { dir = "." },
+    plugin = { dir = ".", id = "wingman" },
     getenv = function() return nil end,
     now = function() return clock end,
     timer = function(ms, callback)
@@ -46,10 +46,11 @@ local tern = {
     },
 }
 local notifications = 0
+local radar_bridge: any
 local real_require = require
 local function fixture_require(path: string): any
     if path == "./radar" then
-        return { on_state_change = function() notifications += 1 end, attach = function() end }
+        return { on_state_change = function() notifications += 1 end, attach = function(b) radar_bridge = b end }
     end
     return real_require(path)
 end
@@ -66,14 +67,25 @@ for id = 1, 4 do
     panes[id] = { pane = id, tab = 42, cwd = "/work" }
     agents[id] = { pane = id, cwd = "/work", state = "idle" }
 end
+local tab_tree: TabTree? = nil
+local focused_pane = 1
+local floated_over: number? = nil
+local moved_next_to: number? = nil
+local live_panel: number? = nil
 local cx = {
     window_key = function() return "" end,
     session = {
         pane = function(_, id) return panes[id] end,
         tab_of = function(_, id) return panes[id].tab end,
-        layout = function() return { floats = {} } end,
+        layout = function() return { floats = {}, root = tab_tree, tab = 42 } end,
+        focused = function() return focused_pane end,
         surface = function() return nil end,
         event = function(_, pane) effect("event", pane) end,
+    },
+    canvas = {
+        list = function()
+            return if live_panel then { { pane = live_panel, title = "Wingman Live", owner = "wingman" } } else {}
+        end,
     },
     agents = {
         list = function() return agents end,
@@ -81,7 +93,23 @@ local cx = {
         transcript = function() return {} end,
     },
     layout = {
-        float = function(_, pane) effect("pip", pane); return true end,
+        float = function(_, pane, over, _, opts)
+            floated_over = over
+            assert(opts.focus == false)
+            effect("pip", pane)
+            return true
+        end,
+        unpark = function(_, pane, opts)
+            assert(opts.focus == false)
+            effect("unpark", pane)
+            return true
+        end,
+        move = function(_, pane, target, _, opts)
+            assert(opts.focus == false)
+            moved_next_to = target
+            effect("move", pane)
+            return true
+        end,
         dock = function(_, pane) effect("dock", pane); return true end,
     },
 }
@@ -270,3 +298,59 @@ assert(effects[#effects].target == 3 and effects[#effects].prompt == "move and w
 assert(replies[move_cid].reply._ack and replies[move_cid].keep_open)
 handlers.agent_finished({ pane = 3, result = "done" }, cx)
 assert(replies[move_cid].reply.pane == 3 and replies[move_cid].reply.status == "done" and not replies[move_cid].keep_open)
+
+-- A shell can inspect and manage the sole unowned live agent without creating a binding.
+start()
+local standalone = agents[2]
+agents = { standalone }
+standalone.state = "idle"
+assert(rpc("queue", 1, nil, { action = "list" }).pane == 2)
+assert(not rpc("queue", 2, nil, { action = "list" }).ok)
+local ok, _, queued = radar_bridge.enqueue_prompt(cx, 2, "immediate")
+assert(ok and queued == false and effects[#effects].prompt == "immediate")
+local calls_after_immediate = #effects
+local queued_ok, _, queued_flag, a, a_pos = radar_bridge.enqueue_prompt(cx, 2, "first pending")
+assert(queued_ok and queued_flag and a_pos == 1 and #effects == calls_after_immediate)
+local _, _, _, b = radar_bridge.enqueue_prompt(cx, 2, "second pending")
+assert(radar_bridge.queue_prompt(b) == "second pending")
+assert(radar_bridge.edit_queued(b, "edited pending"))
+assert(radar_bridge.promote_queued(b))
+local items = radar_bridge.queue_items(2)
+assert(#items == 2 and items[1].id == b and items[1].preview == "edited pending")
+assert(rpc("queue", 1, nil, { action = "edit", id = b, prompt = "edited from shell" }).ok)
+assert(rpc("queue", 1, nil, { action = "reorder", ordered_ids = { a, b } }).ok)
+assert(rpc("queue", 1, nil, { action = "move", id = b, to_pos = 1 }).ok)
+assert(radar_bridge.cancel_queued_id(a))
+assert(not radar_bridge.edit_queued(a, "stale") and not radar_bridge.cancel_queued_id(a))
+assert(rpc("queue", 1, nil, { action = "cancel", position = 1 }).cancelled == 1)
+assert(rpc("status", 2).owner_pane == nil and #radar_bridge.queue_items(2) == 0)
+standalone.state = "waiting_input"
+assert(not radar_bridge.enqueue_prompt(cx, 2, "blocked"))
+standalone.state = "exited"
+assert(not radar_bridge.enqueue_prompt(cx, 2, "exited"))
+assert(not rpc("queue", 1, nil, { action = "list" }).ok)
+standalone.state = "working"
+local third_agent = { pane = 3, cwd = "/work", state = "idle" }
+table.insert(agents, third_agent)
+assert(not rpc("queue", 1, nil, { action = "list" }).ok)
+table.remove(agents)
+
+tab_tree = { pane = 2 }
+assert(not radar_bridge.can_pip(cx, 2))
+assert(not radar_bridge.pip(cx, 2))
+local inner: TabTree = { split = "right", [1] = { pane = 2 }, [2] = { pane = 1 } }
+local panel_leaf: TabTree = { pane = 4 }
+tab_tree = { split = "right", [1] = panel_leaf, [2] = inner }
+live_panel = 4
+assert(radar_bridge.can_pip(cx, 2) and radar_bridge.pip(cx, 2))
+assert(floated_over == 1, "standalone PiP should prefer the sibling shell over Wingman Live")
+tab_tree = { split = "right", [1] = { pane = 4 }, [2] = { pane = 1 } }
+focused_pane = 4
+assert(radar_bridge.unpark(cx, 2))
+assert(moved_next_to == 1, "unpark should place the standalone agent beside the shell instead of the focused sidebar")
+
+local sync = rpc("dispatch", 1, 2, { async_callback = false, prompt = "waiting caller" })
+local sync_cid = request_id
+assert(sync._ack and sync.queued)
+assert(radar_bridge.cancel_queued_id(sync.queue_id))
+assert(replies[sync_cid].reply.status == "cancelled" and not replies[sync_cid].keep_open)

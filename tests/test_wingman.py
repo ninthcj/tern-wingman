@@ -1191,6 +1191,27 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         proc = subprocess.run([luau, str(fixture)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
 
+    def test_queue_id_actions_need_no_explicit_pane(self) -> None:
+        reply = {"ok": True, "pane": 105, "cancelled": 1, "remaining": 0}
+        calls, code, _ = self._run_cli(["queue", "edit", "11", "-m", "new"], reply)
+        self.assertIsNone(code)
+        self.assertEqual((calls[0]["op"], calls[0]["action"], calls[0]["id"]), ("queue", "edit", 11))
+        self.assertNotIn("target_pane", calls[0])
+        calls, code, _ = self._run_cli(["queue", "cancel", "11"], reply)
+        self.assertIsNone(code)
+        self.assertEqual((calls[0]["action"], calls[0]["id"]), ("cancel", 11))
+        self.assertNotIn("target_pane", calls[0])
+
+    def test_luau_workbench_view_fixture(self) -> None:
+        import shutil
+
+        luau = shutil.which("luau")
+        if luau is None:
+            self.skipTest("`luau` runner is not on PATH; cannot execute tests/workbench_view_fixture.luau")
+        fixture = ROOT_DIR / "tests" / "workbench_view_fixture.luau"
+        proc = subprocess.run([luau, str(fixture)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
     def test_window_luau_ownership_fixture(self) -> None:
         import shutil
 

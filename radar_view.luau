@@ -5,6 +5,8 @@
 -- The `tern.ui.*` builders are native calls: measured ~6x the cost and ~190 KB of garbage per 268-node build,
 -- against ~0 for the same tables built here.
 
+local Queue = require("./queue")
+
 local ROLE = "wingman.radar"
 
 -- The panel's sheet: a stage lit by the agents' mood, cards on a rail, a compact file tree, a feed. Colors come
@@ -68,6 +70,10 @@ local CSS = [==[
 .wr-name { flex: 0 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font: 600 12.5px/16px var(--sans); }
 .wr-name[data-focused] { color: var(--accent); }
 .wr-hit .wr-time { margin-left: auto; }
+.wr-qs { display: flex; flex-direction: column; gap: 1px; min-width: 0; padding-left: 15px; }
+.wr-q { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.wr-qhit { display: flex; flex: 1; align-items: center; gap: 6px; min-width: 0; font: 500 11px/16px var(--mono); cursor: pointer; }
+.wr-q:hover .wr-acts { opacity: 1; }
 .wr-acts { display: flex; flex: none; gap: 1px; opacity: 0.4; }
 .wr-card:hover .wr-acts { opacity: 1; }
 .wr-dot { flex: none; width: 8px; height: 8px; border-radius: 4px; background-color: var(--t4); }
@@ -180,6 +186,8 @@ export type Row = {
 	inbox: number,
 	fault: string?,
 	failed: boolean,
+	queue_items: { Queue.Compact },
+	can_pip: boolean,
 }
 
 export type ToolRec = {
@@ -285,6 +293,18 @@ end
 
 local function feed_cap(f: Frame): number
 	return math.clamp(math.floor(viewport_lines(f) / 3), 4, 10)
+end
+
+-- Queued-prompt previews one agent card shows: more when the panel is tall.
+local function queue_cap(f: Frame): number
+	return math.clamp(math.floor(viewport_lines(f) / 6), 2, 4)
+end
+
+-- Preview rows (plus the overflow note) a card spends on `r`'s queue.
+local function queue_lines(f: Frame, r: Row): number
+	local n = #r.queue_items
+	local cap = queue_cap(f)
+	return if n > cap then cap + 1 else n
 end
 local SEARCH: { [string]: boolean } = { grep = true, find = true, glob = true, ast_grep = true, search = true, lsp = true,
 	grep_search = true, find_by_name = true, codebase_search = true }
@@ -494,7 +514,7 @@ end
 -- Agents
 
 -- One agent: its head row (focus target, chips, time, actions) and, while active, its current tool and strip.
-local function agent_parts(f: Frame, hue: (number) -> string, r: Row, ts: { ToolRec }?): { Node }
+local function agent_parts(f: Frame, hue: (number) -> string, r: Row, ts: { ToolRec }?, qcap: number): { Node }
 	local pane = tostring(r.pane)
 	local now_ms = f.now_ms
 	local s = state_of(r)
@@ -526,11 +546,11 @@ local function agent_parts(f: Frame, hue: (number) -> string, r: Row, ts: { Tool
 		table.insert(acts, icon_btn("eye", "unpark=" .. pane, "Unpark: bring this parked wingman back into the current tab"))
 	elseif r.floating then
 		table.insert(acts, icon_btn("sidebar", "dock=" .. pane, "Dock this floating pane back into the split"))
-	elseif r.owner ~= nil then
-		table.insert(acts, icon_btn("pip", "pip=" .. pane, "Float this wingman in a corner of its owner"))
+	elseif r.can_pip and r.state ~= "exited" then
+		table.insert(acts, icon_btn("pip", "pip=" .. pane, "Float this agent in a corner of the pane beside it"))
 	end
-	if r.owner ~= nil and not r.parked then
-		table.insert(acts, icon_btn("eye-off", "park=" .. pane, "Park: hide this wingman (it keeps running)"))
+	if not r.parked and r.state ~= "exited" then
+		table.insert(acts, icon_btn("eye-off", "park=" .. pane, "Park: hide this agent (it keeps running)"))
 	end
 	if r.state == "working" then
 		table.insert(acts, icon_btn("stop", "interrupt=" .. pane, "Interrupt: send Ctrl-C to this agent's turn"))
@@ -539,6 +559,9 @@ local function agent_parts(f: Frame, hue: (number) -> string, r: Row, ts: { Tool
 	end
 	if r.queued > 0 then
 		table.insert(acts, icon_btn("x", "unqueue=" .. pane, "Unqueue: cancel the prompts queued for this agent"))
+	end
+	if r.state ~= "exited" then
+		table.insert(acts, icon_btn("plus", "queue_ask=" .. pane, "Queue Ask: add a prompt to this agent's queue"))
 	end
 	local tip = string.format("Focus %s%s · pane %s\n%s", r.title, if r.model then " · " .. r.model else "", pane, r.cwd)
 	local head: { Node } = { el("div", "wr-hit", hit, { actions = { click = "focus=" .. pane }, title = tip }) }
@@ -575,6 +598,33 @@ local function agent_parts(f: Frame, hue: (number) -> string, r: Row, ts: { Tool
 		end
 		table.insert(parts, el("div", "wr-loom", blocks))
 	end
+	local items = r.queue_items
+	if qcap > 0 and #items > 0 then
+		local width = loom_cap(f) * 2
+		local shown = math.min(#items, qcap)
+		local rows: { Node } = {}
+		for i = 1, shown do
+			local item = items[i]
+			local id = tostring(item.id)
+			local qacts: { Node } = {}
+			if item.position > 1 then
+				table.insert(qacts, icon_btn("arrow-up", "queue_top=" .. id, "Move to the top of the queue"))
+			end
+			table.insert(qacts, icon_btn("pencil", "queue_edit=" .. id, "Edit this queued prompt"))
+			table.insert(qacts, icon_btn("x", "queue_cancel=" .. id, "Cancel this queued prompt"))
+			table.insert(rows, el("div", "wr-q", {
+				el("div", "wr-qhit", {
+					txt("span", "wr-chip", "#" .. id, { title = "Slot " .. item.position }),
+					txt("span", "wr-tgt", clip(item.preview, width)),
+				}, { actions = { click = "queue_edit=" .. id }, title = item.preview }),
+				el("div", "wr-acts", qacts),
+			}, { key = "q" .. id }))
+		end
+		if #items > shown then
+			table.insert(rows, more_line(#items - shown))
+		end
+		table.insert(parts, el("div", "wr-qs", rows))
+	end
 	return parts
 end
 
@@ -587,10 +637,12 @@ local function topology(f: Frame, budget_left: number): Section
 	local kids: { Node } = {}
 	local hidden = 0
 	local placed: { [number]: boolean } = {}
-	local chain: (r: Row) -> { Node }
-	chain = function(r: Row): { Node }
+	local trail: { number } = {}
+	local qcap = 0
+	local function chain(r: Row): { Node }
 		placed[r.pane] = true
-		local parts = agent_parts(f, hue, r, by_tool[r.pane])
+		table.insert(trail, r.pane)
+		local parts = agent_parts(f, hue, r, by_tool[r.pane], qcap)
 		local rail: { Node } = {}
 		for _, id in r.workers do
 			local child = by_pane[id]
@@ -603,13 +655,29 @@ local function topology(f: Frame, budget_left: number): Section
 		end
 		return parts
 	end
+	-- A card that overflows the budget sheds queue previews (all the way to none) before it is hidden.
 	local function add(head: Row)
-		local n = el("div", "wr-card", chain(head), { key = "a" .. head.pane })
-		if hidden == 0 and fits(budget, n) then
-			table.insert(kids, n)
-		else
+		if hidden > 0 then
 			hidden += 1
+			qcap = 0
+			chain(head) -- marks its subtree placed so no later pass re-adds it as a head
+			return
 		end
+		for cap = queue_cap(f), 0, -1 do
+			qcap = cap
+			table.clear(trail)
+			local n = el("div", "wr-card", chain(head), { key = "a" .. head.pane })
+			if fits(budget, n) then
+				table.insert(kids, n)
+				return
+			end
+			if cap > 0 then
+				for _, pane in trail do
+					placed[pane] = nil
+				end
+			end
+		end
+		hidden += 1
 	end
 	for _, r in rows do
 		if r.owner == nil or by_pane[r.owner] == nil then
@@ -633,7 +701,8 @@ local function topology(f: Frame, budget_left: number): Section
 			bound += 1
 		end
 	end
-	local node = el("div", "wr-sec", { section_head("Agents", string.format("%d · %d bound", #rows, bound)), el("div", "wr-cards", kids) })
+	local meta = if bound > 0 then string.format("%d · %d bound", #rows, bound) else tostring(#rows)
+	local node = el("div", "wr-sec", { section_head("Agents", meta), el("div", "wr-cards", kids) })
 	return { node = node, grants = grants }
 end
 
@@ -821,7 +890,7 @@ local function living_files(f: Frame, budget_left: number): Section
 	local max_feed = feed_cap(f)
 	local agent_lines = 0
 	for _, r in f.rows do
-		agent_lines += if r.state == "idle" and r.fault == nil and r.queued == 0 then 1 else 3
+		agent_lines += (if r.state == "idle" and r.fault == nil and r.queued == 0 then 1 else 3) + queue_lines(f, r)
 	end
 	local feed_lines = 0
 	for _, id in tools.ids do
