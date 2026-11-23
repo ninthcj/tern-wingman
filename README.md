@@ -25,7 +25,7 @@ Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across
 - **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until the agent reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
 - **Zero-polling `AF_UNIX` event bus (`tern.process.spawn` + `agent_finished`)** — zero `.jsonl` polling, zero timer directory scans, and zero ephemeral TCP ports; `window.luau` wakes `wingman.py` over a `0600` UNIX domain socket in `2–10 ms` (even when occluded on Wayland) and survives live `tern plugin reload`.
 - **Explicit `anchor → wingman` ownership and editable queues** — sending to a busy worker queues in Wingman. Use `send --position N` to insert at a 1-based slot, or `queue list --all` to inspect pending tasks across your workers. Edit, cancel, or move a task by stable ID; reorder by supplying the pane’s complete ID sequence. Self and ancestor bindings are rejected before any effect.
-- **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if a worker finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if busy, and adding an explicit UTF-8-safe truncation notice past 3,600 bytes pointing to `wingman transcript`); workers can also push mid-turn progress or questions proactively via `wingman report -m "..."` (or `-m -` for piped stdin).
+- **State-driven automatic callbacks & escalations** — when a worker finishes a turn (including unsolicited follow-up turns such as an internal background job completing after the lead agent went `idle`), pauses on `waiting_input`, or stalls on a retryable fault, `window.luau` automatically pushes the summary back into the lead agent's composer (coalescing if busy, and adding an explicit UTF-8-safe truncation notice past 3,600 bytes pointing to `wingman transcript`).
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
 - **Non-intrusive Splits & Dynamic Picture-in-Picture (`--pip`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), stacks additional right-column workers cleanly, scales PiP windows dynamically to the owner's tab share with automatic free-corner selection (`br → tr → bl → tl`), and `unpark`s workers beside their owner.
 - **Native Live Panel (`radar.luau` + `radar_view.luau`)** — a Tern canvas showing the `owner → wingman` topology, Living Files, and recent tool calls, with one-click Focus / PiP / Dock / Interrupt / Retry / Unqueue. Sidebar width is remembered when dragged, floating size scales across resolutions and OSes, and Living Files / activity budgets adapt dynamically to panel size and active load.
@@ -164,8 +164,7 @@ python3 skills/wingman/scripts/wingman.py interrupt
 python3 skills/wingman/scripts/wingman.py unqueue
 python3 skills/wingman/scripts/wingman.py stop
 
-# Bidirectional worker -> supervisor reporting & auto-callback policy
-python3 skills/wingman/scripts/wingman.py report -m "Finished v4 pipeline; ready for review"
+# Inspect or toggle automatic worker -> supervisor callbacks
 python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 ```
 

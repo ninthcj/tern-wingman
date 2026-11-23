@@ -61,8 +61,6 @@ local dispatch_inflight: { [number]: number } = {}
 local queued_callbacks: { [number]: { string } } = {}
 -- Tracks whether a wingman pane is executing an unsolicited turn (no active `pending_waits` waiter)
 local unsolicited_working: { [number]: boolean } = {}
--- Tracks whether a wingman pane already called `report` (`kind ~= "progress"`) during the current turn
-local reported_in_turn: { [number]: boolean } = {}
 -- Panes intentionally interrupted via `wingman.py interrupt` (suppresses fault escalation until next turn)
 local manual_interrupt: { [number]: boolean } = {}
 
@@ -300,7 +298,6 @@ local function promote_next_queued(cx: WindowCx, pane_id: number): number?
 		end
 		local ok, err = ask_worker(cx, pane_id, item.prompt)
 		if ok then
-			reported_in_turn[pane_id] = false
 			unsolicited_working[pane_id] = item.cid == nil
 			if item.cid ~= nil then
 				pending_waits[pane_id] = {
@@ -332,7 +329,6 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 	end
 	pending_waits[pane_id] = nil
 	unsolicited_working[pane_id] = false
-	reported_in_turn[pane_id] = false
 	local last_msg, transcript = collect_turn_output(cx, pane_id)
 	if #w.cids == 0 then
 		local owner = state.owner_of_pane(cx, pane_id)
@@ -496,7 +492,6 @@ local function settle_stalled_fault(cx: WindowCx, pane: number)
 		end
 		if tsp.inspect_fault_surface(lcx, pane) then
 			unsolicited_working[pane] = false
-			reported_in_turn[pane] = false
 			deliver_fault_if_needed(lcx, pane, nil)
 		end
 	end)
@@ -535,7 +530,6 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 	elseif ev.new == "working" and ev.old ~= "working" and dispatches.count(ev.pane) == 0 then
 		if state.owner_of_pane(cx, ev.pane) ~= nil then
 			unsolicited_working[ev.pane] = true
-			reported_in_turn[ev.pane] = false
 		end
 	elseif ev.old == "working" and ev.new == "idle" and state.owner_of_pane(cx, ev.pane) ~= nil then
 		settle_stalled_fault(cx, ev.pane)
@@ -567,7 +561,6 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	if (ev.result == "failed" or ev.result == "exited") and not manual_interrupt[ev.pane] and state.owner_of_pane(cx, ev.pane) ~= nil then
 		-- Failed/exited turns (including across plugin reload) report the native error surface + retry hint once TSP settles.
 		unsolicited_working[ev.pane] = false
-		reported_in_turn[ev.pane] = false
 		was_unsolicited = false
 		local failed_pane = ev.pane
 		local failed_res = ev.result
@@ -580,13 +573,10 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	end
 	if was_unsolicited then
 		unsolicited_working[ev.pane] = false
-		local already_reported = reported_in_turn[ev.pane] == true
-		reported_in_turn[ev.pane] = false
 		local owner = state.owner_of_pane(cx, ev.pane)
 		local has_next_q = dispatches.count(ev.pane) > 0 and ev.result == "done"
 		if
 			owner ~= nil
-			and not already_reported
 			and state.is_auto_callback_enabled(owner)
 			and (ev.result == "done" or ev.result == "failed" or ev.result == "exited")
 		then
@@ -633,7 +623,6 @@ tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	state.unbind_pane(ev.pane)
 	state.clear_waiting(ev.pane)
 	unsolicited_working[ev.pane] = nil
-	reported_in_turn[ev.pane] = nil
 	queued_callbacks[ev.pane] = nil
 	manual_interrupt[ev.pane] = nil
 	if pending_waits[ev.pane] then
@@ -645,7 +634,6 @@ end)
 
 local function register_waiter(pane_id: number, cid: number)
 	unsolicited_working[pane_id] = false
-	reported_in_turn[pane_id] = false
 	local existing = pending_waits[pane_id]
 	if existing then
 		table.insert(existing.cids, cid)
@@ -653,36 +641,6 @@ local function register_waiter(pane_id: number, cid: number)
 		pending_waits[pane_id] = { cids = { cid }, started_ms = tern.now(), saw_working = false }
 	end
 	ensure_watchdog()
-end
-
-local function resolve_report_owner(cx: WindowCx, worker_pane: number, explicit_target: number?): (number?, string?)
-	if explicit_target ~= nil then
-		if explicit_target == worker_pane then
-			return nil, "refusing to report onto caller's own pane"
-		end
-		if cx.session:pane(explicit_target) == nil then
-			return nil, "explicit owner pane does not exist in this session"
-		end
-		return explicit_target, nil
-	end
-	local bound_owner = state.owner_of_pane(cx, worker_pane)
-	if bound_owner ~= nil then
-		return bound_owner, nil
-	end
-	-- Fallback when user opened supervisor + wingman manually in the same tab without `wingman.py send` yet:
-	local my_tab = cx.session:tab_of(worker_pane)
-	if my_tab ~= nil then
-		local peers: { number } = {}
-		for _, a in ipairs(cx.agents:list()) do
-			if a.pane ~= worker_pane and cx.session:tab_of(a.pane) == my_tab then
-				table.insert(peers, a.pane)
-			end
-		end
-		if #peers == 1 then
-			return peers[1], nil
-		end
-	end
-	return nil, "no supervisor/owner pane is bound to this wingman pane (pass `--pane <id>` to specify)"
 end
 
 -- Cores shared by the RPC ops and the live panel's buttons, so both keep the same control-plane bookkeeping.
@@ -1342,45 +1300,6 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		return
 	end
 
-	if op == "report" then
-		if not anchor then
-			send_mux(cid, { ok = false, error = "missing anchor_pane" }, false)
-			return
-		end
-		local prompt = tostring(req.prompt or "")
-		if prompt == "" then
-			send_mux(cid, { ok = false, error = "report message is empty" }, false)
-			return
-		end
-		local explicit_target: number? = if req.target_pane ~= nil and req.target_pane ~= tern.json.null
-			then tonumber(req.target_pane)
-			else nil
-		local owner, err_owner = resolve_report_owner(cx, anchor, explicit_target)
-		if not owner then
-			send_mux(cid, { ok = false, error = err_owner or "no owner pane found" }, false)
-			return
-		end
-		local kind = tostring(req.kind or "final")
-		if kind ~= "progress" then
-			reported_in_turn[anchor] = true
-		end
-		local tag = if kind == "progress"
-			then "progress"
-			elseif kind == "question" then "question"
-			else "report"
-		local delivered, queued, pos = deliver_to_owner(cx, owner, anchor, tag, prompt)
-		send_mux(cid, {
-			ok = true,
-			worker_pane = anchor,
-			owner_pane = owner,
-			kind = kind,
-			delivered = delivered,
-			queued = queued,
-			position = pos,
-		}, false)
-		return
-	end
-
 	if op == "callback" then
 		local mode = tostring(req.mode or "status")
 		local scope = tostring(req.scope or "owner")
@@ -1457,7 +1376,6 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				state.arm_callback(anchor)
 			end
 			unsolicited_working[tp] = true
-			reported_in_turn[tp] = false
 			send_mux(cid, { ok = true, async_callback = true, pane = tp, retried = true }, false)
 		else
 			send_mux(cid, { _ack = true, pane = tp }, true)
@@ -1566,7 +1484,6 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				state.bind_wingman(anchor, tp)
 			end
 			unsolicited_working[tp] = true
-			reported_in_turn[tp] = false
 		end
 		send_mux(cid, {
 			ok = all_ok,
@@ -1768,7 +1685,6 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			ensure_watchdog()
 		elseif async_cb then
 			unsolicited_working[pane] = true
-			reported_in_turn[pane] = false
 			send_mux(cid, { ok = true, async_callback = true, pane = pane, queued = false, position = 0 }, false)
 		else
 			send_mux(cid, { _ack = true, pane = pane }, true)
@@ -1951,7 +1867,6 @@ local function enqueue_prompt(cx: WindowCx, pane: number, prompt: string): (bool
 		return false, tostring(err)
 	end
 	unsolicited_working[pane] = true
-	reported_in_turn[pane] = false
 	notify_radar()
 	return true, nil, false
 end
@@ -2071,7 +1986,6 @@ if radar_loaded then
 				if ok_r then
 					-- As `retry --async`: the retried turn reports back to its bound owner when it ends.
 					unsolicited_working[pane] = true
-					reported_in_turn[pane] = false
 				end
 				return ok_r, err_r
 			end,

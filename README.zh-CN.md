@@ -18,7 +18,7 @@
 - **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 Agent 输入框 `sendable=true` 后单次原子投递。
 - **零轮询 `AF_UNIX` 原生事件总线（`tern.process.spawn` + `agent_finished`）**：0 磁盘 `.jsonl` 轮询、0 定时器扫目录、0 临时 TCP 端口；通过本地 `0600` UNIX Domain Socket 原生跨线程唤醒 UI 虚拟机（Wayland 后台失焦同样稳定 `2~10 ms` 响应），并支持插件热重载不断连恢复。
 - **显式 `anchor → wingman` 归属绑定与可编辑队列**：僚机忙碌时，Wingman 会将新任务加入队列。`send --position N` 可指定从 1 开始的插入位置；`queue list --all` 可查看自己所有僚机的待派发任务。通过稳定任务 ID 可编辑、撤回或转派，也可提交同一 pane 上的完整 ID 次序来重排。绑定自身或祖先会在产生任何副作用之前被拒绝。
-- **全双工双向回推（`report` 主动汇报 + 异步轮次自动唤醒）**：当僚机内部后台长任务（如 `bg_x`）跑完自动开启新一轮并结束时，即便主控早已进入 `idle`，插件也会自动把本轮结果回推唤醒主控（若主控正忙则自动缓冲合并投递；超过 3,600 字节时会按 UTF-8 边界安全截断并附带 `wingman transcript` 提示）；同时僚机也可随时调用 `wingman report -m "..."`（或 `-m -` 从标准输入管道读取）沿着 `boundOwner` 主动上报进度或提问。
+- **原生状态驱动自动回推与升级（Auto-Callback & Escalations）**：当僚机完成本轮（含后台长任务自动开启的后续轮次）、进入 `waiting_input` 等待决策或遇到可重试故障时，插件随宿主状态自动把结果或交互卡片回推唤醒主控（若主控正忙则自动缓冲合并投递；超过 3,600 字节按 UTF-8 边界安全截断并附带 `wingman transcript` 提示），彻底杜绝运行中途旁路消息错位。
 - **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片，并在 `waiting_input` 时原生提取 ACP `layer` 弹窗摘要。
 - **零抢焦点分屏 & 动态画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；多个右侧分屏自动垂直叠放，画中画按主控 Tab 占比与同类浮窗数量动态缩放并自动挑空角落（`br → tr → bl → tl`），`unpark` 恢复回主控身旁而不误切实时面板。
 - **原生实时面板（`radar.luau` + `radar_view.luau`）**：Tern 画布实时展示 `owner → wingman` 拓扑、文件动态与最近工具调用，并可一键聚焦 / 画中画 / 贴回 / 中断 / 重试 / 撤回排队。拖拽侧栏宽度会自动记忆（`sidebar_share`），浮窗尺寸随不同系统与分辨率按比例自适应，文件动态与活动流预算随面板宽高与负载动态调节。
@@ -121,8 +121,7 @@ python3 skills/wingman/scripts/wingman.py interrupt
 python3 skills/wingman/scripts/wingman.py unqueue
 python3 skills/wingman/scripts/wingman.py stop
 
-# 僚机反向主动汇报主控 / 查看或切换自动回推开关
-python3 skills/wingman/scripts/wingman.py report -m "后台链路已跑完，测试全绿，请验收"
+# 查看或切换自动回推开关
 python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 ```
 

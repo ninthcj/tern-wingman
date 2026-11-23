@@ -47,9 +47,6 @@ wingman retry [pane | --pane ID] [--cwd DIR] [--async | --wait] [--max-time 30m]
 wingman surface [pane | --pane ID] [--cwd DIR] [--root NODE_ID] [--all] [--json]
 wingman event [--pane ID] [--cwd DIR] [--no-rearm] '<json-event>' ...
 
-# Worker -> supervisor reverse push (run from inside the worker pane)
-wingman report (-m TEXT | --prompt-file FILE|-) [--kind final|progress|question] [--pane OWNER_ID]
-
 # Layout & lifecycle (all accept optional [pane | --pane ID] [--cwd DIR])
 wingman pip [--corner br|bl|tr|tl]
 wingman dock [--dir right|left|up|down]
@@ -74,7 +71,7 @@ wingman callback [status|on|off|reset] [--global] [--pane OWNER_ID]
 
 ## Runtime Behavior
 
-- **Async default when the caller is a Tern agent** (e.g. `agy`, `claude`, `codex`, detected by the caller's ID in Tern's agent list): `send` and `retry` return immediately after dispatch and Tern submits `[Wingman auto-callback · pane <id>]` back into your composer when the worker finishes. Do not poll or sleep; pass `--wait` only to force blocking stdout.
+- **Async default when the caller is a Tern agent** (e.g. `agy`, `claude`, `codex`, detected by the caller's ID in Tern's agent list): `send` and `retry` return immediately after dispatch and Tern submits `[Wingman auto-callback · pane <id>]` back into your composer when the worker finishes. Do not poll or sleep; pass `--wait` only to force blocking stdout. Workers report back simply by finishing their turn (or entering native `waiting_input` via their own interactive `ask` tool)—never instruct a worker to run a reverse CLI callback mid-turn.
 - **Editable queue**: Busy workers queue prompts in Wingman and promote from the head on completion. `send --position N` inserts into a 1-based slot; otherwise it appends. Use the returned queue ID rather than the slot to edit, move, or cancel; promoted or removed IDs are rejected. `queue list --all` lists your workers' pending tasks in this window, and `reorder` requires every ID on one pane exactly once. Moving to an idle worker can dispatch immediately. Pending prompts do not survive plugin reload.
 - **`[Wingman waiting_input · pane <id>]`**: `send` onto a `waiting_input` pane is refused. Inspect with `surface`, answer with `event` (auto-rearms callback unless `--no-rearm`; simple option pick: `'{"ev":"action","id":"ui","act":"pick:0:0"}' '{"ev":"action","id":"ui.actions/submit","act":"submit"}'`). Decide technical/architectural questions yourself; consult the user on product/scope/cost trade-offs.
 - **`[Wingman fault · retryable · pane <id>]`**: worker exhausted internal recovery and is waiting on `F5 to retry`. Run `retry --pane <id>` for transient stream/network/edit-preview glitches (up to 2–3 tries); consult the user on persistent quota/auth/config errors.

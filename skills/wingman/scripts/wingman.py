@@ -706,40 +706,6 @@ def select_wingman_pane_from_status(
     )
 
 
-def select_owner_pane_from_status(
-    status: dict[str, Any],
-    my_pane: int,
-) -> int:
-    """Resolve the caller wingman's supervisor/owner pane (`boundOwner`) for reverse reporting."""
-    agents = [
-        a
-        for a in status.get("agents", [])
-        if not a.get("is_self") and int(a["pane"]) != my_pane
-    ]
-    active_ids = {int(a["pane"]) for a in agents}
-
-    raw_owner = status.get("owner_pane")
-    if raw_owner is not None:
-        oid = int(raw_owner)
-        if oid != my_pane and oid in active_ids:
-            return oid
-
-    for a in status.get("agents", []):
-        if int(a["pane"]) == my_pane and a.get("bound_owner") is not None:
-            oid = int(a["bound_owner"])
-            if oid != my_pane and oid in active_ids:
-                return oid
-
-    same_tab_peers = [int(a["pane"]) for a in agents if a.get("same_tab")]
-    if len(same_tab_peers) == 1:
-        return same_tab_peers[0]
-
-    raise SystemExit(
-        "error: no supervisor/owner pane is bound to this pane "
-        "(pass `--pane <id>` from `wingman info` to specify the target owner pane)"
-    )
-
-
 def is_caller_tern_agent(status: dict[str, Any], my_pane: int) -> bool:
     """True when `my_pane` is a live Tern agent pane (any ACP agent or `omp`) rather than a plain shell."""
     return any(int(a["pane"]) == my_pane for a in status.get("agents", []))
@@ -1643,53 +1609,6 @@ def _retry(args: argparse.Namespace, res: dict[str, Any]) -> None:
         print(reply["last_message"])
 
 
-def cmd_report(args: argparse.Namespace) -> None:
-    """Push a report/progress/question from a wingman pane back up to its bound supervisor (`boundOwner`)."""
-    my_pane = current_tern_pane()
-    if my_pane is None:
-        raise SystemExit("error: `report` requires running inside Tern")
-
-    prompt = _read_prompt_input(args.prompt, args.prompt_file, label="report prompt")
-
-    explicit_owner: int | None = None
-    if args.pane:
-        if not str(args.pane).isdigit():
-            raise SystemExit(f"error: invalid owner pane id: {args.pane!r}")
-        explicit_owner = int(args.pane)
-        if explicit_owner == my_pane:
-            raise SystemExit(f"error: refusing to report onto caller's own pane ({my_pane})")
-    else:
-        status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
-        explicit_owner = select_owner_pane_from_status(status, my_pane)
-
-    reply = call_bridge(
-        {
-            "op": "report",
-            "anchor_pane": my_pane,
-            "target_pane": explicit_owner,
-            "kind": args.kind,
-            "prompt": prompt,
-        },
-        timeout=DEFAULT_BRIDGE_TIMEOUT,
-    )
-    if not reply.get("ok"):
-        raise SystemExit(f"error: {reply.get('error')}")
-    print(
-        json.dumps(
-            {
-                "workerPane": reply.get("worker_pane", my_pane),
-                "ownerPane": reply.get("owner_pane", explicit_owner),
-                "kind": reply.get("kind", args.kind),
-                "delivered": bool(reply.get("delivered")),
-                "queued": bool(reply.get("queued")),
-                "position": int(reply.get("position") or 0),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-
-
 def cmd_callback(args: argparse.Namespace) -> None:
     """Inspect or toggle unsolicited wingman -> supervisor auto-callback policy."""
     my_pane = current_tern_pane()
@@ -1830,14 +1749,6 @@ def build_parser() -> argparse.ArgumentParser:
     cb_grp.add_argument("--no-auto-callback", dest="auto_callback", action="store_false", help="Disable unsolicited worker->owner auto-callback for this binding")
     p_send.add_argument("--json", action="store_true", help="Print a single JSON result object on stdout (exit codes 0/1/2/124)")
     p_send.set_defaults(func=cmd_send)
-
-    p_rep = sub.add_parser("report", help="Push a report/progress/question from a wingman pane back up to its bound supervisor")
-    rep_grp = p_rep.add_mutually_exclusive_group(required=True)
-    rep_grp.add_argument("--prompt", "--message", "-m", dest="prompt", help="Report message text")
-    rep_grp.add_argument("--prompt-file", help="Path to report markdown/text file (or '-' for stdin)")
-    p_rep.add_argument("--kind", choices=["final", "progress", "question"], default="final", help="Report kind (`progress` keeps end-of-turn auto-callback active)")
-    p_rep.add_argument("--pane", help="Optional explicit supervisor/owner pane id (defaults to caller's boundOwner)")
-    p_rep.set_defaults(func=cmd_report)
 
     p_cb = sub.add_parser("callback", help="Inspect or toggle unsolicited wingman -> supervisor auto-callback")
     p_cb.add_argument("mode", nargs="?", choices=["status", "on", "off", "reset"], default="status")
