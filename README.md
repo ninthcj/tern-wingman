@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  English · <a href="README.zh-CN.md">简体中文</a>
+  English · <a href="README.zh-CN.md">简体中文</a> · <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
@@ -25,10 +25,10 @@ Instead of emulating terminal keystrokes (`paste` + `Enter`, which breaks across
 - **Atomic TSP prompt delivery (`cx.agents:start` / `cx.agents:ask`)** — prompts are queued natively by Tern until the agent reports `sendable=true` and delivered as a single atomic TSP `send` event, regardless of length.
 - **Zero-polling `AF_UNIX` event bus (`tern.process.spawn` + `agent_finished`)** — zero `.jsonl` polling, zero timer directory scans, and zero ephemeral TCP ports; `window.luau` wakes `wingman.py` over a `0600` UNIX domain socket in `2–10 ms` (even when occluded on Wayland) and survives live `tern plugin reload`.
 - **Explicit `anchor → wingman` ownership graph & FIFO queueing** — ACP lead agents (`agy`, `claude`, `codex`) never target themselves or collide in multi-agent tabs; binding a pane to itself or an ancestor is rejected with a cycle error before any effect. Sending to a busy worker queues natively in `window.luau` (`unqueue` cancels pending slots), and `same` / `interrupt` / `pip` track the bound worker across `ovnfs` checkouts and subdirectory changes.
-- **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if `omp` finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if the lead agent is busy); `omp` can also push mid-turn progress or questions proactively via `wingman.py report`.
+- **Full-duplex bidirectional callbacks (`report` + Auto-Callback)** — if a worker finishes an unsolicited follow-up turn (such as an internal background job completing after the lead agent went `idle`), `window.luau` automatically pushes the completion back into the lead agent's composer (coalescing if busy, and adding an explicit UTF-8-safe truncation notice past 3,600 bytes pointing to `wingman transcript`); workers can also push mid-turn progress or questions proactively via `wingman report -m "..."` (or `-m -` for piped stdin).
 - **In-memory structured transcripts (`cx.agents:transcript`)** — read recent turns and tool cards straight from Tern's live TSP memory without touching disk.
-- **Non-intrusive Splits & Picture-in-Picture (`--pip br`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), and floats/docks the wingman as a corner PiP overlay on demand.
-- **Native Live Panel (`radar.luau`)** — a Tern canvas showing the `owner → wingman` topology, the files agents are touching (`git status` ∪ edit/read tool calls), and their recent tool calls, with one-click Focus / PiP / Dock / Interrupt / Retry / Unqueue. Pure Luau inside the window plugin: no subprocess, no CLI round-trip, no change to the socket protocol.
+- **Non-intrusive Splits & Dynamic Picture-in-Picture (`--pip`)** — spawns splits without yanking keyboard focus away from your lead agent (even across background tabs), stacks additional right-column workers cleanly, scales PiP windows dynamically to the owner's tab share with automatic free-corner selection (`br → tr → bl → tl`), and `unpark`s workers beside their owner.
+- **Native Live Panel (`radar.luau` + `radar_view.luau`)** — a Tern canvas showing the `owner → wingman` topology, Living Files, and recent tool calls, with one-click Focus / PiP / Dock / Interrupt / Retry / Unqueue. Sidebar width is remembered when dragged, floating size scales across resolutions and OSes, and Living Files / activity budgets adapt dynamically to panel size and active load.
 - **Mechanism, not policy** — zero prompt rewriting and zero hidden config overrides; the lead agent decides per task whether to open a fresh session (`new`), iterate in place (`same`), resume a specific session, or isolate risky changes in an [`ovnfs`](https://github.com/stencil-hq/ovnfs) copy-on-write checkout.
 
 ## Architecture
@@ -38,10 +38,10 @@ sequenceDiagram
     participant L as Lead Agent (ACP agy / claude / codex / …)
     participant W as wingman.py (AF_UNIX client)
     participant M as mux.py (0600 AF_UNIX <-> stdio)
-    participant P as Tern Plugin (window.luau · WindowCx.agents)
-    participant O as omp Wingman (Right Split or PiP)
+    participant P as Tern Plugin (window / state / tsp / radar · WindowCx.agents)
+    participant O as Wingman (omp or tern acp <id> · Split / PiP)
 
-    L->>W: wingman.py send <new|same|id> --prompt-file spec.md
+    L->>W: wingman send <new|same|id> --prompt-file spec.md
     W->>M: JSON line over w-<pid>.sock
     M->>P: native stdout wakeup on UI VM thread
     P->>O: cx.agents:start / cx.agents:ask + bind(anchor -> wingman)
@@ -51,6 +51,8 @@ sequenceDiagram
     M->>W: JSON reply + EOF
     W-->>L: stdout reply + exit status (0=done, 2=waiting_input)
 ```
+
+The Tern plugin is split into five acyclic Luau modules: `window.luau` (RPC router, turn/queue/callback state machine, dynamic worker placement), `state.luau` (`owners_v1` 1-to-N graph, `bindings_v1` migration, cycle guard), `tsp.luau` (stateless TSP/surface helpers, ACP `layer` dialog extraction, UTF-8 clipping), `radar.luau` (Live Panel controller & 50 ms budget guard), and `radar_view.luau` (pure declarative CSS + UI renderer).
 
 ## Install
 
@@ -86,18 +88,18 @@ Verify the plugin is `ready`:
 
 ```sh
 tern plugin list
-# wingman 0.1.0 Wingman — 0 blocks, 0 lenses, window  ready
+# wingman 0.6.0 Wingman — 0 blocks, 0 lenses, window  ready
 ```
 
 </details>
 
 ## Live Panel
 
-Toggle it from the palette (**Wingman: Toggle Live Panel**) or add the **Wingman** widget to the widget bar (palette → *Edit widgets…* → *Plugins*); the widget shows working / waiting / queued counts and toggles the panel on click. The canvas opens as a sidebar on the far right of the tab (about a quarter of its width, taken from the panes on its left) without taking focus, and survives `tern plugin reload`. The button beside *Tab* / *All* floats it as a corner PiP over the rightmost pane or docks it back; that choice, and the corner you drag the float to, are remembered.
+Toggle it from the palette (**Wingman: Toggle Live Panel**) or add the **Wingman** widget to the widget bar (palette → *Edit widgets…* → *Plugins*); the widget shows working / waiting / queued counts and toggles the panel on click. The canvas opens as a sidebar on the far right of the tab without taking focus and survives `tern plugin reload`. Dragging the sidebar divider remembers your preferred width (`sidebar_share` in `radar_v1`). The button beside *Tab* / *All* floats it as a proportionally sized corner PiP over the rightmost pane or docks it back; both the mode and the corner you drag the float to are remembered across resolutions and OSes.
 
 - **Topology** — each owner with its bound wingmen: state, time in state, queued prompts, fault flag. Click a row to focus its pane; per-row PiP/Dock, Interrupt, Retry (after a fault) and Unqueue run the same cores as the CLI ops.
-- **Living files** — per repository, `git status` merged with the files agents edited or read in recent tool calls; click to open. *Clear reads* hides read-only entries.
-- **Activity** — each working agent's card shows its current tool and a strip of its last 24 calls colored by kind (read / search / edit / run / error, the running one pulsing); below, the last 8 calls across agents from `cx.agents:transcript`, for omp and ACP panes alike.
+- **Living files** — per repository, `git status` merged with files agents edited (including external edits) or read in recent tool calls, with cross-OS path normalization; click to open. Read-only entries are capped dynamically from the panel's available height and active load, folding overflow into `… N more`, and *Clear reads* hides them on demand.
+- **Activity** — each working agent's card shows its current tool and a loom strip of recent calls colored by kind (read / search / edit / run / error, the running one pulsing), with strip length and recent-call feed count adapting dynamically to the panel's width/height share (`cx.agents:transcript`, for `omp` and ACP panes alike).
 - **Stage & dock** — working / waiting / queued / fault tiles under a glow that follows the agents' mood, *Tab* / *All* scope (persisted), *Open Git*, *Clear reads*, and a health dot whose tooltip shows the panel's measured cost per render.
 
 Budget (Tern pauses a window hook whose call runs past 50 ms of Lua, and every timer shares one hook with the wingman watchdog): while closed the panel only keeps per-agent counts for the widget — no timer, transcript or git work. While open it re-renders on agent events and ticks only while an in-scope agent is working, spaced to keep under 2 % of the window thread; `git status` runs once per repository, is never re-issued while pending, and is asked less often the slower it is. Each render times its Lua and native parts; past 10 ms of Lua (or 100 ms wall) it drops transcript sampling ("lite") for a cooldown that doubles like Tern's own pause. It never reads `cx.session:surface` (~20 ms per omp pane).
@@ -169,8 +171,8 @@ One owner can run several wingmen at once, and wingmen can own wingmen. `send ne
 
 | Layout | Use for |
 | --- | --- |
-| `split` | primary worker, beside the supervisor |
-| `pip` | lightweight worker or watcher (`--pip tl\|tr\|bl\|br` sets the corner and implies `--layout pip`; default `br`) |
+| `split` | primary worker beside the supervisor; additional `split`/`dock` workers stack cleanly in the right column |
+| `pip` | lightweight worker or watcher, dynamically sized to the owner's tab share (`--pip tl\|tr\|bl\|br` pins a corner and implies `--layout pip`; omitting the corner picks the first free corner `br → tr → bl → tl`) |
 | `down` | second worker, stacked under the right-side worker |
 | `tab` | independent unfocused tab for a 3rd+ or noisy worker |
 | `park` | hide a live worker; `omp` keeps running and responding while parked, but a hidden ACP agent queues prompts until `unpark` |

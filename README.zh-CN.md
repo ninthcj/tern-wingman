@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · 简体中文
+  <a href="README.md">English</a> · 简体中文 · <a href="CHANGELOG.md">更新日志</a>
 </p>
 
 ---
@@ -18,10 +18,10 @@
 - **原生 TSP 原子投递（`cx.agents:start` / `cx.agents:ask`）**：不走模拟粘贴回车、不撞 Linux 4 KB PTY 行缓冲上限，由 Tern 窗口原生队列等 Agent 输入框 `sendable=true` 后单次原子投递。
 - **零轮询 `AF_UNIX` 原生事件总线（`tern.process.spawn` + `agent_finished`）**：0 磁盘 `.jsonl` 轮询、0 定时器扫目录、0 临时 TCP 端口；通过本地 `0600` UNIX Domain Socket 原生跨线程唤醒 UI 虚拟机（Wayland 后台失焦同样稳定 `2~10 ms` 响应），并支持插件热重载不断连恢复。
 - **显式 `anchor → wingman` 归属绑定与原生排队（`unqueue`）**：主控跑在 Tern 原生 ACP 界面（`agy`、`claude`、`codex`）时绝不误伤自身或其他主控的僚机；显式把 pane 绑定到自身或其祖先会在产生任何副作用之前以环路错误拒绝。僚机忙碌时继续派单会在 `window.luau` 内存队列自动排队并在 `agent_finished` 时按序推进，支持随时 `unqueue` 撤回。
-- **全双工双向回推（`report` 主动汇报 + 异步轮次自动唤醒）**：当 `omp` 内部后台长任务（如 `bg_x`）跑完自动开启新一轮并结束时，即便主控 `agy` 早已进入 `idle`，插件也会自动把本轮结果回推唤醒主控（若主控正忙则自动缓冲合并投递）；同时 `omp` 也可随时调用 `wingman.py report -m "..."` 沿着 `boundOwner` 主动上报进度或提问。
-- **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片。
-- **零抢焦点分屏 & 画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；随时支持 `--pip br` 缩成角落画中画小窗盯盘、`dock` 一键贴回分屏。
-- **原生实时面板（`radar.luau`）**：Tern 画布实时展示 `owner → wingman` 拓扑、Agent 正在动的文件（`git status` ∪ 编辑/读取类工具调用）与最近工具调用，并可一键聚焦 / 画中画 / 贴回 / 中断 / 重试 / 撤回排队。纯 Luau 跑在窗口插件内：不起子进程、不走 CLI、不改 socket 协议。
+- **全双工双向回推（`report` 主动汇报 + 异步轮次自动唤醒）**：当僚机内部后台长任务（如 `bg_x`）跑完自动开启新一轮并结束时，即便主控早已进入 `idle`，插件也会自动把本轮结果回推唤醒主控（若主控正忙则自动缓冲合并投递；超过 3,600 字节时会按 UTF-8 边界安全截断并附带 `wingman transcript` 提示）；同时僚机也可随时调用 `wingman report -m "..."`（或 `-m -` 从标准输入管道读取）沿着 `boundOwner` 主动上报进度或提问。
+- **内存级结构化对话读取（`cx.agents:transcript`）**：直接从 Tern 内存读取最近几轮回复与工具调用卡片，并在 `waiting_input` 时原生提取 ACP `layer` 弹窗摘要。
+- **零抢焦点分屏 & 动态画中画悬浮（PiP）**：哪怕你正切在别的 Tab，分屏派活也绝不抢夺键盘焦点；多个右侧分屏自动垂直叠放，画中画按主控 Tab 占比与同类浮窗数量动态缩放并自动挑空角落（`br → tr → bl → tl`），`unpark` 恢复回主控身旁而不误切实时面板。
+- **原生实时面板（`radar.luau` + `radar_view.luau`）**：Tern 画布实时展示 `owner → wingman` 拓扑、文件动态与最近工具调用，并可一键聚焦 / 画中画 / 贴回 / 中断 / 重试 / 撤回排队。拖拽侧栏宽度会自动记忆（`sidebar_share`），浮窗尺寸随不同系统与分辨率按比例自适应，文件动态与活动流预算随面板宽高与负载动态调节。
 - **纯机制、零越俎代庖**：脚本只做忠实透明管道，不篡改 Prompt、不魔改任何全局扩展；每次派单是用干净新会话（`new`）、原位续跑（`same`）、还是配合 [`ovnfs`](https://github.com/stencil-hq/ovnfs) 开零拷贝写时复制沙箱，完全由主控模型按任务性质自主权衡。
 
 ## 安装
@@ -50,12 +50,14 @@ ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wing
 
 ## 实时面板（Live Panel）
 
-命令面板执行 **Wingman: Toggle Live Panel**，或把 **Wingman** 组件加到组件栏（命令面板 → *Edit widgets…* → *Plugins*），组件显示 working / waiting / queued 计数，点击即开关面板。画布默认作为侧栏贴在当前 Tab 最右侧（约占 Tab 宽度的四分之一，从左侧 pane 让出空间），不抢焦点，`tern plugin reload` 后自动接管续画。*Tab* / *All* 旁的按钮可将其浮动为最右 pane 角落的画中画或贴回侧栏；该选择以及你拖动浮窗到的角落都会被记住。
+命令面板执行 **Wingman: Toggle Live Panel**，或把 **Wingman** 组件加到组件栏（命令面板 → *Edit widgets…* → *Plugins*），组件显示 working / waiting / queued 计数，点击即开关面板。画布默认作为侧栏贴在当前 Tab 最右侧，不抢焦点，`tern plugin reload` 后自动接管续画；手动拖动侧栏分隔线会自动记住你的偏好宽度（`radar_v1.sidebar_share`）。*Tab* / *All* 旁的按钮可将其浮动为按 Tab 比例自适应缩放的角落画中画或贴回侧栏，浮窗模式与拖动到的角落均会跨分辨率持久化记住。
 
 - **Topology**：每个主控及其绑定僚机的状态、持续时长、排队数与故障标记；点击行聚焦对应 pane，行内 PiP/Dock、Interrupt、Retry（故障后）、Unqueue 与 CLI 操作共用同一套核心逻辑。
-- **Living files**：按仓库合并 `git status` 与 Agent 最近编辑/读取过的文件，点击打开；*Clear reads* 隐藏只读条目。
-- **Activity**：工作中的 Agent 卡片内显示当前工具与最近 24 次调用的色块节拍条（read / search / edit / run / error，进行中的色块脉动）；下方列出各 Agent 最近 8 次调用，数据来自 `cx.agents:transcript`，omp 与 ACP pane 通用。
+- **Living files**：按仓库合并 `git status` 与 Agent 最近编辑（含仓库外编辑）或读取过的文件，跨 macOS / Linux / Windows 规范化路径，点击即打开；只读条目上限随面板可用高度与活跃负载动态调节，超出折叠为 `… N more`，*Clear reads* 可一键隐藏只读条目。
+- **Activity**：工作中的 Agent 卡片内显示当前工具与色块节拍条（read / search / edit / run / error，进行中的色块脉动），节拍条长度与下方跨 Agent 近期调用条数随面板宽高占比动态调节（数据来自 `cx.agents:transcript`，`omp` 与 ACP pane 通用）。
 - **舞台与 Dock**：随 Agent 状态变色的顶部氛围舞台与 working / waiting / queued / fault 计数格，*Tab* / *All* 作用域（持久化）、*Open Git*、*Clear reads*，以及悬停可见每次渲染实测开销的健康指示点。
+
+插件本身按职责拆分为 5 个无环 Luau 模块：`window.luau`（控制面路由、排队/回推状态机与动态布局）、`state.luau`（`owners_v1` 一对多归属图、`bindings_v1` 迁移与环路检测）、`tsp.luau`（无状态 TSP/surface 工具、ACP `layer` 弹窗提取与 UTF-8 安全截断）、`radar.luau`（Live Panel 控制器与 50 ms 预算守护）及 `radar_view.luau`（纯声明式 CSS 与 UI 渲染器）。
 
 预算（Tern 会暂停单次调用 Lua 超过 50 ms 的窗口 hook，且所有定时器与 wingman 看门狗共用一个 hook）：面板关闭时只为组件维护每个 Agent 的计数，无定时器、无 transcript、无 git。打开时随 Agent 事件重绘，仅在作用域内有 Agent 工作时才定时刷新，间隔保证平均占用窗口线程低于 2%；`git status` 按仓库去重、未返回前绝不重发，仓库越慢询问越少。每次渲染分别计时 Lua 与原生调用，Lua 超过 10 ms（或墙钟超过 100 ms）即降级为不采样 transcript 的 lite 模式，冷却期像 Tern 自身暂停一样倍增。从不读取 `cx.session:surface`（omp pane 单次约 20 ms）。
 
@@ -121,8 +123,8 @@ python3 skills/wingman/scripts/wingman.py callback [status|on|off|reset]
 
 | 布局 | 适用场景 |
 | --- | --- |
-| `split` | 主僚机，紧邻主控 |
-| `pip` | 轻量任务或盯盘（`--pip tl\|tr\|bl\|br` 选择角落并隐含 `--layout pip`，默认 `br`） |
+| `split` | 主僚机，紧邻主控；新增 `split` / `dock` 僚机自动在右侧列垂直叠放 |
+| `pip` | 轻量任务或盯盘，按主控 Tab 占比动态缩放（`--pip tl\|tr\|bl\|br` 固定角落并隐含 `--layout pip`；省略角落时自动选择首个空闲角落 `br → tr → bl → tl`） |
 | `down` | 第二个僚机，叠在右侧僚机下方 |
 | `tab` | 第 3 个及以上或输出嘈杂的僚机，放入独立且不抢焦点的 Tab |
 | `park` | 隐藏僚机；`omp` 停放期间继续运行并响应，但被隐藏的 ACP Agent 会让提示排队直到 `unpark` |
