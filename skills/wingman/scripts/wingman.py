@@ -1250,10 +1250,6 @@ def _non_negative_int(raw: str) -> int:
     return value
 
 
-CLIP_MARK = "… (truncated)"
-CLIP_SCALE = 10000
-
-
 def _collect_text_leaves(node: Any, in_tool: bool, out: list[tuple[Any, Any, str, bool]]) -> None:
     """Collect (container, key, original, is_tool) for clippable string leaves; tool context propagates downward."""
     items = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else ()
@@ -1267,36 +1263,63 @@ def _collect_text_leaves(node: Any, in_tool: bool, out: list[tuple[Any, Any, str
             _collect_text_leaves(val, tool, out)
 
 
-def bound_transcript_json(messages: list[Any], max_chars: int) -> str:
-    """Serialize `messages` (indent=2) to at most `max_chars` characters of valid JSON.
+def _clip_leaf_text(original: str, cap: int, is_tool: bool) -> str:
+    """Clip `original` under water-filling cap `cap` (leaving strings <= cap untouched).
 
-    Reduction order: tool text is clipped proportionally, then message text;
-    clipped text keeps a prefix plus `… (truncated)`. If keys and structure alone still
-    exceed the bound, the oldest messages are dropped. `[]` takes 2 characters, so smaller
-    bounds are rejected; very small bounds therefore trade content for validity.
+    Tool output preserves head (30%) + tail (70%) so trailing errors/conclusions survive;
+    message text preserves the leading prefix. Monotonically non-decreasing in `cap`.
     """
+    if len(original) <= cap:
+        return original
+    omitted = len(original) - cap
+    if cap == 0:
+        return f"… (truncated {omitted} chars)"
+    if is_tool:
+        head = (cap * 3) // 10
+        tail = cap - head
+        prefix = original[:head] if head > 0 else ""
+        suffix = original[len(original) - tail :] if tail > 0 else ""
+        return f"{prefix}\n… (truncated {omitted} chars) …\n{suffix}"
+    return f"{original[:cap]}… (truncated {omitted} chars)"
 
-    def dump(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, indent=2)
 
-    full = dump(messages)
-    if len(full) <= max_chars:
-        return full
+def bound_transcript_json(messages: list[Any], max_chars: int) -> str:
+    """Serialize `messages` to at most `max_chars` characters of valid JSON.
+
+    Degradation order:
+      1. Pretty JSON (indent=2) if it already fits.
+      2. Compact JSON (no extra whitespace) if it fits with zero content loss.
+      3. Water-filling cap on tool `text` leaves (head+tail preserved; short leaves untouched).
+      4. Water-filling cap on message `text` leaves (short messages untouched).
+      5. Drop oldest messages as a last resort so valid JSON (`[]` at minimum) is always returned.
+    """
+    pretty = json.dumps(messages, ensure_ascii=False, indent=2)
+    if len(pretty) <= max_chars:
+        return pretty
     if max_chars < 2:
         raise SystemExit("error: --max-chars must be at least 2 to hold valid JSON")
 
-    work = json.loads(full)
+    def dump_compact(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    compact = dump_compact(messages)
+    if len(compact) <= max_chars:
+        return compact
+
+    work = json.loads(compact)
     leaves: list[tuple[Any, Any, str, bool]] = []
     _collect_text_leaves(work, False, leaves)
 
-    def render(tool_num: int, msg_num: int) -> str:
-        for container, key, original, tool in leaves:
-            keep = len(original) * (tool_num if tool else msg_num) // CLIP_SCALE
-            container[key] = original if len(original) <= keep else original[:keep] + CLIP_MARK
-        return dump(work)
+    max_tool = max((len(orig) for _, _, orig, tool in leaves if tool), default=0)
+    max_msg = max((len(orig) for _, _, orig, tool in leaves if not tool), default=0)
 
-    def largest(fits: Callable[[int], bool]) -> int:
-        lo, hi = 0, CLIP_SCALE
+    def render(tool_cap: int, msg_cap: int) -> str:
+        for container, key, original, tool in leaves:
+            container[key] = _clip_leaf_text(original, tool_cap if tool else msg_cap, tool)
+        return dump_compact(work)
+
+    def largest(hi: int, fits: Callable[[int], bool]) -> int:
+        lo = 0
         while lo < hi:
             mid = (lo + hi + 1) // 2
             if fits(mid):
@@ -1305,16 +1328,16 @@ def bound_transcript_json(messages: list[Any], max_chars: int) -> str:
                 hi = mid - 1
         return lo
 
-    if len(render(0, CLIP_SCALE)) <= max_chars:
-        tool_num = largest(lambda n: len(render(n, CLIP_SCALE)) <= max_chars)
-        return render(tool_num, CLIP_SCALE)
+    if len(render(0, max_msg)) <= max_chars:
+        tool_cap = largest(max_tool, lambda c: len(render(c, max_msg)) <= max_chars)
+        return render(tool_cap, max_msg)
     if len(render(0, 0)) <= max_chars:
-        msg_num = largest(lambda n: len(render(0, n)) <= max_chars)
-        return render(0, msg_num)
+        msg_cap = largest(max_msg, lambda c: len(render(0, c)) <= max_chars)
+        return render(0, msg_cap)
 
     render(0, 0)
     for start in range(len(work) + 1):
-        text = dump(work[start:])
+        text = dump_compact(work[start:])
         if len(text) <= max_chars:
             return text
     raise AssertionError("unreachable: [] always fits when max_chars >= 2")

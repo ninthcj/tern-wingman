@@ -1177,7 +1177,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         self.assertLessEqual(len(out.rstrip("\n")), 240)
         result = json.loads(out)
         self.assertEqual(result[0]["text"], "keep this summary")
-        self.assertIn("… (truncated)", result[0]["tools"][0]["text"])
+        self.assertIn("… (truncated ", result[0]["tools"][0]["text"])
 
     def test_info_reports_queued_items(self) -> None:
         status = _multi_status([105])
@@ -1258,6 +1258,40 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         self.assertIsNone(code)
         self.assertEqual((calls[0]["action"], calls[0]["id"]), ("cancel", 11))
         self.assertNotIn("target_pane", calls[0])
+
+    def test_bound_transcript_water_filling_and_head_tail(self) -> None:
+        huge_log = "BUILD_START " + ("x" * 2000) + " FATAL_ERROR_AT_TAIL"
+        msgs = [
+            {
+                "role": "assistant",
+                "text": "Summary ready.",
+                "tools": [
+                    {"name": "check", "text": "tests passed"},
+                    {"name": "bash", "text": huge_log},
+                ],
+            }
+        ]
+        # 1. Compact JSON preserves everything without clipping when pretty > max_chars >= compact
+        pretty_len = len(json.dumps(msgs, ensure_ascii=False, indent=2))
+        compact_len = len(json.dumps(msgs, ensure_ascii=False, separators=(",", ":")))
+        self.assertLess(compact_len, pretty_len)
+        out_compact = wingman.bound_transcript_json(msgs, compact_len)
+        self.assertLessEqual(len(out_compact), compact_len)
+        self.assertEqual(json.loads(out_compact), msgs)
+
+        # 2. Water-filling keeps short tool text & message text intact while clipping only huge_log with head+tail
+        out = wingman.bound_transcript_json(msgs, 360)
+        self.assertLessEqual(len(out), 360)
+        parsed = json.loads(out)
+        self.assertEqual(parsed[0]["text"], "Summary ready.")
+        self.assertEqual(parsed[0]["tools"][0]["text"], "tests passed")
+        clipped = parsed[0]["tools"][1]["text"]
+        self.assertIn("BUILD_START", clipped)
+        self.assertIn("FATAL_ERROR_AT_TAIL", clipped)
+        self.assertIn("truncated", clipped)
+
+        # 3. Minimum valid JSON boundary
+        self.assertEqual(wingman.bound_transcript_json(msgs, 2), "[]")
 
     def test_luau_workbench_view_fixture(self) -> None:
         import shutil
