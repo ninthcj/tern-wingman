@@ -4,6 +4,9 @@ All notable changes to `tern-wingman` are documented in this file.
 
 ## [Unreleased]
 
+### Removed
+- **Removed out-of-band `wingman report` CLI/RPC (`op == "report"`, `reported_in_turn`)**: Workers no longer inject mid-turn `progress`/`question` messages into a supervisor's composer while continuing to run (`working`), eliminating state/message desynchronization and queued-reply deadlocks. All upward communication now aligns strictly with Tern's native agent states (`agent_finished` auto-callback on turn end and `waiting_input` surface escalation).
+
 ### Changed
 - `info` fast path: live-state only, reports `availableAgents`; `--no-sessions` / `--limit 0` skip session scanning.
 - `send` and `retry` accept `--json`; `transcript --max-chars N` bounds output; stale pane ids are recovered by re-running `info`.
