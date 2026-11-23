@@ -784,15 +784,15 @@ local function can_pip(cx: WindowCx, pane: number): boolean
 	return layout ~= nil and first_leaf(layout.root, pane, nil) ~= nil
 end
 
-local function float_worker(cx: WindowCx, pane: number, over: number?, requested: Corner?): (boolean, string?)
+local function float_worker(cx: WindowCx, pane: number, over: number?, requested: Corner?): (boolean, string?, Corner?)
 	if over == nil then
 		local layout = tab_layout(cx, pane)
 		if layout == nil then
-			return false, "agent is not in a tiled tab"
+			return false, "agent is not in a tiled tab", nil
 		end
 		over = first_leaf(layout.root, pane, live_panel_pane(cx)) or first_leaf(layout.root, pane, nil)
 		if over == nil then
-			return false, "no sibling pane to float over"
+			return false, "no sibling pane to float over", nil
 		end
 	end
 	local sx, sy = pane_shares(cx, over :: number)
@@ -823,7 +823,8 @@ local function float_worker(cx: WindowCx, pane: number, over: number?, requested
 	local w = math.clamp(0.36 / math.max(sx, 0.25), 0.34, 0.68)
 	local base_h = if peers >= 1 then 0.38 else 0.46
 	local h = math.clamp(base_h / math.max(sy, 0.4), 0.34, 0.56)
-	return cx.layout:float(pane, over, chosen, { focus = false, size = { w, h } })
+	local ok, err = cx.layout:float(pane, over, chosen, { focus = false, size = { w, h } })
+	return ok, err, if ok then chosen else nil
 end
 
 -- Choose a tiled slot beside `anchor` without crushing `anchor`: stack `"down"` under an existing
@@ -868,9 +869,10 @@ local function unpark_pane(cx: WindowCx, pane: number): (boolean, string?)
 	return true, nil
 end
 
-local function place_worker(cx: WindowCx, pane: number, anchor: number, form: WorkerLayout, corner: Corner): (boolean, string?)
+local function place_worker(cx: WindowCx, pane: number, anchor: number, form: WorkerLayout, corner: Corner?): (boolean, string?)
 	if form == "pip" then
-		return float_worker(cx, pane, anchor, corner)
+		local ok, err = float_worker(cx, pane, anchor, corner)
+		return ok, err
 	elseif form == "park" then
 		return park_pane(cx, pane)
 	elseif form == "tab" then
@@ -891,7 +893,7 @@ local function place_worker(cx: WindowCx, pane: number, anchor: number, form: Wo
 	return ok, if ok then nil else "could not move wingman beside target pane"
 end
 
-local function spawn_worker(cx: WindowCx, anchor: number, form: WorkerLayout, cwd: string, command: string, corner: Corner): (number?, string?)
+local function spawn_worker(cx: WindowCx, anchor: number, form: WorkerLayout, cwd: string, command: string, corner: Corner?): (number?, string?)
 	local launch = { cwd = cwd, command = command }
 	local pane: number?
 	if form == "tab" then
@@ -1334,9 +1336,9 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 	if op == "pip" or op == "dock" or op == "park" or op == "unpark" then
 		local tp = target :: number
 		local over = state.owner_of_pane(cx, tp) or anchor
-		local ok: boolean, err: string?
+		local ok: boolean, err: string?, chosen_corner: Corner?
 		if op == "pip" then
-			ok, err = float_worker(cx, tp, over, corner_of(req.corner))
+			ok, err, chosen_corner = float_worker(cx, tp, over, corner_of(req.corner))
 		elseif op == "dock" then
 			local d: Dir? = if req.dir == "left" or req.dir == "right" or req.dir == "up" or req.dir == "down"
 				then req.dir
@@ -1350,7 +1352,7 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		if ok and anchor and not state.owner_of_pane(cx, tp) and (op == "pip" or op == "dock") then
 			state.bind_wingman(anchor, tp)
 		end
-		send_mux(cid, { ok = ok, pane = tp, error = err }, false)
+		send_mux(cid, { ok = ok, pane = tp, corner = chosen_corner, error = err }, false)
 		return
 	end
 
@@ -1552,7 +1554,6 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		local form: WorkerLayout? = nil
 		local requested = req.layout
 		local corner: Corner? = corner_of(req.pip_corner)
-		local placement_corner: Corner = if corner then corner else "br"
 		if requested == nil or requested == tern.json.null then
 			if corner then
 				form = "pip" -- Legacy clients sent only pip_corner.
@@ -1632,14 +1633,14 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		if target_pane then
 			pane = target_pane
 			if form then
-				local ok, err = place_worker(cx, pane, anchor, form, placement_corner)
+				local ok, err = place_worker(cx, pane, anchor, form, corner)
 				if not ok then
 					send_mux(cid, { ok = false, error = err or ("could not place wingman in " .. form) }, false)
 					return
 				end
 			end
 		else
-			local spawned, err = spawn_worker(cx, anchor, form or "split", tostring(req.cwd or ""), command, placement_corner)
+			local spawned, err = spawn_worker(cx, anchor, form or "split", tostring(req.cwd or ""), command, corner)
 			if not spawned then
 				send_mux(cid, { ok = false, error = err }, false)
 				return
@@ -1973,7 +1974,8 @@ if radar_loaded then
 				return string.match(rest, "^[^:]*:(.+)$") or rest
 			end,
 			pip = function(cx: WindowCx, pane: number): (boolean, string?)
-				return float_worker(cx, pane, state.owner_of_pane(cx, pane), nil)
+				local ok_f, err_f = float_worker(cx, pane, state.owner_of_pane(cx, pane), nil)
+				return ok_f, err_f
 			end,
 			dock = function(cx: WindowCx, pane: number): (boolean, string?)
 				return dock_worker(cx, pane, state.owner_of_pane(cx, pane), nil)

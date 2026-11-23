@@ -611,9 +611,10 @@ class WingmanMultiWorkerTests(unittest.TestCase):
 
         for target_argv, status in ((["new"], _multi_status([])), (["same"], _multi_status([105]))):
             with self.subTest(layout="pip", argv=target_argv):
-                # `--layout pip` alone defaults to the bottom-right corner
+                # `--layout pip` alone leaves `pip_corner` unset so `window.luau` picks a free corner
                 req = self._dispatch([*target_argv, "--layout", "pip"], status)
-                self.assertEqual((req["layout"], req["pip_corner"]), ("pip", "br"))
+                self.assertEqual(req["layout"], "pip")
+                self.assertNotIn("pip_corner", req)
                 # `--layout pip --pip <corner>` and legacy `--pip <corner>` alone are equivalent
                 for corner in ("tl", "tr", "bl", "br"):
                     both = self._dispatch([*target_argv, "--layout", "pip", "--pip", corner], status)

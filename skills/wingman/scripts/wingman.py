@@ -853,7 +853,8 @@ def parse_send_options(
     """Validate Tern-only `send` flags; return (explicit_pane, layout, pip_corner).
 
     `layout` is None when the caller expressed no placement. `--pip <corner>` is both the legacy alias for
-    `--layout pip` and the corner modifier of `--layout pip`; `pip_corner` is set only for layout `pip` (default `br`).
+    `--layout pip` and the explicit corner modifier; omitting `--pip` with `--layout pip` leaves `pip_corner`
+    as None so `window.luau` picks the first free corner (`br -> tr -> bl -> tl`).
     """
     layout = args.layout
     corner = args.pip
@@ -882,8 +883,6 @@ def parse_send_options(
         raise SystemExit(f"error: --pip conflicts with --layout {layout}")
     if corner is not None:
         layout = "pip"
-    if layout == "pip" and corner is None:
-        corner = "br"
     return explicit_pane, layout, corner
 
 
@@ -1332,13 +1331,13 @@ def cmd_pip(args: argparse.Namespace) -> None:
     if my_pane is None:
         raise SystemExit("error: `pip` requires running inside Tern")
     pane = _resolve_explicit_or_bound_pane(args, my_pane)
-    reply = call_bridge(
-        {"op": "pip", "anchor_pane": my_pane, "target_pane": pane, "corner": args.corner},
-        timeout=DEFAULT_BRIDGE_TIMEOUT,
-    )
+    req: dict[str, Any] = {"op": "pip", "anchor_pane": my_pane, "target_pane": pane}
+    if args.corner is not None:
+        req["corner"] = args.corner
+    reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT)
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
-    print(json.dumps({"pane": pane, "floating": args.corner}, indent=2))
+    print(json.dumps({"pane": pane, "floating": reply.get("corner") or args.corner or "br"}, indent=2))
 
 
 def cmd_dock(args: argparse.Namespace) -> None:
@@ -1759,12 +1758,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")
     _add_pane_args(p_tr)
     p_tr.add_argument("--last", type=int, default=8, help="Number of recent messages")
-    p_tr.add_argument("--max-chars", type=_positive_int, help="Bound the printed JSON to at most N characters: tool text is clipped first, then message text proportionally (clipped text ends with `…`); if keys and structure alone overflow, oldest messages are dropped. N below 2 cannot hold valid JSON and is rejected")
+    p_tr.add_argument("--max-chars", type=_positive_int, help="Bound the printed JSON to at most N characters (compact JSON first, then water-filling head+tail clip on tool text, then message text)")
     p_tr.set_defaults(func=cmd_transcript)
 
     p_pip = sub.add_parser("pip", help="Float worker pane into Picture-in-Picture corner")
     _add_pane_args(p_pip)
-    p_pip.add_argument("--corner", choices=["tl", "tr", "bl", "br"], default="br")
+    p_pip.add_argument("--corner", choices=["tl", "tr", "bl", "br"], default=None, help="Corner to pin (default: first free corner br -> tr -> bl -> tl)")
     p_pip.set_defaults(func=cmd_pip)
 
     p_dock = sub.add_parser("dock", help="Dock floating Picture-in-Picture worker back into split")

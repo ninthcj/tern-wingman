@@ -81,7 +81,7 @@ wingman callback [status|on|off|reset] [--global] [--pane OWNER_ID]
 ## Layout Selection
 
 - **One primary interactive task:** `split` beside the supervisor (the default).
-- **Quick check or peripheral watcher:** `pip`. `--pip tl|tr|bl|br` implies `--layout pip` and sets the corner; the default is `br`.
+- **Quick check or peripheral watcher:** `pip`. `--pip tl|tr|bl|br` implies `--layout pip` and pins that corner; omitting the corner picks the first free corner (`br → tr → bl → tl`).
 - **Second concurrent worker:** `down` stacks below the right-side worker (or below the supervisor if none), or use `pip`.
 - **Three or more workers, or heavy/noisy `omp` runs:** `park` keeps `omp` workers off-screen but live, with callbacks and Live Panel visibility. Use `tab` for a dedicated background tab (ACP agents there queue until shown). `unpark` brings a parked worker back into the current tab without focusing it.
 
