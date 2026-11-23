@@ -30,7 +30,7 @@ expect(segs[1].icon, "alert-triangle", "fault icon")
 expect(segs[2].tone, "warn", "queue tone")
 expect(segs[3].text, "↩3", "callback text")
 expect(segs[3].command, "s", "callback opens Live Panel")
-expect(assert(NativeUi.status_segments("waiting_input", nil, 0, 0, "s", "q"))[1].text, "waiting", "waiting")
+expect(NativeUi.status_segments("waiting_input", nil, 0, 0, "s", "q"), nil, "waiting_input is owned by Tern native Agents widget")
 
 local rows = {
 	{ pane = 5, title = "solo", state = "idle", queued = 0, current = false },
@@ -107,20 +107,21 @@ local ui = NativeUi.new({
 	changed = function() end, log = function() end,
 })
 ui.register()
-expect(commands.switch_agent.title, "Wingman: Switch / Search Agents", "switch title")
+expect(commands.switch_agent, nil, "no redundant switch_agent command")
 expect(commands.manage_queue.title, "Wingman: Search / Manage Queue", "manage title")
 expect(button.id, "send_to_agent", "Files button id")
-expect(commands.switch_agent.available(cx), true, "switch available")
 expect(commands.manage_queue.available(cx), true, "manage available")
 expect(status_fn({ pane = 10 })[1].text, "Q1", "status Q for pane 10")
 expect(status_fn({ pane = 99 }), nil, "status unknown pane")
 expect(status_fn({ pane = 10 }), status_fn({ pane = 10 }), "unchanged segments are cached")
 
--- Switch: pick parked pane 11 -> unpark then focus.
-answers = { function(items) for _, i in items do if i.pane == 11 then return i end end end }
-commands.switch_agent.run(cx)
-expect(table.concat(calls, ","), "unpark 11,focus 11", "unpark then focus")
-expect(#picks[1].items, 2, "all live agents listed")
+-- Focus via Manage Queue on a parked pane -> unpark then focus.
+answers = {
+	function(items) return items[2] end,
+	function(items) for _, i in items do if i.act == "focus" then return i end end error("focus action unavailable") end,
+}
+commands.manage_queue.run(cx)
+expect(table.concat(calls, ","), "unpark 11,focus 11", "unpark then focus via manage_queue")
 
 -- Manage: pick #8, then Move, then destination 10 -> dispatched toast.
 calls, picks, toasts = {}, {}, {}

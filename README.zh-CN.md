@@ -55,11 +55,11 @@ ln -sf "$(pwd)/tern-wingman/skills/wingman/scripts/wingman.py" ~/.local/bin/wing
 - **Topology**：每个主控及其绑定僚机的状态、持续时长、排队数与故障标记；点击行聚焦对应 pane，行内 PiP/Dock、Interrupt、Retry（故障后）、Unqueue 与 CLI 操作共用同一套核心逻辑。
 - **Living files**：按仓库合并 `git status` 与 Agent 最近编辑（含仓库外编辑）或读取过的文件，跨 macOS / Linux / Windows 规范化路径，点击即打开；只读条目上限随面板可用高度与活跃负载动态调节，超出折叠为 `… N more`，*Clear reads* 可一键隐藏只读条目。
 - **Activity**：工作中的 Agent 卡片内显示当前工具与色块节拍条（read / search / edit / run / error，进行中的色块脉动），节拍条长度与下方跨 Agent 近期调用条数随面板宽高占比动态调节（数据来自 `cx.agents:transcript`，`omp` 与 ACP pane 通用）。
-- **舞台与 Dock**：随 Agent 状态变色的顶部氛围舞台与 working / waiting / queued / fault 计数格，*Tab* / *All* 作用域（持久化）、*Open Git*、*Clear reads*，以及悬停可见每次渲染实测开销的健康指示点。
+- **舞台与 Dock**：随 Agent 状态变色的顶部氛围舞台与 working / waiting / queued / fault 计数格，*Tab* / *All* 作用域（持久化）、*Clear reads*、*Popouts* 开关与上限，以及悬停可见每次渲染实测开销的健康指示点。
 
-### 切换/搜索智能体、管理队列与 Files
+### 原生队列搜索、Files 按钮与状态段
 
-**Wingman: Switch / Search Agents** 搜索窗口内所有运行中的 Agent，选中后恢复已停放的 Agent 并聚焦。**Wingman: Search / Manage Queue** 先搜索待派发任务，再选择置顶、编辑、转移、取消或聚焦 Agent。Files 面板的 **Send selection to Agent** 将选中的路径（无选择时为当前目录）预填到提示词。Tern 的 **Plugin segments** 组件仅显示当前聚焦 Agent 的故障、等待、队列和回调状态，点击打开 Wingman Live 或队列管理。
+**Wingman: Search / Manage Queue** 在整个窗口内搜索待派发任务，再选择置顶、编辑、转移到其他 Agent、取消或聚焦所属 Agent。Files 面板的 **Send selection to Agent** 将选中的路径（无选择时为当前目录）预填到提示词。Tern 的 **Plugin segments** 组件仅显示当前聚焦 Agent 的 Wingman 专属状态（`fault`、`Q<n>`、`↩<n>`，不与 Tern 原生 Agents 组件重叠），点击打开 Wingman Live 或队列管理。
 
 ### Workbench（独立工作台，适用任意 Agent）
 

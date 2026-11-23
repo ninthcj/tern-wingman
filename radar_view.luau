@@ -1088,10 +1088,6 @@ end
 
 local function dock_node(info: DockInfo): Node
 	local kids: { Node } = {
-		el("button", "wr-btn", { icon("git-branch"), txt("span", nil, "Open Git") }, {
-			actions = { click = "git" },
-			title = "Open the git block of the main repository in scope",
-		}),
 		el("button", "wr-btn", { icon("eraser"), txt("span", nil, "Clear reads") }, {
 			actions = { click = "clear" },
 			title = "Hide the read/search touches shown so far",

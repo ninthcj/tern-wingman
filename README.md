@@ -100,11 +100,11 @@ Toggle it from the palette (**Wingman: Toggle Live Panel**) or add the **Wingman
 - **Topology** — each owner with its bound wingmen: state, time in state, queued prompts, fault flag. Click a row to focus its pane; per-row PiP/Dock, Interrupt, Retry (after a fault) and Unqueue run the same cores as the CLI ops.
 - **Living files** — per repository, `git status` merged with files agents edited (including external edits) or read in recent tool calls, with cross-OS path normalization; click to open. Read-only entries are capped dynamically from the panel's available height and active load, folding overflow into `… N more`, and *Clear reads* hides them on demand.
 - **Activity** — each working agent's card shows its current tool and a loom strip of recent calls colored by kind (read / search / edit / run / error, the running one pulsing), with strip length and recent-call feed count adapting dynamically to the panel's width/height share (`cx.agents:transcript`, for `omp` and ACP panes alike).
-- **Stage & dock** — working / waiting / queued / fault tiles under a glow that follows the agents' mood, *Tab* / *All* scope (persisted), *Open Git*, *Clear reads*, and a health dot whose tooltip shows the panel's measured cost per render.
+- **Stage & dock** — working / waiting / queued / fault tiles under a glow that follows the agents' mood, *Tab* / *All* scope (persisted), *Clear reads*, *Popouts* toggle/limit, and a health dot whose tooltip shows the panel's measured cost per render.
 
-### Switch / Search Agents, Manage Queue & Files
+### Manage Queue, Files & Status Segments
 
-**Wingman: Switch / Search Agents** searches all live agents in the window and restores parked agents before focusing them. **Wingman: Search / Manage Queue** searches pending tasks, then offers actions to reorder, edit, move, cancel, or focus the agent. The Files pane’s **Send selection to Agent** button prefills a prompt with selected paths (or the folder when nothing is selected). Tern’s **Plugin segments** widget shows fault, waiting, queue, and callback indicators only for the focused agent; clicking opens Wingman Live or queue management.
+**Wingman: Search / Manage Queue** searches pending tasks across the window, then offers actions to move to top, edit, reassign to another agent, cancel, or focus the agent. The Files pane’s **Send selection to Agent** button prefills a prompt with selected paths (or the folder when nothing is selected). Tern’s **Plugin segments** widget shows Wingman-only indicators (`fault`, `Q<n>`, `↩<n>`) for the focused agent without duplicating Tern’s native Agents widget; clicking opens Wingman Live or queue management.
 
 ### Subagent Panes (opt-in)
 

@@ -81,7 +81,7 @@ local ABOUT = "Live view of this window's coding agents (omp and ACP) and their 
 	.. "its owner; PiP floats a wingman over its owner and Dock puts it back; Park hides a wingman (it keeps running) "
 	.. "and Unpark brings it into the current tab; Interrupt sends "
 	.. "Ctrl-C to that agent's turn; Retry sends /retry to a stalled agent; Unqueue cancels prompts queued for it. "
-	.. "Clicking a file opens it beside; Open Git opens the git block; Clear Reads hides read/search touches; Tab/All "
+	.. "Clicking a file opens it beside; Clear Reads hides read/search touches; Tab/All "
 	.. "picks which agents show. Popouts toggles automatic Subagent Panes; its limit button cycles capacity."
 
 local BUDGET_MS = 50 -- window-half Lua budget per call (tern.d.luau)
@@ -179,7 +179,6 @@ local KV_SUBAGENTS = "subagent_panes_v1"
 local subagents = Subagents.new(nil)
 local terminal_subagents: { [number]: "done" | "error" } = {}
 local any_working = false
-local primary_root: string? = nil
 local live_agents = 0 -- agents not exited; kept by `track` and `forget_agent`
 local cwd_of: { [number]: string } = {}
 
@@ -928,7 +927,6 @@ local function compose(cx: WindowCx, b: Bridge, t0: number, phases: { string }):
 	end
 	lap("sample")
 	local roots = kick_git(cx, rows)
-	primary_root = roots[1]
 	lap("git")
 	-- Keyboard moves and other plugins' calls fire no `float_moved`: the toggle follows what the panel is now.
 	local self_pane = panel_pane
@@ -1606,17 +1604,6 @@ local function handle_action(ev: CanvasAction, cx: WindowCx, b: Bridge)
 		place(cx, b, want)
 	elseif act == "subagent_toggle" or act == "subagent_limit" then
 		configure_subagents(cx, act == "subagent_limit")
-	elseif act == "git" then
-		local root = primary_root
-		if root == nil then
-			cx:toast("info", "Wingman: no git repository among the agents in scope")
-		else
-			cx.git:open(root, { how = "beside" }):next(function(_pane: number?, err: string?, later: WindowCx?)
-				if err and later then
-					later:toast("error", "Wingman: Open Git failed", err)
-				end
-			end)
-		end
 	elseif act == "clear" then
 		for _, id in tool_ids do
 			if tools[id].kind == "read" then

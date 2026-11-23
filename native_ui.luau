@@ -202,8 +202,8 @@ function M.files_prefill(root: string?, selection: { string }): string?
 	return table.concat(shown, " ") .. " "
 end
 
---- Status-bar segments of one agent: fault or waiting, then queued prompts and queued callbacks; nil for an unknown
---- or quiet agent.
+--- Status-bar segments of one agent: Wingman-only signals (fault, queued prompts, queued callbacks).
+--- Tern's native Agents widget already reports working/waiting, so those are never duplicated here.
 function M.status_segments(
 	state: string?,
 	fault: string?,
@@ -218,8 +218,6 @@ function M.status_segments(
 	local segments: { Segment } = {}
 	if fault ~= nil then
 		table.insert(segments, { text = "fault", icon = "alert-triangle", tone = "error", command = switch_action })
-	elseif state == "waiting_input" then
-		table.insert(segments, { text = "waiting", icon = "message-circle", tone = "warn", command = switch_action })
 	end
 	if queued > 0 then
 		table.insert(segments, { text = "Q" .. queued, icon = "list", tone = "warn", command = queue_action })
@@ -409,26 +407,6 @@ function M.new(d: Deps)
 		)
 	end
 
-	function ui.switch_agent(cx: any)
-		local rows = ui.live_rows(cx)
-		if #rows == 0 then
-			cx:toast("info", "Wingman: no live agent to switch to")
-			return
-		end
-		cx:pick({ items = M.switch_items(rows), placeholder = "Switch to agent…", icon = "layers", action = "focus" }):next(
-			function(item: any, err: string?, later: any)
-				if not settled(cx, later) then
-					return
-				end
-				if err then
-					later:toast("error", "Wingman: Switch Agent failed", err)
-				elseif item ~= nil and type(item.pane) == "number" then
-					ui.reveal(later, item.pane)
-				end
-			end
-		)
-	end
-
 	local function move_queued(cx: any, id: number, from: number)
 		local rows = ui.live_rows(cx)
 		for _, r in rows do
@@ -562,15 +540,6 @@ function M.new(d: Deps)
 
 	function ui.register()
 		local host = d.host
-		host.command({
-			id = "switch_agent",
-			title = "Wingman: Switch / Search Agents",
-			icon = "layers",
-			available = function(_cx: any): boolean
-				return d.live_count() > 0
-			end,
-			run = guarded("switch_agent", "Wingman: Switch Agent", ui.switch_agent),
-		})
 		host.command({
 			id = "manage_queue",
 			title = "Wingman: Search / Manage Queue",
