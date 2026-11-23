@@ -88,7 +88,7 @@ Verify the plugin is `ready`:
 
 ```sh
 tern plugin list
-# wingman 0.6.0 Wingman — 0 blocks, 0 lenses, window  ready
+# wingman 0.7.0 Wingman — 0 blocks, 0 lenses, window  ready
 ```
 
 </details>

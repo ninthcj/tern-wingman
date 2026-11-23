@@ -2,7 +2,7 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
-## [Unreleased]
+## [0.7.0] - 2026-11-23
 
 ### Added
 - Editable pending-task queues with stable IDs: `wingman queue list`, `edit`, `cancel`, `move`, and `reorder`; `send --position`, `unqueue --id`, and per-agent `queuedItems` in `info`.
