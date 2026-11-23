@@ -2,6 +2,11 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
+## [0.8.1] - 2026-11-23
+
+### Fixed
+- **CLI PiP free-corner auto-selection**: Omitting `--pip <corner>` on `wingman send --layout pip` and omitting `--corner` on `wingman pip` now preserve `nil` through to `window.luau` so multiple PiP floats automatically pick unoccupied corners (`br → tr → bl → tl`) instead of stacking on `br`.
+
 ## [0.8.0] - 2026-11-23
 
 ### Removed
