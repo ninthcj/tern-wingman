@@ -14,6 +14,13 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 
+def mock_stderr():
+    import io
+    from unittest import mock
+
+    return mock.patch("sys.stderr", new_callable=io.StringIO)
+
+
 def mock_stdout(buf):
     from unittest import mock
 
@@ -161,26 +168,59 @@ class WingmanTests(unittest.TestCase):
             ns = parser.parse_args(["surface", "100"])
             ns.func(ns)
 
-    def test_event_cli_parses_events_and_rearm(self) -> None:
+    def test_surface_cli_explicit_root_disables_auto_root_and_surfaces_missing_node(self) -> None:
         from unittest import mock
 
         parser = wingman.build_parser()
         calls: list[dict] = []
-        replies = [{"ok": True, "results": []}, {"ok": False, "error": "boom"}]
+        replies = [
+            {"ok": True, "root": "n40", "interactive_role": None, "surface": "subtree"},
+            {"ok": False, "pane": 200, "error": 'surface node "n99" not found on pane 200'},
+        ]
 
         def fake_bridge(req, timeout=None):
             calls.append(req)
             return replies[len(calls) - 1]
 
-        a = '{"ev":"action","id":"n1","act":"pick:0:0"}'
-        b = '{"ev":"action","id":"n2","act":"submit"}'
+        with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(wingman, "call_bridge", fake_bridge):
+            with mock.patch("sys.stdout"):
+                ns = parser.parse_args(["surface", "--pane", "200", "--root", "n40"])
+                ns.func(ns)
+            ns = parser.parse_args(["surface", "--pane", "200", "--root", "n99"])
+            with self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+        self.assertEqual(calls[0]["root"], "n40")
+        self.assertIs(calls[0]["auto_root"], False)
+        self.assertEqual(calls[1]["root"], "n99")
+        self.assertIs(calls[1]["auto_root"], False)
+        self.assertEqual(str(cm.exception), 'error: surface node "n99" not found on pane 200')
+
+    def test_event_cli_parses_events_and_rearm(self) -> None:
+        import io
+        from unittest import mock
+
+        parser = wingman.build_parser()
+        calls: list[dict] = []
+        error = 'surface node "ui" not found on pane 200 (active interactive root is "40", role omp.ask.card)'
+        rejected = {"ok": False, "pane": 200, "error": error, "results": [{"index": 1, "ok": False, "error": error}]}
+        replies = [{"ok": True, "results": []}, rejected]
+
+        def fake_bridge(req, timeout=None):
+            calls.append(req)
+            return replies[len(calls) - 1]
+
+        a = '{"ev":"action","id":"40","act":"pick:0:0"}'
+        b = '{"ev":"action","id":"40.actions/submit","act":"submit"}'
+        stale_pick = '{"ev":"action","id":"ui","act":"pick:0:0"}'
         with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(wingman, "call_bridge", fake_bridge):
             with mock.patch("sys.stdout"):
                 ns = parser.parse_args(["event", "--pane", "200", a, b])
                 ns.func(ns)
-                ns = parser.parse_args(["event", "--pane", "200", "--no-rearm", b])
-                with self.assertRaises(SystemExit):
-                    ns.func(ns)
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, self.assertRaises(SystemExit) as failure:
+                ns = parser.parse_args(["event", "--pane", "200", "--no-rearm", stale_pick, b])
+                ns.func(ns)
+            self.assertEqual(failure.exception.code, 1)
+            self.assertEqual(json.loads(stdout.getvalue()), rejected)
             with self.assertRaises(SystemExit):
                 ns = parser.parse_args(["event", "--pane", "200", "not-json"])
                 ns.func(ns)
@@ -930,7 +970,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         out = info_for({"ok": True, "bound_pane": 105, "agents": [_agent(105, bound_owner=100)]})
         self.assertEqual((out["boundWingmanPanes"], out["boundWingmanPane"]), ([105], 105))
 
-    def _info(self, status: dict, omp: str | None, inspect_data: dict | None = None) -> dict:
+    def _info(self, status: dict, omp: str | None, inspect_data: dict | None = None, extra: list[str] | None = None) -> dict:
         import io
         from contextlib import redirect_stdout
         from unittest import mock
@@ -939,7 +979,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
             raise AssertionError("omp must not be consulted when it is missing")
 
         with tempfile.TemporaryDirectory(dir="/tmp") as tmp:
-            ns = wingman.build_parser().parse_args(["info", "--cwd", tmp])
+            ns = wingman.build_parser().parse_args(["info", "--cwd", tmp, *(extra or [])])
             buf = io.StringIO()
             with mock.patch.dict(wingman.os.environ, {"TERN_PANE": "100"}), mock.patch.object(
                 wingman, "find_omp_bin", lambda required=True: omp
@@ -956,12 +996,12 @@ class WingmanMultiWorkerTests(unittest.TestCase):
     def test_info_kind_comes_only_from_omp_session_file_and_omp_is_optional(self) -> None:
         status = _multi_status([105], [_agent(106)])
         inspect_data = {"panes": [{"pane": 105, "omp_session_file": "/tmp/s105.jsonl"}, {"pane": 106, "omp_session_file": None}]}
-        out = self._info(status, "omp", inspect_data)
+        out = self._info(status, "omp", inspect_data, ["--all"])
         kinds = {a["pane"]: a["kind"] for a in out["ternAgents"]}
         self.assertEqual((kinds[105], kinds[106]), ("omp", "acp"))
         self.assertEqual(out["ompBin"], "omp")
         # Without omp installed `info` still works and reports the native agents
-        out = self._info(status, None, inspect_data)
+        out = self._info(status, None, inspect_data, ["--all"])
         self.assertIsNone(out["ompBin"])
         self.assertEqual(out["boundWingmanPanes"], [105])
         self.assertEqual({a["pane"] for a in out["ternAgents"]}, {100, 105, 106})
@@ -1135,7 +1175,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
 
     def test_transcript_char_cap_compacts_tool_text_first(self) -> None:
         messages = [{"role": "assistant", "text": "keep this summary", "tools": [{"name": "read", "text": 'λ\n"' * 2000}]}]
-        _, code, out = self._run_cli(["transcript", "105", "--max-chars", "240"], {"ok": True, "messages": messages})
+        _, code, out = self._run_cli(["transcript", "105", "--tools", "--max-chars", "240"], {"ok": True, "messages": messages})
         self.assertIsNone(code)
         self.assertLessEqual(len(out.rstrip("\n")), 240)
         result = json.loads(out)
@@ -1190,6 +1230,394 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         reply, sent = run({"_ack": True, "pane": 105}, [{"_reload": True}, {"ok": True, "last_message": "done"}])
         self.assertTrue(reply["ok"])
         self.assertEqual([s["op"] for s in sent], ["dispatch", "await"])
+
+    def _cli_output(self, argv: list[str], status: dict, reply: dict | None = None, env: dict | None = None) -> tuple[list[dict], str | int | None, str]:
+        import io
+        from unittest import mock
+
+        calls: list[dict] = []
+        ns = wingman.build_parser().parse_args(argv)
+        out = io.StringIO()
+        with self._patched(status, calls, reply) as stack:
+            stack.enter_context(mock_stdout(out))
+            stack.enter_context(mock.patch.dict(wingman.os.environ, env or {}))
+            try:
+                ns.func(ns)
+                code = None
+            except SystemExit as exc:
+                code = exc.code
+        return calls, code, out.getvalue()
+
+    def test_answer_cli_choices_are_options_never_panes(self) -> None:
+        status = _multi_status([105])
+        calls, code, out = self._cli_output(["answer", "2"], status, {"ok": True, "pane": 105})
+        self.assertIsNone(code)
+        req = next(c for c in calls if c["op"] == "answer")
+        self.assertEqual(req, {"op": "answer", "anchor_pane": 100, "target_pane": 105, "rearm": True, "choices": [2]})
+        self.assertEqual(out.strip(), "[wingman] Answered pane 105: option 2")
+
+        status = _multi_status([105, 107])
+        calls, code, out = self._cli_output(["answer", "1", "2", "--pane", "107", "--no-rearm"], status, {"ok": True, "pane": 107})
+        req = next(c for c in calls if c["op"] == "answer")
+        self.assertEqual((req["target_pane"], req["choices"], req["rearm"]), (107, [1, 2], False))
+        self.assertIn("options 1 2", out)
+        self.assertEqual([c["op"] for c in calls], ["answer"])
+
+        # With several workers a bare choice must not guess a pane
+        calls, code, _ = self._cli_output(["answer", "2"], status, {"ok": True, "pane": 105})
+        self.assertIsInstance(code, str)
+        self.assertFalse([c for c in calls if c["op"] == "answer"])
+
+    def test_answer_cli_other_question_and_decisions(self) -> None:
+        status = _multi_status([105])
+        text = "héllo 😀 世界"
+        calls, code, out = self._cli_output(["answer", "--other", text, "--question", "2"], status, {"ok": True, "pane": 105})
+        self.assertIsNone(code)
+        req = next(c for c in calls if c["op"] == "answer")
+        self.assertEqual((req["other"], req["question"], req["choices"]), (text, 2, []))
+        self.assertIn("other", out)
+
+        calls, _, _ = self._cli_output(["answer", "3", "--other", "x"], status, {"ok": True, "pane": 105})
+        req = next(c for c in calls if c["op"] == "answer")
+        self.assertEqual((req["choices"], req["other"]), ([3], "x"))
+
+        for flag in ("approve", "deny", "cancel"):
+            with self.subTest(flag=flag):
+                calls, code, out = self._cli_output(["answer", f"--{flag}"], status, {"ok": True, "pane": 105})
+                self.assertIsNone(code)
+                req = next(c for c in calls if c["op"] == "answer")
+                self.assertIs(req[flag], True)
+                self.assertEqual([k for k in ("approve", "deny", "cancel") if k in req], [flag])
+                self.assertEqual(req["choices"], [])
+                self.assertIn(flag, out)
+
+    def test_answer_cli_rejects_bad_input_before_any_bridge_call(self) -> None:
+        status = _multi_status([105])
+        for argv in (["answer"], ["answer", "--question", "2"], ["answer", "1", "--approve"], ["answer", "--other", "  "], ["answer", "--other", "x", "--deny"]):
+            with self.subTest(argv=argv):
+                calls, code, _ = self._cli_output(argv, status, {"ok": True})
+                self.assertIsInstance(code, str)
+                self.assertTrue(code.startswith("error: "))
+                self.assertEqual(calls, [])
+        parser = wingman.build_parser()
+        for argv in (["answer", "0"], ["answer", "--approve", "--deny"], ["answer", "--question", "0", "1"]):
+            with self.subTest(argv=argv), mock_stderr(), self.assertRaises(SystemExit) as cm:
+                parser.parse_args(argv)
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_answer_cli_bridge_failure_and_json(self) -> None:
+        status = _multi_status([105])
+        failure = {"ok": False, "pane": 105, "error": "choice 9 is out of range (question 1 has 3 options)"}
+        _, code, out = self._cli_output(["answer", "9"], status, failure)
+        self.assertEqual(code, f"error: {failure['error']}")
+        self.assertEqual(out, "")
+        _, code, out = self._cli_output(["answer", "9", "--json"], status, failure)
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), {"ok": False, "pane": 105, "error": failure["error"]})
+        _, code, out = self._cli_output(["answer", "1", "--json"], status, {"ok": True, "pane": 105})
+        self.assertIsNone(code)
+        self.assertEqual(json.loads(out), {"ok": True, "pane": 105, "answered": "option 1"})
+
+    def test_surface_without_card_prints_state_line_only(self) -> None:
+        status = _multi_status([105])
+        reply = {"ok": True, "pane": 105, "state": "working", "root": None, "interactive_root": None, "interactive_role": None, "surface": None}
+        _, code, out = self._cli_output(["surface", "105"], status, reply)
+        self.assertIsNone(code)
+        self.assertEqual(out, "[pane 105 · state working · no interactive card]\n")
+        _, _, out = self._cli_output(["surface", "105", "--all"], status, {**reply, "surface": "[main]\n- hello"})
+        self.assertTrue(out.startswith("[pane 105 · root - · role -]"))
+        _, _, out = self._cli_output(["surface", "105"], status, {**reply, "root": "40", "interactive_role": "omp.ask.card", "surface": "card"})
+        self.assertTrue(out.startswith("[pane 105 · root 40 · role omp.ask.card]"))
+
+    RAW_TRANSCRIPT = [
+        {"role": "user", "text": "go"},
+        {
+            "role": "assistant",
+            "text": 'Done.\n```svg\n<svg aria-label="Latency by region" width="9"><rect/></svg>\n```\nAll good.\n·\n6m44s · 445 tok · $0.06 this turn',
+            "tools": [
+                {
+                    "name": "bash",
+                    "status": "ok",
+                    "command": [{"t": "ls"}, {"t": " -la\n"}, {"t": "x" * 200}],
+                    "intent": "list files",
+                    "took": "1.2s",
+                    "text": "total 8\nfile\n19s · 202K tok this turn",
+                    "collapsed": True,
+                    "collapsible": True,
+                    "frame": "box",
+                    "preview": "total 8",
+                    "role": "tool",
+                    "targetKind": "shell",
+                    "href": "x",
+                    "key": "k1",
+                    "age": 3,
+                },
+                {"name": "noop"},
+                {"collapsed": True, "key": "empty"},
+            ],
+        },
+        {"role": "assistant", "text": "  ", "tools": [{"collapsed": True}]},
+    ]
+
+    def test_transcript_defaults_are_conclusions_and_one_line_tool_summaries(self) -> None:
+        ns = wingman.build_parser().parse_args(["transcript", "105"])
+        self.assertEqual((ns.last, ns.max_chars, ns.tools, ns.full), (6, 8000, False, False))
+        calls, code, out = self._cli_output(["transcript", "105"], _multi_status([105]), {"ok": True, "messages": self.RAW_TRANSCRIPT})
+        self.assertIsNone(code)
+        self.assertEqual(next(c for c in calls if c["op"] == "transcript")["last"], 6)
+        result = json.loads(out)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], {"role": "user", "text": "go"})
+        self.assertEqual(result[1]["text"], "Done.\n[chart: Latency by region]\nAll good.")
+        tool, noop = result[1]["tools"]
+        self.assertEqual(set(tool), {"name", "status", "target", "took"})
+        self.assertEqual(tool["target"], ("ls -la " + "x" * 200)[:119] + "…")
+        self.assertEqual(len(tool["target"]), 120)
+        self.assertEqual((tool["name"], tool["status"], tool["took"]), ("bash", "ok", "1.2s"))
+        self.assertEqual(noop, {"name": "noop"})
+        for chrome in ("collapsed", "collapsible", "frame", "preview", "targetKind", "href", "key", "age"):
+            self.assertNotIn(chrome, out)
+
+    def test_transcript_tools_flag_keeps_cleaned_text_and_drops_chrome(self) -> None:
+        _, _, out = self._cli_output(["transcript", "105", "--tools"], _multi_status([105]), {"ok": True, "messages": self.RAW_TRANSCRIPT})
+        tool = json.loads(out)[1]["tools"][0]
+        self.assertEqual(tool["text"], "total 8\nfile")
+        self.assertEqual(set(tool), {"name", "status", "target", "took", "text"})
+        self.assertNotIn("collapsed", out)
+
+    def test_transcript_target_falls_back_and_empty_messages_vanish(self) -> None:
+        messages = [
+            {"role": "assistant", "tools": [{"name": "edit", "intent": "fix typo", "status": "ok"}]},
+            {"role": "assistant", "text": "\n·\n3s this turn", "tools": []},
+            {"role": "assistant", "text": "<svg viewBox='0 0 1 1'><g/></svg>"},
+        ]
+        _, _, out = self._cli_output(["transcript", "105"], _multi_status([105]), {"ok": True, "messages": messages})
+        result = json.loads(out)
+        self.assertEqual(result[0]["tools"], [{"name": "edit", "status": "ok", "target": "fix typo"}])
+        self.assertNotIn("text", result[0])
+        self.assertEqual(result[1]["text"], "[svg chart omitted]")
+        self.assertEqual(len(result), 2)
+
+    def test_transcript_full_is_raw_and_uncapped_and_zero_disables_cap(self) -> None:
+        big = [{"role": "assistant", "text": "t" * 20000, "tools": [{"name": "read", "text": "o" * 20000, "collapsed": True}]}]
+        reply = {"ok": True, "messages": big}
+        _, _, out = self._cli_output(["transcript", "105", "--full"], _multi_status([105]), reply)
+        self.assertEqual(json.loads(out), big)
+        _, _, out = self._cli_output(["transcript", "105", "--full", "--max-chars", "100"], _multi_status([105]), reply)
+        self.assertEqual(json.loads(out), big)
+        raw = self.RAW_TRANSCRIPT
+        _, _, out = self._cli_output(["transcript", "105", "--full"], _multi_status([105]), {"ok": True, "messages": raw})
+        self.assertEqual(json.loads(out), raw)
+        _, _, out = self._cli_output(["transcript", "105", "--tools", "--max-chars", "0"], _multi_status([105]), reply)
+        self.assertEqual(len(json.loads(out)[0]["tools"][0]["text"]), 20000)
+        small = [{"role": "assistant", "text": "short", "tools": [{"name": "read", "text": "o" * 20000}]}]
+        _, _, out = self._cli_output(["transcript", "105", "--tools"], _multi_status([105]), {"ok": True, "messages": small})
+        self.assertLessEqual(len(out.rstrip("\n")), 8000)
+        clipped = json.loads(out)[0]
+        self.assertEqual(clipped["text"], "short")
+        head, _, tail = clipped["tools"][0]["text"].partition("\n… (truncated ")
+        self.assertGreater(len(head), 0)
+        self.assertGreater(len(tail), len(head))
+
+    def test_clean_message_text_strips_footer_and_collapses_svg(self) -> None:
+        clean = wingman.clean_message_text
+        self.assertEqual(clean("answer\n·\n6m44s · 445 tok · $0.06 this turn"), "answer")
+        self.assertEqual(clean("answer\n19s · 202K tok this turn\n"), "answer")
+        self.assertEqual(clean("keep this turn going"), "keep this turn going")
+        self.assertEqual(clean('a <SVG aria-label="Bars  by\nday"><path/></SVG> b'), "a [chart: Bars by day] b")
+        self.assertEqual(clean("```svg\n<svg><circle/></svg>\n```\nend"), "[svg chart omitted]\nend")
+        self.assertEqual(clean("x ```svg\n<svg aria-label='Pie'/>\n``` y"), "x [chart: Pie] y")
+
+    def _info_cli(self, status: dict, argv: list[str], env: dict | None = None) -> dict:
+        import io
+        from unittest import mock
+
+        out = io.StringIO()
+        ns = wingman.build_parser().parse_args(["info", *argv])
+        with self._patched(status, [], None) as stack:
+            stack.enter_context(mock_stdout(out))
+            stack.enter_context(mock.patch.dict(wingman.os.environ, env or {}))
+            stack.enter_context(mock.patch.object(wingman, "find_ovnfs_bin", lambda: None))
+            stack.enter_context(mock.patch.object(wingman, "find_omp_bin", lambda required=True: "omp"))
+            stack.enter_context(mock.patch.object(wingman, "get_collab_hosts", lambda _b: {}))
+            stack.enter_context(mock.patch.object(wingman, "check_leases", lambda _b, _s: set()))
+            ns.func(ns)
+        return json.loads(out.getvalue())
+
+    def _crowded_status(self) -> dict:
+        status = _multi_status(
+            [105],
+            [
+                _agent(110),  # unclaimed, same tab -> adoptable
+                {**_agent(111, bound_owner=300), "same_tab": True},  # other owner
+                {**_agent(112), "same_tab": False},  # other tab
+                _agent(113, bound_owner=None, model="m", parked=True, floating=True, last_message="done\n19s this turn"),
+            ],
+        )
+        status["owner_pane"] = 90
+        status["agents"].append(_agent(90, bound_owner=None))
+        status["agents"][-1].update(auto_callback=True)
+        status["floats"] = [{"pane": 105, "over": 100, "corner": "br"}, {"pane": 111, "over": 100, "corner": "tl"}, {"pane": 112, "over": 100, "corner": "tr"}]
+        return status
+
+    def test_info_default_is_perspective_isolated_and_compact(self) -> None:
+        out = self._info_cli(self._crowded_status(), ["--cwd", "/tmp"], {"TERN_PANE": "100"})
+        self.assertNotIn("ompBin", out)
+        self.assertEqual(out["sessions"], [])
+        self.assertEqual([a["pane"] for a in out["ternAgents"]], [105, 110, 113, 90])
+        self.assertEqual(out["ownerPane"], 90)
+        self.assertEqual([f["pane"] for f in out["floats"]], [105])
+        bound, adopt, noisy, owner = out["ternAgents"]
+        self.assertEqual(set(bound), {"pane", "kind", "state", "cwd", "isBoundToMe", "boundOwner"})
+        self.assertTrue(bound["isBoundToMe"])
+        self.assertEqual(set(adopt), {"pane", "kind", "state", "cwd", "isBoundToMe"})
+        self.assertEqual(noisy["lastMessagePreview"], "done")
+        self.assertEqual((noisy["model"], noisy["parked"], noisy["floating"]), ("m", True, True))
+        self.assertNotIn("isSelf", noisy)
+        self.assertNotIn("queuedCount", owner)
+
+    def test_info_compact_includes_queue_only_when_present(self) -> None:
+        status = self._crowded_status()
+        next(a for a in status["agents"] if a["pane"] == 105).update(queued_count=2, queued_items=[{"id": 1}], queued_preview="pv")
+        out = self._info_cli(status, [], {"TERN_PANE": "100"})
+        by_pane = {a["pane"]: a for a in out["ternAgents"]}
+        self.assertEqual((by_pane[105]["queuedCount"], by_pane[105]["queuedItems"]), (2, [{"id": 1}]))
+        self.assertNotIn("queuedPreview", by_pane[105])
+        self.assertNotIn("queuedCount", by_pane[110])
+
+    def test_info_all_exposes_everything(self) -> None:
+        out = self._info_cli(self._crowded_status(), ["--all", "--limit", "0"], {"TERN_PANE": "100"})
+        self.assertEqual(out["ompBin"], "omp")
+        self.assertEqual({a["pane"] for a in out["ternAgents"]}, {100, 105, 110, 111, 112, 113, 90})
+        self.assertTrue(next(a for a in out["ternAgents"] if a["pane"] == 100)["isSelf"])
+        self.assertEqual(len(out["floats"]), 3)
+        full = next(a for a in out["ternAgents"] if a["pane"] == 113)
+        self.assertIn("sameTab", full)
+        self.assertEqual(full["lastMessagePreview"], "done")
+
+    def test_info_session_limit_defaults_by_perspective(self) -> None:
+        from unittest import mock
+
+        def limit_for(argv: list[str], env: dict) -> int:
+            ns = wingman.build_parser().parse_args(["info", *argv])
+            with mock.patch.dict(wingman.os.environ, {"TERN_PANE": ""}), mock.patch.dict(wingman.os.environ, env):
+                return wingman._info_session_limit(ns, wingman.current_tern_pane())
+
+        inside, outside = {"TERN_PANE": "100"}, {"TERN_PANE": ""}
+        self.assertEqual(limit_for([], inside), 0)
+        self.assertEqual(limit_for(["--sessions"], inside), 6)
+        self.assertEqual(limit_for(["--all"], inside), 6)
+        self.assertEqual(limit_for(["--limit", "3"], inside), 3)
+        self.assertEqual(limit_for(["--limit", "0", "--sessions"], inside), 0)
+        self.assertEqual(limit_for(["--sessions", "--no-sessions"], inside), 0)
+        self.assertEqual(limit_for([], outside), 6)
+        self.assertEqual(limit_for(["--limit", "2"], outside), 2)
+        self.assertEqual(limit_for(["--no-sessions"], outside), 0)
+
+    def test_info_inside_tern_skips_session_work_by_default(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(wingman, "sessions_root", side_effect=AssertionError("session scan")), mock.patch.object(
+            wingman, "get_collab_hosts", side_effect=AssertionError("collab subprocess")
+        ):
+            out = self._info_cli(_multi_status([105]), [], {"TERN_PANE": "100"})
+        self.assertEqual(out["sessions"], [])
+
+    def test_async_delivery_prints_one_crisp_line(self) -> None:
+        import io
+
+        def stdout_for(argv: list[str], reply: dict) -> str:
+            out = io.StringIO()
+            with self._patched(_multi_status([105]), [], {"ok": True, "async_callback": True, **reply}), mock_stdout(out):
+                with self.assertRaises(SystemExit) as cm:
+                    ns = wingman.build_parser().parse_args(argv)
+                    ns.func(ns)
+            self.assertEqual(cm.exception.code, 0)
+            return out.getvalue()
+
+        queued = stdout_for(["send", "same", "-m", "go", "--async"], {"pane": 105, "queued": True, "position": 2, "queue_id": 42})
+        self.assertEqual(queued, "[wingman] Queued #2 id=42 -> pane 105 (async callback armed)\n")
+        sent = stdout_for(["send", "same", "-m", "go", "--async"], {"pane": 105})
+        self.assertEqual(sent, "[wingman] Dispatched -> pane 105 (async callback armed)\n")
+        retry = stdout_for(["retry", "105", "--async"], {"pane": 105})
+        self.assertEqual(retry, "[wingman] Retry sent -> pane 105 (async callback armed)\n")
+        for text in (queued, sent, retry):
+            self.assertEqual(len(text.splitlines()), 1)
+
+    def _bridge_harness(self, tmp: str, frames: list, on_frame=None):
+        """Run `call_bridge(timeout=None)` against fake sockets; return (reply, read deadlines, sent payloads, sleeps)."""
+        from unittest import mock
+
+        sent: list[dict] = []
+        deadlines: list[float | None] = []
+        seq = iter(frames)
+        sock_path = Path(tmp) / "w-1.sock"
+
+        class FakeSock:
+            def __init__(self, *a, **k): ...
+            def settimeout(self, _t): ...
+            def connect(self, _a): ...
+            def sendall(self, data): sent.append(json.loads(data))
+            def close(self): ...
+
+        def read(_sock, _buf, deadline):
+            deadlines.append(deadline)
+            frame = next(seq)
+            if on_frame is not None:
+                on_frame(frame, sock_path)
+            return frame
+
+        clock = [1000.0]
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            clock[0] += seconds
+            if len(sleeps) == 3 and not sock_path.exists():
+                sock_path.write_text("")
+
+        with mock.patch.object(wingman, "bridge_ipc_dir", lambda: Path(tmp)), mock.patch.object(
+            wingman.socket, "socket", FakeSock
+        ), mock.patch.object(wingman, "_read_json_line", read), mock.patch.object(
+            wingman.time, "sleep", sleep
+        ), mock.patch.object(wingman.time, "monotonic", lambda: clock[0]):
+            reply = wingman.call_bridge({"op": "dispatch", "anchor_pane": 100}, timeout=None)
+        return reply, deadlines, sent, sleeps
+
+    def test_call_bridge_without_timeout_survives_reload_socket_gap(self) -> None:
+        def drop_socket_on_reload(frame: dict, sock_path: Path) -> None:
+            if frame.get("_reload"):
+                sock_path.unlink()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "w-1.sock").write_text("")
+            reply, deadlines, sent, sleeps = self._bridge_harness(
+                tmp,
+                [{"_ack": True, "pane": 105}, {"_reload": True}, {"_ack": True, "pane": 105}, {"ok": True, "last_message": "done"}],
+                drop_socket_on_reload,
+            )
+        self.assertTrue(reply["ok"])
+        self.assertEqual([s["op"] for s in sent], ["dispatch", "await"])
+        self.assertEqual(deadlines, [None] * 4, "timeout=None must never become a deadline after discovery")
+        self.assertGreaterEqual(len(sleeps), 3)
+
+    def test_call_bridge_discovery_wait_is_bounded_and_independent_of_deadline(self) -> None:
+        from unittest import mock
+
+        clock = [0.0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += seconds
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(wingman, "bridge_ipc_dir", lambda: Path(tmp)), mock.patch.object(
+            wingman.time, "sleep", sleep
+        ), mock.patch.object(wingman.time, "monotonic", lambda: clock[0]):
+            for timeout, limit in ((None, wingman.DEFAULT_BRIDGE_TIMEOUT), (1.0, 1.0), (600.0, wingman.DEFAULT_BRIDGE_TIMEOUT)):
+                clock[0] = 0.0
+                with self.subTest(timeout=timeout), self.assertRaises(TimeoutError):
+                    wingman.call_bridge({"op": "status"}, timeout=timeout)
+                self.assertLessEqual(clock[0], limit + 0.2)
+                self.assertGreaterEqual(clock[0], limit - 0.2)
 
     def test_luau_queue_fixture(self) -> None:
         import shutil

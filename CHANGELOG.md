@@ -2,6 +2,24 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
+## [0.9.0] - 2026-11-24
+
+### Added
+- **`wingman answer` semantic reply CLI/RPC**: Answer blocked `[Wingman waiting_input]` workers directly by 1-based option number (`wingman answer 2`), multi-question picks (`wingman answer 1 3`), free-text `Other…` (`wingman answer --other "..."` with automatic field expansion and UTF-16 `edit` calculation), or approval decisions (`--approve` / `--deny` / `--cancel`) without touching raw TSP node IDs or JSON events.
+
+### Fixed
+- **Long-session TSP card & fault resolution**: Scoped region reads (`layer`, `dock`, and reverse tail walk of `main`) find interactive `ask`/approval cards and `F5 to retry` faults in O(1) regardless of transcript length, and empty `layer` containers no longer mask active cards.
+- **`wingman event` target validation**: Validates target node existence on the live TSP surface before sending, stopping at the first missing node ID and reporting the active interactive root instead of silently succeeding as a no-op.
+- **Eliminated delayed / duplicate escalations**: `event` and `answer` keep `notified_waiting` deduplication intact until Tern transitions out of `waiting_input`, and queued `waiting_input` / `fault` callbacks are automatically purged or live-verified before delivery while preserving turn-completion callbacks.
+- **Unbounded `--wait` across plugin reloads**: `call_bridge` keeps socket-discovery timeouts separate from the caller's turn deadline so hot-reloads never cap an unbounded wait to 5 seconds.
+
+### Changed
+- **Pure-signal agent outputs & perspective isolation**:
+  - `[Wingman waiting_input]` callbacks present clean questions and numbered choices without internal TSP widget trees or coaching boilerplate, and completion callbacks collapse TUI `<svg>` markup so prose conclusions are never truncated.
+  - `wingman info` inside Tern defaults to the caller's control domain (bound workers, direct owner, and adoptable same-tab peers, excluding `isSelf`, other tabs, and disk session scans unless `--all` / `--sessions` is passed).
+  - `wingman surface` without `--all` or `--root` reports only the active interactive card, retry fault, or a 1-line pane state—never historical chat scrollback.
+  - `wingman transcript` defaults to 6 messages, an 8,000-char water-filling cap, and 1-line tool summaries without raw `tools[].text` or TSP UI widget props (opt in with `--tools` or `--full`).
+
 ## [0.8.1] - 2026-11-23
 
 ### Fixed

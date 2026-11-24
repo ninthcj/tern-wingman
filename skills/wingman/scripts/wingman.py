@@ -253,12 +253,15 @@ def call_bridge(
     ack_pane: int | None = None
     ack_queued = False
     notified_ack = False
+    discovery_deadline: float | None = None
 
     while True:
         endpoints: list[tuple[str, Path]] = []
         if hasattr(socket, "AF_UNIX"):
             endpoints.extend(("unix", p) for p in sorted(ipc.glob("w-*.sock")))
         endpoints.extend(("tcp", p) for p in sorted(ipc.glob("w-*.tcp")))
+        if endpoints:
+            discovery_deadline = None
         need_reload_retry = False
 
         for kind, sp in endpoints:
@@ -347,15 +350,16 @@ def call_bridge(
             time.sleep(0.15)
             continue
 
-        # If no active mux socket answered yet (e.g. plugin is mid-reload), retry briefly up to 1.5s / deadline
-        now = time.monotonic()
-        wait_cap = min(deadline, now + 0.15) if deadline is not None else (now + 0.15)
-        if not endpoints and (deadline is None or now + 0.05 < deadline):
-            # Bound initial socket discovery wait when plugin is not installed/running
-            init_cap = deadline if deadline is not None else (now + DEFAULT_BRIDGE_TIMEOUT)
-            deadline = init_cap
-            time.sleep(max(0.01, wait_cap - now))
-            if time.monotonic() < deadline:
+        # No mux socket yet (plugin mid-reload or not installed): wait briefly for one to bind.
+        # `deadline` is the caller's (None = wait for the whole turn) and must survive a reload untouched.
+        if not endpoints:
+            now = time.monotonic()
+            if discovery_deadline is None:
+                discovery_deadline = now + DEFAULT_BRIDGE_TIMEOUT
+                if deadline is not None:
+                    discovery_deadline = min(discovery_deadline, deadline)
+            if now < discovery_deadline:
+                time.sleep(max(0.01, min(0.15, discovery_deadline - now)))
                 continue
 
         raise TimeoutError("no active Tern `wingman` window socket answered")
@@ -563,6 +567,35 @@ def extract_content(content: Any) -> tuple[str, list[str], int]:
     return "\n".join(texts), tools, thinking_chars
 
 
+TURN_FOOTER_RES = (
+    re.compile(r"\n·\n[^\n]* this turn\s*\Z"),
+    re.compile(r"\n[^\n]* this turn\s*\Z"),
+)
+FENCED_SVG_RE = re.compile(r"```svg\b.*?```", re.DOTALL | re.IGNORECASE)
+INLINE_SVG_RE = re.compile(r"<svg\b.*?</svg>", re.DOTALL | re.IGNORECASE)
+SVG_OPEN_TAG_RE = re.compile(r"<svg\b[^>]*>", re.IGNORECASE)
+SVG_LABEL_RE = re.compile(r"""aria-label\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
+
+
+def _svg_placeholder(match: re.Match[str]) -> str:
+    tag = SVG_OPEN_TAG_RE.search(match.group(0))
+    label = SVG_LABEL_RE.search(tag.group(0)) if tag else None
+    text = " ".join((label.group(1) or label.group(2) or "").split()) if label else ""
+    return f"[chart: {text}]" if text else "[svg chart omitted]"
+
+
+def clean_message_text(text: str) -> str:
+    """Drop the TUI turn-usage footer and collapse SVG charts to a one-line placeholder."""
+    for footer in TURN_FOOTER_RES:
+        text = footer.sub("", text)
+    text = FENCED_SVG_RE.sub(_svg_placeholder, text)
+    return INLINE_SVG_RE.sub(_svg_placeholder, text)
+
+
+def clip_text(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _pick_unclaimed_agent_in_tab(
     agents: list[dict[str, Any]],
     cwd: Path | None,
@@ -727,13 +760,47 @@ def merge_available_agents(custom: Any) -> list[str]:
     return merged
 
 
+def _info_session_limit(args: argparse.Namespace, my_pane: int | None) -> int:
+    """Sessions are noise for a Tern agent (it works with panes), so inside Tern they are opt-in."""
+    if args.no_sessions:
+        return 0
+    if args.limit is not None:
+        return args.limit
+    return 6 if my_pane is None or args.sessions or args.all else 0
+
+
+def _is_visible_peer(a: dict[str, Any], pid: int, is_self: bool, is_bound: bool, owner_pane: int | None) -> bool:
+    """Panes that matter to the caller: its workers, its owner, and unclaimed same-tab agents it could adopt."""
+    if is_self:
+        return False
+    return is_bound or pid == owner_pane or (a.get("same_tab") is True and a.get("bound_owner") is None)
+
+
+def _compact_agent(entry: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {key: entry[key] for key in ("pane", "kind", "state", "cwd", "isBoundToMe")}
+    for key in ("model", "boundOwner"):
+        if entry[key]:
+            out[key] = entry[key]
+    for key in ("parked", "floating"):
+        if entry[key]:
+            out[key] = True
+    if entry["queuedCount"] > 0 or entry["queuedItems"]:
+        out["queuedCount"] = entry["queuedCount"]
+        out["queuedItems"] = entry["queuedItems"]
+    preview = clip_text(clean_message_text(entry["lastMessage"]).strip(), 160)
+    if preview:
+        out["lastMessagePreview"] = preview
+    return out
+
+
 def cmd_info(args: argparse.Namespace) -> None:
     omp_bin = find_omp_bin(required=False)
     tern_bin = find_tern_bin()
     ovnfs_bin = find_ovnfs_bin()
     my_pane = current_tern_pane()
     cwd = Path(args.cwd).resolve()
-    skip_sessions = args.no_sessions or args.limit == 0
+    limit = _info_session_limit(args, my_pane)
+    skip_sessions = limit == 0
     hosts = get_collab_hosts(omp_bin) if omp_bin and not skip_sessions else {}
 
     bridge_status: dict[str, Any] | None = None
@@ -753,7 +820,7 @@ def cmd_info(args: argparse.Namespace) -> None:
             (f for f in bucket.glob("*.jsonl") if "__advisor" not in f.name),
             key=lambda f: f.stat().st_mtime,
             reverse=True,
-        )[: args.limit]
+        )[:limit]
         headers = [(f, read_session_header(f)) for f in files]
         sids = [h["id"] for _, h in headers if "id" in h]
         held = check_leases(omp_bin, sids) if omp_bin else set()
@@ -774,51 +841,66 @@ def cmd_info(args: argparse.Namespace) -> None:
                 }
             )
 
+    bound_panes = bound_panes_from_status(bridge_status) if bridge_status else []
+    owner_pane = bridge_status.get("owner_pane") if bridge_status else None
+    isolate = my_pane is not None and not args.all
+
     agents_out = []
     if bridge_status and bridge_status.get("ok"):
         for a in bridge_status.get("agents", []):
             pid = int(a["pane"])
-            lm = a.get("last_message") or ""
-            agents_out.append(
-                {
-                    "pane": pid,
-                    "isSelf": bool(a.get("is_self") or (my_pane is not None and pid == my_pane)),
-                    "isBoundToMe": bool(a.get("is_bound_to_me")),
-                    "boundOwner": a.get("bound_owner"),
-                    "autoCallback": a.get("auto_callback"),
-                    "queuedCount": int(a.get("queued_count") or 0),
-                    "queuedItems": a.get("queued_items") or [],
-                    "queuedPreview": a.get("queued_preview"),
-                    "queuedCallbacksCount": int(a.get("queued_callbacks_count") or 0),
-                    "sameTab": a.get("same_tab"),
-                    "parked": a.get("parked"),
-                    "floating": a.get("floating"),
-                    "state": a.get("state"),
-                    "model": a.get("model"),
-                    "cwd": a.get("cwd"),
-                    "sessionFile": pane_files.get(pid),
-                    "kind": "omp" if pid in pane_files else "acp",
-                    "lastMessagePreview": lm[:200] + ("…" if len(lm) > 200 else ""),
-                }
-            )
+            is_self = bool(a.get("is_self") or (my_pane is not None and pid == my_pane))
+            is_bound = bool(a.get("is_bound_to_me")) or pid in bound_panes
+            if isolate and not _is_visible_peer(a, pid, is_self, is_bound, owner_pane):
+                continue
+            lm = clean_message_text(a.get("last_message") or "").strip()
+            entry = {
+                "pane": pid,
+                "isSelf": is_self,
+                "isBoundToMe": is_bound,
+                "boundOwner": a.get("bound_owner"),
+                "autoCallback": a.get("auto_callback"),
+                "queuedCount": int(a.get("queued_count") or 0),
+                "queuedItems": a.get("queued_items") or [],
+                "queuedPreview": a.get("queued_preview"),
+                "queuedCallbacksCount": int(a.get("queued_callbacks_count") or 0),
+                "sameTab": a.get("same_tab"),
+                "parked": a.get("parked"),
+                "floating": a.get("floating"),
+                "state": a.get("state"),
+                "model": a.get("model"),
+                "cwd": a.get("cwd"),
+                "sessionFile": pane_files.get(pid),
+                "kind": "omp" if pid in pane_files else "acp",
+                "lastMessage": lm,
+            }
+            if args.all:
+                entry["lastMessagePreview"] = clip_text(entry.pop("lastMessage"), 200)
+                agents_out.append(entry)
+            else:
+                agents_out.append(_compact_agent(entry))
 
-    bound_panes = bound_panes_from_status(bridge_status) if bridge_status else []
+    floats = bridge_status.get("floats", []) if bridge_status else []
+    if isolate:
+        seen = {my_pane, *(entry["pane"] for entry in agents_out)}
+        floats = [fl for fl in floats if isinstance(fl, dict) and fl.get("pane") in seen]
 
     out = {
-        "ompBin": omp_bin,
         "ovnfsBin": ovnfs_bin,
         "ternPane": my_pane,
         "boundWingmanPane": bound_panes[0] if len(bound_panes) == 1 else None,
         "boundWingmanPanes": bound_panes,
-        "ownerPane": bridge_status.get("owner_pane") if bridge_status else None,
-        "autoCallback": bridge_status.get("auto_callback") if bridge_status else None,
+        "ownerPane": owner_pane,
         "wingmanBridgeReady": bool(bridge_status and bridge_status.get("ok")),
-        "floats": bridge_status.get("floats", []) if bridge_status else [],
+        "floats": floats,
         "ternAgents": agents_out,
         "cwd": str(cwd),
         "availableAgents": merge_available_agents(bridge_status.get("custom_agents") if bridge_status else None),
         "sessions": sessions_out,
     }
+    if args.all:
+        out["ompBin"] = omp_bin
+        out["autoCallback"] = bridge_status.get("auto_callback") if bridge_status else None
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
@@ -1118,17 +1200,9 @@ def _send(args: argparse.Namespace, res: dict[str, Any]) -> None:
             if reply.get("queued"):
                 pos = int(reply.get("position") or 1)
                 qid = f" id={reply['queue_id']}" if reply.get("queue_id") else ""
-                print(
-                    f"[wingman] Queued (#{pos}{qid}, {len(prompt)} chars) onto wingman pane {dispatched_pane} (async callback armed).\n"
-                    "When this task completes, Wingman sends the auto-callback tagged with the pane that ran it. "
-                    "Do NOT poll or sleep; end your turn now and wait for the callback."
-                )
+                print(f"[wingman] Queued #{pos}{qid} -> pane {dispatched_pane} (async callback armed)")
             else:
-                print(
-                    f"[wingman] Dispatched ({len(prompt)} chars) onto wingman pane {dispatched_pane} (async callback armed).\n"
-                    f"When pane {dispatched_pane} finishes, Tern will automatically submit `[Wingman auto-callback · pane {dispatched_pane}]` "
-                    "into your chat composer as a visible turn. Do NOT poll or sleep; end your turn now and wait for the callback."
-                )
+                print(f"[wingman] Dispatched -> pane {dispatched_pane} (async callback armed)")
             raise SystemExit(0)
 
         res.update(**{"async": False, "status": reply.get("status") or "completed"})
@@ -1308,6 +1382,70 @@ def bound_transcript_json(messages: list[Any], max_chars: int) -> str:
     raise AssertionError("unreachable: [] always fits when max_chars >= 2")
 
 
+TOOL_TARGET_KEYS = ("target", "command", "intent")
+TOOL_TARGET_MAX_CHARS = 120
+
+
+def _flatten_spans(value: Any) -> str:
+    """TSP text is a plain string or a list of `{t: ...}` spans; return its plain text."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return _flatten_spans(value.get("t"))
+    if isinstance(value, list):
+        return "".join(_flatten_spans(part) for part in value)
+    return ""
+
+
+def compact_tool(tool: Any, with_text: bool) -> dict[str, Any] | None:
+    """Reduce a transcript tool entry to its semantic headers (`name`, `status`, `target`, `took`) and optional log text."""
+    if not isinstance(tool, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("name", "status"):
+        value = clean_message_text(_flatten_spans(tool.get(key))).strip()
+        if value:
+            out[key] = value
+    for key in TOOL_TARGET_KEYS:
+        target = " ".join(clean_message_text(_flatten_spans(tool.get(key))).split())
+        if target:
+            out["target"] = clip_text(target, TOOL_TARGET_MAX_CHARS)
+            break
+    took = tool.get("took")
+    if isinstance(took, (int, float)) and not isinstance(took, bool):
+        out["took"] = took
+    elif _flatten_spans(took).strip():
+        out["took"] = _flatten_spans(took).strip()
+    if with_text:
+        text = clean_message_text(_flatten_spans(tool.get("text"))).strip()
+        if text:
+            out["text"] = text
+    return out or None
+
+
+def compact_transcript(messages: list[Any], with_tool_text: bool) -> list[dict[str, Any]]:
+    """Conclusions + one-line tool summaries; messages left with neither text nor tools are dropped."""
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        item: dict[str, Any] = {}
+        for key, value in message.items():
+            if key == "text":
+                text = clean_message_text(_flatten_spans(value)).strip()
+                if text:
+                    item["text"] = text
+            elif key == "tools":
+                tools = [t for t in (compact_tool(t, with_tool_text) for t in value) if t] if isinstance(value, list) else []
+                if tools:
+                    item["tools"] = tools
+            elif key == "role" and value in ("user", "assistant"):
+                item[key] = value
+        if "text" in item or "tools" in item:
+            out.append(item)
+    return out
+
+
 def cmd_transcript(args: argparse.Namespace) -> None:
     my_pane = current_tern_pane()
     if my_pane is None:
@@ -1320,7 +1458,11 @@ def cmd_transcript(args: argparse.Namespace) -> None:
     if not reply.get("ok"):
         raise SystemExit(f"error: {reply.get('error')}")
     messages = reply.get("messages", [])
-    if args.max_chars is not None:
+    if args.full:
+        print(json.dumps(messages, ensure_ascii=False, indent=2))
+        return
+    messages = compact_transcript(messages, args.tools)
+    if args.max_chars:
         print(bound_transcript_json(messages, args.max_chars))
     else:
         print(json.dumps(messages, ensure_ascii=False, indent=2))
@@ -1525,7 +1667,7 @@ def cmd_surface(args: argparse.Namespace) -> None:
         "anchor_pane": my_pane,
         "target_pane": pane,
         "as": "table" if args.json else "text",
-        "auto_root": not args.all,
+        "auto_root": not args.all and not args.root,
     }
     if args.root:
         req["root"] = args.root
@@ -1534,6 +1676,9 @@ def cmd_surface(args: argparse.Namespace) -> None:
         raise SystemExit(f"error: {reply.get('error')}")
     if args.json:
         print(json.dumps(reply, ensure_ascii=False, indent=2))
+        return
+    if not args.all and not args.root and not reply.get("surface") and not reply.get("root") and not reply.get("interactive_role"):
+        print(f"[pane {pane} · state {reply.get('state') or 'unknown'} · no interactive card]")
         return
     print(f"[pane {pane} · root {reply.get('root') or '-'} · role {reply.get('interactive_role') or '-'}]")
     print(reply.get("surface") or "")
@@ -1561,6 +1706,60 @@ def cmd_event(args: argparse.Namespace) -> None:
     print(json.dumps(reply, ensure_ascii=False, indent=2))
     if not reply.get("ok"):
         raise SystemExit(1)
+
+
+def _answer_summary(args: argparse.Namespace) -> str:
+    parts = []
+    if args.choices:
+        parts.append(f"option{'s' if len(args.choices) > 1 else ''} {' '.join(map(str, args.choices))}")
+    if args.other is not None:
+        parts.append(f"other {json.dumps(clip_text(args.other, 40), ensure_ascii=False)}")
+    parts += [name for name in ("approve", "deny", "cancel") if getattr(args, name)]
+    return ", ".join(parts)
+
+
+def cmd_answer(args: argparse.Namespace) -> None:
+    """Answer a worker's pending ask/approval prompt without touching its TSP node tree (`op: answer`)."""
+    my_pane = current_tern_pane()
+    if my_pane is None:
+        raise SystemExit("error: `answer` requires running inside Tern")
+    decisions = [name for name in ("approve", "deny", "cancel") if getattr(args, name)]
+    if decisions and (args.choices or args.other is not None or args.question is not None):
+        raise SystemExit(f"error: --{decisions[0]} cannot be combined with CHOICE, --other or --question")
+    if args.other is not None and not args.other.strip():
+        raise SystemExit("error: --other needs non-empty text")
+    if not (decisions or args.choices or args.other is not None):
+        raise SystemExit("error: nothing to answer: give CHOICE number(s), --other TEXT, --approve, --deny or --cancel")
+    pane = _resolve_explicit_or_bound_pane(args, my_pane)
+    req: dict[str, Any] = {
+        "op": "answer",
+        "anchor_pane": my_pane,
+        "target_pane": pane,
+        "rearm": not args.no_rearm,
+        "choices": list(args.choices),
+    }
+    if args.other is not None:
+        req["other"] = args.other
+    if args.question is not None:
+        req["question"] = args.question
+    for name in decisions:
+        req[name] = True
+    reply = call_bridge(req, timeout=DEFAULT_BRIDGE_TIMEOUT)
+    ok = bool(reply.get("ok"))
+    answered_pane = reply.get("pane", pane)
+    if args.json:
+        out: dict[str, Any] = {"ok": ok, "pane": answered_pane}
+        if ok:
+            out["answered"] = _answer_summary(args)
+        else:
+            out["error"] = reply.get("error") or "answer failed"
+        print(json.dumps(out, ensure_ascii=False))
+        if not ok:
+            raise SystemExit(1)
+        return
+    if not ok:
+        raise SystemExit(f"error: {reply.get('error') or 'answer failed'}")
+    print(f"[wingman] Answered pane {answered_pane}: {_answer_summary(args)}")
 
 
 def cmd_retry(args: argparse.Namespace) -> None:
@@ -1598,10 +1797,7 @@ def _retry(args: argparse.Namespace, res: dict[str, Any]) -> None:
         raise SystemExit(2 if st == "waiting_input" else 1)
     if reply.get("async_callback"):
         res.update(**{"async": True, "queued": False, "queueId": None, "position": None})
-        print(
-            f"[wingman] Sent native /retry to pane {pane} (async callback armed). "
-            "Do NOT poll or sleep; end your turn now and wait for the callback."
-        )
+        print(f"[wingman] Retry sent -> pane {pane} (async callback armed)")
         raise SystemExit(0)
     res.update(**{"async": False, "status": reply.get("status") or "completed"})
     if reply.get("last_message"):
@@ -1717,7 +1913,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_info = sub.add_parser("info", help="List live Tern TSP agents, ownership bindings, PiP floats, available agent ids, and recent sessions")
     p_info.add_argument("--cwd", default=".", help="Workspace directory")
-    p_info.add_argument("--limit", type=_non_negative_int, default=6, help="Max recent sessions to list (0 skips all session, collab and lease lookups)")
+    p_info.add_argument("--all", action="store_true", help="Include every window agent (self and other tabs/owners), full agent fields, `ompBin` and recent sessions")
+    p_info.add_argument("--sessions", action="store_true", help="Inside Tern: also list recent sessions (default there: none)")
+    p_info.add_argument("--limit", type=_non_negative_int, default=None, help="Max recent sessions to list (default: 6 outside Tern, 0 inside unless --sessions/--all; 0 skips all session, collab and lease lookups)")
     p_info.add_argument("--no-sessions", action="store_true", help="Fast path: skip session files, collab hosts and lease checks entirely")
     p_info.set_defaults(func=cmd_info)
 
@@ -1757,8 +1955,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_tr = sub.add_parser("transcript", help="Read structured TSP chat messages from memory (`cx.agents:transcript`)")
     _add_pane_args(p_tr)
-    p_tr.add_argument("--last", type=int, default=8, help="Number of recent messages")
-    p_tr.add_argument("--max-chars", type=_positive_int, help="Bound the printed JSON to at most N characters (compact JSON first, then water-filling head+tail clip on tool text, then message text)")
+    p_tr.add_argument("--last", type=int, default=6, help="Number of recent messages")
+    p_tr.add_argument("--max-chars", type=_non_negative_int, default=8000, help="Bound the printed JSON to at most N characters (0 = unbounded); oversized tool logs are clipped first (30%% head + 70%% tail), then message text")
+    p_tr.add_argument("--tools", action="store_true", help="Include each tool's cleaned output text (default: one-line name/status/target summaries only)")
+    p_tr.add_argument("--full", action="store_true", help="Raw, unstripped, uncapped messages exactly as Tern reports them")
     p_tr.set_defaults(func=cmd_transcript)
 
     p_pip = sub.add_parser("pip", help="Float worker pane into Picture-in-Picture corner")
@@ -1835,7 +2035,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_surf = sub.add_parser("surface", help="Inspect worker TSP surface (auto-scoped to pending ask/approval card)")
     _add_pane_args(p_surf)
-    p_surf.add_argument("--root", help="Explicit TSP node id to scope to")
+    p_surf.add_argument("--root", help="Explicit TSP node id to scope to (read it from a prior `surface`/`--json` output; disables auto-scoping)")
     p_surf.add_argument("--all", action="store_true", help="Whole surface instead of auto-scoping to the interactive node")
     p_surf.add_argument("--json", action="store_true", help="Return structured node table instead of text")
     p_surf.set_defaults(func=cmd_surface)
@@ -1846,6 +2046,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--no-rearm", action="store_true", help="Do not re-arm auto-callback for the resumed worker turn")
     p_ev.add_argument("events", nargs="+", help="JSON event object(s), e.g. '{\"ev\":\"action\",\"id\":\"n1\",\"act\":\"submit\"}'")
     p_ev.set_defaults(func=cmd_event)
+
+    p_ans = sub.add_parser("answer", help="Answer a worker's pending ask/approval prompt by option number, free text, or approve/deny/cancel")
+    p_ans.add_argument("choices", nargs="*", type=_positive_int, metavar="CHOICE", help="1-based option number(s), one per question in order (never a pane id: select the worker with --pane/--cwd)")
+    p_ans.add_argument("--pane", dest="pane_flag", help="Agent pane id (default: the single bound/adoptable worker)")
+    p_ans.add_argument("--cwd", help="Optional workspace directory to disambiguate the worker")
+    p_ans.add_argument("--other", metavar="TEXT", help="Free-text answer instead of a listed option")
+    p_ans.add_argument("--question", type=_positive_int, metavar="N", help="1-based question that CHOICE(s)/--other apply to (default: in order / question 1)")
+    ans_grp = p_ans.add_mutually_exclusive_group()
+    ans_grp.add_argument("--approve", action="store_true", help="Approve the pending approval prompt")
+    ans_grp.add_argument("--deny", action="store_true", help="Deny the pending approval prompt")
+    ans_grp.add_argument("--cancel", action="store_true", help="Cancel/dismiss the pending prompt")
+    p_ans.add_argument("--no-rearm", action="store_true", help="Do not re-arm auto-callback for the resumed worker turn")
+    p_ans.add_argument("--json", action="store_true", help="Print a single JSON result object (exit 0/1)")
+    p_ans.set_defaults(func=cmd_answer)
 
     p_retry = sub.add_parser("retry", help="Retry a failed/aborted worker turn via native `/retry` (same as F5)")
     _add_pane_args(p_retry)

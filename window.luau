@@ -58,11 +58,15 @@ local dispatches = Queue.new(tern.now)
 local dispatch_ids_loaded = false
 local dispatch_inflight: { [number]: number } = {}
 -- Native per-owner FIFO callback queue when owner_pane is busy (`working` / `waiting_input`)
-local queued_callbacks: { [number]: { string } } = {}
+type EscalationKind = "waiting_input" | "fault"
+type CallbackKind = "turn" | EscalationKind
+type Callback = { worker: number, kind: CallbackKind, key: string?, text: string }
+local queued_callbacks: { [number]: { Callback } } = {}
 -- Tracks whether a wingman pane is executing an unsolicited turn (no active `pending_waits` waiter)
 local unsolicited_working: { [number]: boolean } = {}
 -- Panes intentionally interrupted via `wingman.py interrupt` (suppresses fault escalation until next turn)
 local manual_interrupt: { [number]: boolean } = {}
+local pending_fault_escalations: { [number]: {} } = {}
 
 local mux_child: Child? = nil
 local unloading = false
@@ -145,7 +149,7 @@ local function collect_turn_output(cx: WindowCx, pane_id: number): (string?, any
 		end
 	end
 	if last_msg and last_msg ~= "" then
-		last_msg = tsp.strip_turn_footer(last_msg)
+		last_msg = tsp.clean_message_text(last_msg)
 	end
 	return last_msg, transcript
 end
@@ -174,6 +178,43 @@ local function has_active_timers(): boolean
 	return next(pending_waits) ~= nil or dispatches.has_any() or next(queued_callbacks) ~= nil or next(dispatch_inflight) ~= nil
 end
 
+local function purge_worker_callbacks(worker_pane: number, kind: EscalationKind?)
+	for owner, queue in queued_callbacks do
+		local kept = 0
+		local length = #queue
+		for _, item in queue do
+			if item.worker ~= worker_pane or item.kind == "turn" or (kind ~= nil and item.kind ~= kind) then
+				kept += 1
+				queue[kept] = item
+			end
+		end
+		for index = length, kept + 1, -1 do
+			queue[index] = nil
+		end
+		if kept == 0 then
+			queued_callbacks[owner] = nil
+		end
+	end
+end
+
+local function callback_is_current(cx: WindowCx, owner: number, item: Callback): boolean
+	if item.kind == "turn" then
+		return true
+	end
+	local worker = item.worker
+	if manual_interrupt[worker] or cx.session:pane(worker) == nil or state.owner_of_pane(cx, worker) ~= owner
+		or state.waiting_key(worker) ~= item.key then
+		return false
+	end
+	local agent = find_agent_info(cx, worker)
+	if agent == nil then
+		return false
+	elseif item.kind == "waiting_input" then
+		return agent.state == "waiting_input"
+	end
+	return (agent.state == "idle" or agent.state == "exited") and not has_pending_dispatch(worker)
+end
+
 local function flush_queued_callbacks(cx: WindowCx, owner_pane: number): boolean
 	local q = queued_callbacks[owner_pane]
 	if not q or #q == 0 then
@@ -188,7 +229,24 @@ local function flush_queued_callbacks(cx: WindowCx, owner_pane: number): boolean
 	if not ainfo or ainfo.state ~= "idle" or has_pending_dispatch(owner_pane) then
 		return false
 	end
-	local combined = table.concat(q, "\n\n---\n\n")
+	local texts: { string } = {}
+	local kept = 0
+	local length = #q
+	for _, item in q do
+		if callback_is_current(cx, owner_pane, item) then
+			kept += 1
+			q[kept] = item
+			texts[kept] = item.text
+		end
+	end
+	for index = length, kept + 1, -1 do
+		q[index] = nil
+	end
+	if kept == 0 then
+		queued_callbacks[owner_pane] = nil
+		return false
+	end
+	local combined = table.concat(texts, "\n\n---\n\n")
 	local ok_ask = ask_worker(cx, owner_pane, combined)
 	if ok_ask then
 		queued_callbacks[owner_pane] = nil
@@ -204,19 +262,30 @@ local function deliver_to_owner(
 	owner_pane: number,
 	worker_pane: number,
 	tag: string,
-	body: string
+	body: string,
+	kind: CallbackKind,
+	key: string?
 ): (boolean, boolean, number)
 	local delivered_body = body
 	if #delivered_body > CALLBACK_BODY_MAX_BYTES then
+		local inspect = if kind == "turn" then "transcript --last 2" else "surface"
 		delivered_body = tsp.clip_utf8_bytes(delivered_body, CALLBACK_BODY_MAX_BYTES)
 			.. string.format(
-				"\n\n… (truncated from %d bytes; run `wingman transcript --pane %d --last 2` for full output)",
+				"\n\n… (truncated from %d bytes; run `wingman %s --pane %d` to inspect)",
 				#body,
+				inspect,
 				worker_pane
 			)
 	end
 	local formatted = string.format("[Wingman %s · pane %d]\n%s", tag, worker_pane, delivered_body)
 	local existing_q = queued_callbacks[owner_pane]
+	if existing_q ~= nil and kind ~= "turn" then
+		for _, item in existing_q do
+			if item.worker == worker_pane and item.kind == kind and item.key == key then
+				return false, true, #existing_q
+			end
+		end
+	end
 	local ainfo = find_agent_info(cx, owner_pane)
 	if ainfo ~= nil and ainfo.state == "idle" and not has_pending_dispatch(owner_pane)
 		and dispatches.count(owner_pane) == 0 and (existing_q == nil or #existing_q == 0) then
@@ -229,7 +298,7 @@ local function deliver_to_owner(
 		existing_q = {}
 		queued_callbacks[owner_pane] = existing_q
 	end
-	table.insert(existing_q, formatted)
+	table.insert(existing_q, { worker = worker_pane, kind = kind, key = key, text = formatted })
 	ensure_watchdog()
 	return false, true, #existing_q
 end
@@ -238,7 +307,7 @@ local function notify_waiting_input(cx: WindowCx, worker_pane: number)
 	tern.timer(120, function(later_cx: WindowCx?)
 		local lcx = later_cx or cx
 		local ainfo = find_agent_info(lcx, worker_pane)
-		if not ainfo or ainfo.state ~= "waiting_input" or pending_waits[worker_pane] ~= nil then
+		if not ainfo or ainfo.state ~= "waiting_input" or pending_waits[worker_pane] ~= nil or manual_interrupt[worker_pane] then
 			return
 		end
 		local owner = state.owner_of_pane(lcx, worker_pane)
@@ -249,11 +318,18 @@ local function notify_waiting_input(cx: WindowCx, worker_pane: number)
 		if not state.record_waiting(worker_pane, key) then
 			return
 		end
-		deliver_to_owner(lcx, owner, worker_pane, "waiting_input", body)
+		deliver_to_owner(lcx, owner, worker_pane, "waiting_input", body, "waiting_input", key)
 	end)
 end
 
 local function deliver_fault_if_needed(cx: WindowCx, worker_pane: number, fallback_reason: string?): boolean
+	if manual_interrupt[worker_pane] or has_pending_dispatch(worker_pane) or cx.session:pane(worker_pane) == nil then
+		return false
+	end
+	local ainfo = find_agent_info(cx, worker_pane)
+	if not ainfo or (ainfo.state ~= "idle" and ainfo.state ~= "exited") then
+		return false
+	end
 	local owner = state.owner_of_pane(cx, worker_pane)
 	if owner == nil or not state.is_auto_callback_enabled(owner) then
 		return false
@@ -270,7 +346,7 @@ local function deliver_fault_if_needed(cx: WindowCx, worker_pane: number, fallba
 	end
 	local body = tostring(summary)
 		.. "\n\nRecover: run `wingman retry --pane " .. worker_pane .. "` (sends native `/retry`, equivalent to F5) for transient stream/network/edit-preview glitches (up to 2-3 retries), or consult the user if it is a persistent quota/auth/config error."
-	deliver_to_owner(cx, owner, worker_pane, "fault · retryable", body)
+	deliver_to_owner(cx, owner, worker_pane, "fault · retryable", body, "fault", key)
 	return true
 end
 
@@ -316,7 +392,7 @@ local function promote_next_queued(cx: WindowCx, pane_id: number): number?
 		else
 			local owner = state.owner_of_pane(cx, pane_id)
 			if owner ~= nil and state.is_auto_callback_enabled(owner) then
-				deliver_to_owner(cx, owner, pane_id, "auto-callback · failed", reason)
+				deliver_to_owner(cx, owner, pane_id, "auto-callback · failed", reason, "turn")
 			end
 		end
 	end
@@ -336,7 +412,7 @@ local function finish_wait(cx: WindowCx, pane_id: number, status: string, err_ms
 			notify_waiting_input(cx, pane_id)
 		elseif owner ~= nil then
 			local body = err_msg or last_msg or ("(Wingman turn ended with " .. status .. ")")
-			deliver_to_owner(cx, owner, pane_id, "auto-callback · " .. status, body)
+			deliver_to_owner(cx, owner, pane_id, "auto-callback · " .. status, body, "turn")
 		end
 	else
 		local payload = {
@@ -470,9 +546,7 @@ local function seed_inflight_unsolicited_turns(cx: WindowCx)
 		elseif a.state == "waiting_input" and pending_waits[a.pane] == nil and state.owner_of_pane(cx, a.pane) ~= nil then
 			notify_waiting_input(cx, a.pane)
 		elseif a.state == "idle" and pending_waits[a.pane] == nil and state.owner_of_pane(cx, a.pane) ~= nil then
-			if tsp.inspect_fault_surface(cx, a.pane) then
-				deliver_fault_if_needed(cx, a.pane, nil)
-			end
+			deliver_fault_if_needed(cx, a.pane, nil)
 		end
 	end
 end
@@ -490,9 +564,8 @@ local function settle_stalled_fault(cx: WindowCx, pane: number)
 		if not ainfo or ainfo.state ~= "idle" or pending_waits[pane] ~= nil then
 			return
 		end
-		if tsp.inspect_fault_surface(lcx, pane) then
+		if deliver_fault_if_needed(lcx, pane, nil) then
 			unsolicited_working[pane] = false
-			deliver_fault_if_needed(lcx, pane, nil)
 		end
 	end)
 end
@@ -502,10 +575,15 @@ tern.on("agent_state", function(ev: AgentStateEvent, cx: WindowCx)
 		dispatch_inflight[ev.pane] = nil
 	end
 	if ev.new == "working" then
+		pending_fault_escalations[ev.pane] = nil
+		purge_worker_callbacks(ev.pane, nil)
 		manual_interrupt[ev.pane] = nil
 		state.clear_waiting(ev.pane)
-	elseif ev.new ~= "waiting_input" and not string.find(state.waiting_key(ev.pane) or "", "^fault:") then
-		state.clear_waiting(ev.pane)
+	elseif ev.new ~= "waiting_input" then
+		purge_worker_callbacks(ev.pane, "waiting_input")
+		if not string.find(state.waiting_key(ev.pane) or "", "^fault:") then
+			state.clear_waiting(ev.pane)
+		end
 	end
 	local w = pending_waits[ev.pane]
 	if w then
@@ -541,8 +619,15 @@ end)
 
 tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	dispatch_inflight[ev.pane] = nil
-	if ev.result == "done" then
+	if ev.result == "done" or ev.result == "closed" then
+		pending_fault_escalations[ev.pane] = nil
+		purge_worker_callbacks(ev.pane, nil)
 		state.clear_waiting(ev.pane)
+	else
+		purge_worker_callbacks(ev.pane, "waiting_input")
+		if not string.find(state.waiting_key(ev.pane) or "", "^fault:") then
+			state.clear_waiting(ev.pane)
+		end
 	end
 	-- 1. If this pane is an owner with pending wingman callbacks, flush them as soon as its turn finishes cleanly
 	if queued_callbacks[ev.pane] ~= nil and ev.result == "done" and dispatches.count(ev.pane) == 0 then
@@ -564,11 +649,15 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 		was_unsolicited = false
 		local failed_pane = ev.pane
 		local failed_res = ev.result
+		local token = {}
+		pending_fault_escalations[failed_pane] = token
 		tern.timer(150, function(later_cx: WindowCx?)
 			local lcx = later_cx or cx
-			if not manual_interrupt[failed_pane] then
-				deliver_fault_if_needed(lcx, failed_pane, "Agent turn ended with " .. failed_res)
+			if pending_fault_escalations[failed_pane] ~= token then
+				return
 			end
+			pending_fault_escalations[failed_pane] = nil
+			deliver_fault_if_needed(lcx, failed_pane, "Agent turn ended with " .. failed_res)
 		end)
 	end
 	if was_unsolicited then
@@ -587,7 +676,7 @@ tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 			local tag = if has_next_q
 				then string.format("auto-callback · %s · promoting next queued task", ev.result)
 				else ("auto-callback · " .. ev.result)
-			deliver_to_owner(cx, owner, ev.pane, tag, body)
+			deliver_to_owner(cx, owner, ev.pane, tag, body, "turn")
 		end
 	end
 
@@ -620,6 +709,8 @@ end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
 	dispatch_inflight[ev.pane] = nil
+	pending_fault_escalations[ev.pane] = nil
+	purge_worker_callbacks(ev.pane, nil)
 	state.unbind_pane(ev.pane)
 	state.clear_waiting(ev.pane)
 	unsolicited_working[ev.pane] = nil
@@ -646,6 +737,8 @@ end
 -- Cores shared by the RPC ops and the live panel's buttons, so both keep the same control-plane bookkeeping.
 local function interrupt_pane(cx: WindowCx, tp: number): (boolean, string?)
 	manual_interrupt[tp] = true
+	pending_fault_escalations[tp] = nil
+	purge_worker_callbacks(tp, nil)
 	unsolicited_working[tp] = false
 	local ok_i, err_i = pcall(function()
 		cx.agents:interrupt(tp)
@@ -680,6 +773,8 @@ local function retry_pane(cx: WindowCx, tp: number): (boolean, string?, string?)
 	if not ok_r then
 		return false, "cx.agents:ask /retry failed: " .. tostring(err_r), nil
 	end
+	pending_fault_escalations[tp] = nil
+	purge_worker_callbacks(tp, nil)
 	state.clear_waiting(tp)
 	manual_interrupt[tp] = nil
 	return true, nil, nil
@@ -964,6 +1059,8 @@ local function stop_worker(cx: WindowCx, pane: number): (boolean, string?)
 		cx.agents:stop(pane)
 	end)
 	if ok then
+		pending_fault_escalations[pane] = nil
+		purge_worker_callbacks(pane, nil)
 		state.unbind_pane(pane)
 	end
 	return ok, if ok then nil else tostring(err)
@@ -1215,9 +1312,305 @@ local function queue_request(cx: WindowCx, anchor: number?, req: any): any
 	}
 end
 
+local function deliver_event(cx: WindowCx, tp: number, ev: any): string?
+	if type(ev) ~= "table" or type(ev.ev) ~= "string" or ev.ev == "" then
+		return "invalid event: expected an object with a non-empty 'ev' string"
+	end
+	local id = if supplied(ev.id) then tostring(ev.id) else nil
+	if id ~= nil and tsp.read_root_node(cx, tp, id, { depth = 0, nodes = 1 }) == nil then
+		local _, active_root, role = tsp.resolve_interactive_surface(cx, tp)
+		local hint = if active_root then string.format("active interactive root is %q, role %s", active_root, role or "unknown")
+			else "no active interactive card"
+		return string.format("surface node %q not found on pane %d (%s)", id, tp, hint)
+	end
+	local ok_e, err = pcall(function(): any
+		cx.session:event(tp, ev)
+		return nil
+	end)
+	if not ok_e then
+		return tostring(err)
+	end
+	return nil
+end
+
+-- Runs only after every event of a request was sent: the worker resumes, so the owner hears about its next turn.
+local function rearm_answered(cx: WindowCx, tp: number, anchor: number?)
+	-- Keep the recorded card key until Tern reports the transition out of waiting_input.
+	purge_worker_callbacks(tp, "waiting_input")
+	if anchor and not state.owner_of_pane(cx, tp) then
+		state.bind_wingman(anchor, tp)
+	end
+	local owner = state.owner_of_pane(cx, tp) or anchor
+	if owner ~= nil then
+		state.arm_callback(owner)
+	end
+	unsolicited_working[tp] = true
+end
+
+type AnswerRun = {
+	cx: WindowCx,
+	cid: number,
+	tp: number,
+	anchor: number?,
+	rearm: boolean,
+	root: string,
+	role: string,
+	results: { { index: number, ok: boolean, error: string? } },
+}
+
+local ANSWER_FREE_TEXT_SETTLE_MS = 60
+
+local function conclude_answer(run: AnswerRun, failure: string?)
+	if failure == nil and run.rearm then
+		rearm_answered(run.cx, run.tp, run.anchor)
+	end
+	send_mux(run.cid, {
+		ok = failure == nil,
+		pane = run.tp,
+		error = failure,
+		results = tern.json.array(run.results),
+	}, false)
+end
+
+-- Sends one event of the answer; a failure concludes the request and returns false.
+local function answer_send(run: AnswerRun, ev: any): boolean
+	local failure = deliver_event(run.cx, run.tp, ev)
+	table.insert(run.results, { index = #run.results + 1, ok = failure == nil, error = failure })
+	if failure ~= nil then
+		conclude_answer(run, failure)
+		return false
+	end
+	return true
+end
+
+local function action_of(button: any, names: { string }): string
+	local p = button.p
+	if type(p) == "table" and type(p.actions) == "table" and type(p.actions.click) == "string" then
+		return p.actions.click
+	end
+	local id = tostring(button.id)
+	for _, name in names do
+		local suffix = ".actions/" .. name
+		if string.sub(id, -#suffix) == suffix then
+			return name
+		end
+	end
+	return names[1]
+end
+
+local function submit_target(node: any, root: string): string
+	local button = tsp.find_action_node(node, { "submit" })
+	if button ~= nil and button.id ~= nil then
+		return tostring(button.id)
+	end
+	return root .. ".actions/submit"
+end
+
+local function reread_card(run: AnswerRun): any
+	return tsp.read_root_node(run.cx, run.tp, run.root, { nodes = 2000 })
+end
+
+local function after_settle(run: AnswerRun, step: () -> ())
+	tern.timer(ANSWER_FREE_TEXT_SETTLE_MS, function(later_cx: WindowCx?)
+		run.cx = later_cx or run.cx
+		if run.cx.session:pane(run.tp) == nil then
+			conclude_answer(run, string.format("pane %d closed before the answer finished", run.tp))
+			return
+		end
+		step()
+	end)
+end
+
+-- Free text: open the question, choose `other`, then edit and submit once Tern has mounted each step. A mounted
+-- node is used at once; a missing one is awaited a single settle interval.
+local function answer_other(run: AnswerRun, field: number, text: string)
+	local text_len = tsp.utf16_len(text)
+	local function edit_and_submit(node: any): boolean
+		local input = tsp.find_input_node(node, field)
+		if input == nil or input.id == nil then
+			return false
+		end
+		local p = input.p
+		local current = if type(p) == "table" and type(p.value) == "string" then tsp.utf16_len(p.value) else 0
+		local edit = { ev = "edit", id = tostring(input.id), from = 0, to = current, text = text, cursor = text_len, len = current }
+		if not answer_send(run, edit) then
+			return true
+		end
+		local submit_id = submit_target(node, run.root)
+		if answer_send(run, { ev = "action", id = submit_id, act = "submit" }) then
+			conclude_answer(run, nil)
+		end
+		return true
+	end
+	local function input_stage(node: any, settled: boolean)
+		if node ~= nil and edit_and_submit(node) then
+			return
+		elseif not settled then
+			after_settle(run, function()
+				input_stage(reread_card(run), true)
+			end)
+		else
+			conclude_answer(run, string.format("question %d did not open a free-text Other input", field + 1))
+		end
+	end
+	local function select_stage(node: any, settled: boolean)
+		local list = if node ~= nil then tsp.find_question_list(node, field) else nil
+		if list ~= nil and list.id ~= nil then
+			if answer_send(run, { ev = "select", id = tostring(list.id), item = "other" }) then
+				input_stage(reread_card(run), false)
+			end
+		elseif node ~= nil and tsp.find_input_node(node, field) ~= nil then
+			input_stage(node, false)
+		elseif not settled then
+			after_settle(run, function()
+				select_stage(reread_card(run), true)
+			end)
+		else
+			conclude_answer(run, string.format("question %d has no free-text Other option", field + 1))
+		end
+	end
+	local node = reread_card(run)
+	local direct = node ~= nil and tsp.find_question_list(node, field) == nil and tsp.find_input_node(node, field) ~= nil
+	if not direct and not answer_send(run, { ev = "action", id = run.root, act = string.format("open:%d", field) }) then
+		return
+	end
+	select_stage(if direct then node else reread_card(run), false)
+end
+
+local APPROVAL_DECISION_ACTS: { [string]: { string } } = {
+	approve = { "approve", "grant" },
+	deny = { "deny", "cancel" },
+	cancel = { "cancel", "deny" },
+}
+
+local function handle_answer(cx: WindowCx, cid: number, anchor: number?, tp: number, req: any)
+	local function reject(message: string)
+		send_mux(cid, { ok = false, pane = tp, error = message, results = tern.json.array() }, false)
+	end
+	local decision: string? = nil
+	for _, name in { "approve", "deny", "cancel" } do
+		if req[name] == true then
+			if decision ~= nil then
+				reject("choose only one of --approve, --deny and --cancel")
+				return
+			end
+			decision = name
+		end
+	end
+	local choices: { number } = {}
+	if type(req.choices) == "table" then
+		for _, value in ipairs(req.choices) do
+			local choice = positive_integer(value)
+			if choice == nil then
+				reject("answer choices must be positive integers (1-based option numbers)")
+				return
+			end
+			table.insert(choices, choice)
+		end
+	elseif supplied(req.choices) then
+		reject("answer choices must be a list of option numbers")
+		return
+	end
+	local other: string? = nil
+	if supplied(req.other) then
+		if type(req.other) ~= "string" or not string.find(req.other, "%S") then
+			reject("--other needs non-empty text")
+			return
+		end
+		other = req.other
+	end
+	local question: number? = nil
+	if supplied(req.question) then
+		question = positive_integer(req.question)
+		if question == nil then
+			reject("--question must be a positive integer (1-based)")
+			return
+		end
+	end
+	if decision ~= nil and (#choices > 0 or other ~= nil) then
+		reject(string.format("--%s cannot be combined with choices or --other", decision))
+		return
+	elseif decision == nil and #choices == 0 and other == nil then
+		reject("nothing to answer: give option numbers, --other TEXT, --approve, --deny or --cancel")
+		return
+	end
+
+	local node, root_id, role = tsp.resolve_interactive_surface(cx, tp)
+	if node == nil or root_id == nil then
+		reject(string.format("no active interactive prompt on pane %d", tp))
+		return
+	end
+	local card = tsp.parse_interactive_card(node, root_id, role or "unknown")
+	local questions: any = card.questions or {}
+	local run: AnswerRun = {
+		cx = cx, cid = cid, tp = tp, anchor = anchor, rearm = req.rearm ~= false,
+		root = root_id, role = role or "unknown", results = {},
+	}
+
+	if decision == nil and other == nil and card.kind == "approval" then
+		if #choices ~= 1 or (choices[1] ~= 1 and choices[1] ~= 2) then
+			reject("an approval prompt takes exactly one choice: 1 (approve) or 2 (deny)")
+			return
+		end
+		decision = if choices[1] == 1 then "approve" else "deny"
+	end
+	if decision ~= nil then
+		local names = APPROVAL_DECISION_ACTS[decision]
+		local button = tsp.find_action_node(node, names)
+		if button == nil or button.id == nil then
+			reject(string.format("the active prompt on pane %d has no %s action", tp, decision))
+			return
+		end
+		if answer_send(run, { ev = "action", id = tostring(button.id), act = action_of(button, names) }) then
+			conclude_answer(run, nil)
+		end
+		return
+	end
+
+	local other_field = (question or 1) - 1
+	if other ~= nil and #questions > 0 and other_field >= #questions then
+		reject(string.format("question %d out of range (1..%d)", other_field + 1, #questions))
+		return
+	end
+	local events: { any } = {}
+	if #choices > 0 then
+		if card.kind ~= "ask" then
+			reject(string.format("option numbers apply to ask cards and approvals, not role %s; use `wingman event`", run.role))
+			return
+		end
+		for index, choice in ipairs(choices) do
+			local field = if question ~= nil then question - 1 else index - 1
+			local q: any = questions[field + 1]
+			if #questions > 0 and q == nil then
+				reject(string.format("question %d out of range (1..%d)", field + 1, #questions))
+				return
+			end
+			local count = if q ~= nil then q.option_count else nil
+			if count ~= nil and choice > count then
+				reject(string.format("choice %d out of range for question %d (1..%d); nothing was sent", choice, field + 1, count))
+				return
+			end
+			table.insert(events, { ev = "action", id = root_id, act = string.format("pick:%d:%d", field, choice - 1) })
+		end
+	end
+	for _, ev in events do
+		if not answer_send(run, ev) then
+			return
+		end
+	end
+	if other ~= nil then
+		answer_other(run, other_field, other)
+		return
+	end
+	local submit_id = submit_target(node, root_id)
+	if answer_send(run, { ev = "action", id = submit_id, act = "submit" }) then
+		conclude_answer(run, nil)
+	end
+end
+
 local TARGETED_OPS = {
 	pip = true, dock = true, park = true, unpark = true, interrupt = true,
-	retry = true, stop = true, transcript = true, surface = true, event = true, await = true,
+	retry = true, stop = true, transcript = true, surface = true, event = true, answer = true, await = true,
 }
 
 local function handle_request(cx: WindowCx, cid: number, req: any)
@@ -1235,7 +1628,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = err }, false)
 			return
 		end
-		if anchor and (op == "pip" or op == "dock" or op == "retry" or op == "await" or (op == "event" and req.rearm ~= false)) then
+		if anchor and (op == "pip" or op == "dock" or op == "retry" or op == "await"
+			or ((op == "event" or op == "answer") and req.rearm ~= false)) then
 			local cycle = state.ownership_cycle(anchor, target)
 			if cycle then
 				send_mux(cid, { ok = false, error = cycle }, false)
@@ -1408,91 +1802,93 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 
 	if op == "surface" then
 		local tp = target :: number
-		local root: any = if req.root ~= tern.json.null then req.root else nil
-		local auto_root = req.auto_root == true
-		local want_as = req.as or "text"
-		local i_root, i_role = nil, nil
-		local ok_tree, tree = pcall(function()
-			return cx.session:surface(tp, {
-				as = "table",
-				root = if not auto_root then root else nil,
-				depth = req.depth,
-				nodes = req.nodes or 1500,
-			})
-		end)
-		if not ok_tree then
-			send_mux(cid, { ok = false, pane = tp, error = tostring(tree) }, false)
-			return
-		end
-		if auto_root and type(tree) == "table" then
-			i_root, i_role = tsp.find_interactive_root(tree)
-			if root == nil then
-				root = i_root
+		local root = if supplied(req.root) then tostring(req.root) else nil
+		local auto_root = root == nil and req.auto_root == true
+		local want_table = req.as == "table"
+		local node: any = nil
+		local i_root: string?
+		local i_role: string?
+		if root ~= nil then
+			node = tsp.read_root_node(cx, tp, root, { depth = req.depth, nodes = req.nodes or 2000 })
+			if node == nil then
+				send_mux(cid, { ok = false, pane = tp, root = root, error = string.format("surface node %q not found on pane %d", root, tp) }, false)
+				return
+			end
+		elseif auto_root then
+			node, i_root, i_role = tsp.resolve_interactive_surface(cx, tp)
+			root = i_root
+			if node == nil then
+				local has_fault, _, summary = tsp.inspect_fault_surface(cx, tp)
+				if has_fault then
+					send_mux(cid, { ok = true, pane = tp, interactive_role = "omp.fault", surface = summary }, false)
+				else
+					local ainfo = find_agent_info(cx, tp)
+					send_mux(cid, { ok = true, pane = tp, state = if ainfo then ainfo.state else "unknown" }, false)
+				end
+				return
 			end
 		end
-		if want_as == "table" then
-			local out_tree = tree
-			if root ~= nil and type(tree) == "table" then
-				local sub = tsp.find_node_by_id(tree, tostring(root))
-				if sub ~= nil then
-					out_tree = sub
+		local result: any = node
+		if node == nil then
+			local ok, full = pcall(function()
+				return cx.session:surface(tp, { as = "table", depth = req.depth, nodes = req.nodes or 5000 })
+			end)
+			if not ok then
+				send_mux(cid, { ok = false, pane = tp, error = tostring(full) }, false)
+				return
+			end
+			result = full
+		end
+		if not want_table then
+			local lines: { string } = {}
+			if node ~= nil then
+				tsp.format_tsp_subtree(node, "", lines, 0)
+			elseif type(result) == "table" then
+				for _, region in { "layer", "main", "dock" } do
+					tsp.format_tsp_subtree(result[region], "", lines, 0)
 				end
 			end
-			send_mux(cid, { ok = true, pane = tp, root = root, interactive_root = i_root, interactive_role = i_role, surface = out_tree }, false)
-			return
+			result = table.concat(lines, "\n")
 		end
-		local lines: { string } = {}
-		if type(tree) == "table" then
-			if root ~= nil then
-				local sub = tsp.find_node_by_id(tree, tostring(root))
-				if sub ~= nil then
-					tsp.format_tsp_subtree(sub, "", lines, 0)
-				end
-			else
-				for _, region in ipairs({ "layer", "main", "dock" }) do
-					if type(tree[region]) == "table" then
-						tsp.format_tsp_subtree(tree[region], "", lines, 0)
-					end
-				end
-			end
-		end
-		send_mux(cid, {
-			ok = true,
-			pane = tp,
-			root = root,
-			interactive_root = i_root,
-			interactive_role = i_role,
-			surface = table.concat(lines, "\n"),
-		}, false)
+		send_mux(cid, { ok = true, pane = tp, root = root, interactive_root = i_root, interactive_role = i_role, surface = result }, false)
 		return
 	end
 
 	if op == "event" then
 		local tp = target :: number
-		local events: any = if type(req.events) == "table" then req.events elseif type(req.ev) == "table" then { req.ev } else {}
-		local results = {}
-		local all_ok = #events > 0
-		for i, ev in ipairs(events) do
-			local ok_e, res_e = pcall(function(): any
-				cx.session:event(tp :: number, ev)
-				return nil
+		local events: { any } = if type(req.events) == "table" then req.events elseif supplied(req.ev) then { req.ev } else {}
+		local results: { { index: number, ok: boolean, error: string? } } = {}
+		local failure: string? = nil
+		if #events == 0 then
+			failure = "no events given"
+		else
+			local surface_ok, mounted = pcall(function()
+				return cx.session:surface(tp, { as = "table", depth = 0, nodes = 1 })
 			end)
-			all_ok = all_ok and ok_e
-			table.insert(results, { index = i, ok = ok_e, error = if ok_e then nil else tostring(res_e), result = if ok_e then res_e else nil })
-		end
-		if req.rearm ~= false then
-			state.clear_waiting(tp)
-			if anchor and not state.owner_of_pane(cx, tp) then
-				state.bind_wingman(anchor, tp)
+			if not surface_ok then
+				failure = tostring(mounted)
+			elseif mounted == nil then
+				failure = string.format("pane %d has no active TSP surface", tp)
 			end
-			unsolicited_working[tp] = true
 		end
-		send_mux(cid, {
-			ok = all_ok,
-			pane = tp,
-			error = if #events == 0 then "no events given" else nil,
-			results = tern.json.array(results),
-		}, false)
+		if failure == nil then
+			for i, ev in ipairs(events) do
+				failure = deliver_event(cx, tp, ev)
+				table.insert(results, { index = i, ok = failure == nil, error = failure })
+				if failure ~= nil then
+					break
+				end
+			end
+		end
+		if failure == nil and req.rearm ~= false then
+			rearm_answered(cx, tp, anchor)
+		end
+		send_mux(cid, { ok = failure == nil, pane = tp, error = failure, results = tern.json.array(results) }, false)
+		return
+	end
+
+	if op == "answer" then
+		handle_answer(cx, cid, anchor, target :: number, req)
 		return
 	end
 

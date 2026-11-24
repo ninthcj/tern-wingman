@@ -80,8 +80,8 @@ Wingman Live 是面向任意 Tern Agent 的工作台（`omp`、`claude`、`codex
 ```sh
 # 查看当前窗口活跃的 TSP Agents、画中画状态、ovnfs 与最近会话
 python3 skills/wingman/scripts/wingman.py info --cwd /path/to/project
-# 快速路径：只读 Tern 实时状态并返回 `availableAgents`；--no-sessions 或 --limit 0 不扫描会话
-python3 skills/wingman/scripts/wingman.py info --no-sessions
+# 在 Tern 内默认只显示当前视角的实时状态；--all 展开范围，--sessions 查看历史
+python3 skills/wingman/scripts/wingman.py info
 python3 skills/wingman/scripts/wingman.py info --limit 0
 
 # 派发任务：`new` 是「新增」一个僚机（绝不关闭或替换已有僚机）；`same` 复用已有僚机
@@ -103,8 +103,9 @@ python3 skills/wingman/scripts/wingman.py send same --pane <id> --prompt "跑 py
 python3 skills/wingman/scripts/wingman.py send new --replace --prompt "重来"   # 关闭唯一/同 cwd 唯一的已绑定僚机；没有或有歧义则报错
 
 # 直接从 Tern 内存读取结构化消息与工具卡片
-python3 skills/wingman/scripts/wingman.py transcript --last 6 --max-chars 4000   # 限制输出长度
-# 僚机卡在 ask/审批（waiting_input）：主控会自动收到卡片内容与节点 id；查看并通过 TSP 事件作答
+python3 skills/wingman/scripts/wingman.py transcript --last 6 --max-chars 4000   # 精简输出；--tools 查看工具输出
+python3 skills/wingman/scripts/wingman.py answer 2 --pane ID                    # 回答正在等待的僚机
+# 不支持的卡片可用底层命令调试
 python3 skills/wingman/scripts/wingman.py surface --pane <id> [--json]
 python3 skills/wingman/scripts/wingman.py event --pane <id> '{"ev":"action","id":"<id>","act":"pick:0:0"}' '{"ev":"action","id":"<submit_id>","act":"submit"}'
 # 僚机回合报错/中断（主控自动收到 `[Wingman fault · retryable · pane <id>]`）：原生 `/retry` 重试，等同 F5

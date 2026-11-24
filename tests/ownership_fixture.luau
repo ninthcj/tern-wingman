@@ -11,6 +11,7 @@ local request_id = 1
 local disconnected = false
 local clock = 0
 local watchdog: ((any) -> ())?
+local timers: { { ms: number, callback: (any) -> () } } = {}
 local request: { [string]: any }
 local receive: (string, any) -> ()
 local function unexpected(message: any)
@@ -22,6 +23,7 @@ local tern = {
     getenv = function() return nil end,
     now = function() return clock end,
     timer = function(ms, callback)
+        table.insert(timers, { ms = ms, callback = callback })
         if ms == 500 then
             watchdog = callback
         end
@@ -72,6 +74,157 @@ local focused_pane = 1
 local floated_over: number? = nil
 local moved_next_to: number? = nil
 local live_panel: number? = nil
+
+-- The surface mock follows Tern's capped reads: `nodes` is a preorder budget, `depth` counts levels below the
+-- root, and descendants left out are reported through `more`. Panes without a registered surface mount the
+-- default simple one, which carries the `test` node the shared RPC events address.
+type SurfaceCall = { pane: number, as: any, root: any, depth: any, nodes: any }
+local mock = {
+    surfaces = {} :: { [number]: any },
+    absent = {} :: { [number]: boolean },
+    calls = {} :: { SurfaceCall },
+    assistant_text = nil :: string?,
+    rooted_reads = true,
+    rooted_wrapper = false,
+    missing_root_raises = false,
+    event_failure = nil :: string?,
+    on_event = nil :: ((number, any) -> ())?,
+}
+local SURFACE_REGIONS = { "main", "dock", "layer" }
+
+local function node(id: string, kind: string, props: { [string]: any }?, children: { any }?): any
+    return { id = id, k = kind, p = props, c = children }
+end
+
+local function count_nodes(source: any): number
+    local total = 1
+    for _, child in source.c or {} do
+        total += count_nodes(child)
+    end
+    return total
+end
+
+local function locate(tree: any, id: string): (string?, any)
+    local function search(source: any): any
+        if source.id == id then
+            return source
+        end
+        for _, child in source.c or {} do
+            local hit = search(child)
+            if hit ~= nil then
+                return hit
+            end
+        end
+        return nil
+    end
+    for _, region in SURFACE_REGIONS do
+        local root = tree[region]
+        local hit = if root ~= nil then search(root) else nil
+        if hit ~= nil then
+            return region, hit
+        end
+    end
+    return nil, nil
+end
+
+local function clip_node(source: any, depth: number?, budget: { left: number }): any
+    budget.left -= 1
+    local copy: { [string]: any } = { id = source.id, k = source.k, p = source.p }
+    local children: { any }? = source.c
+    if children == nil or #children == 0 then
+        return copy
+    end
+    if depth ~= nil and depth <= 0 then
+        copy.more = count_nodes(source) - 1
+        return copy
+    end
+    local kept: { any } = {}
+    local omitted = 0
+    for _, child in children do
+        if budget.left > 0 then
+            table.insert(kept, clip_node(child, if depth ~= nil then depth - 1 else nil, budget))
+        else
+            omitted += count_nodes(child)
+        end
+    end
+    if #kept > 0 then
+        copy.c = kept
+    end
+    if omitted > 0 then
+        copy.more = omitted
+    end
+    return copy
+end
+
+local function collect_text(source: any, lines: { string })
+    local props = source.p
+    if props ~= nil then
+        for _, field in { "text", "label" } do
+            if type(props[field]) == "string" then
+                table.insert(lines, props[field])
+            end
+        end
+    end
+    for _, child in source.c or {} do
+        collect_text(child, lines)
+    end
+end
+
+local function default_surface(): any
+    return {
+        surface = { id = "surface-default", mode = "screen" },
+        main = node("main", "stack", nil, { node("test", "button", { label = "Submit", actions = { click = "submit" } }) }),
+    }
+end
+
+local function read_surface(pane: number, opts: any): any
+    local read = opts or {}
+    table.insert(mock.calls, { pane = pane, as = read.as, root = read.root, depth = read.depth, nodes = read.nodes })
+    local tree = if mock.absent[pane] then nil else (mock.surfaces[pane] or default_surface())
+    if tree == nil then
+        return nil
+    end
+    if read.root ~= nil and not mock.rooted_reads then
+        error("rooted surface reads are unavailable")
+    end
+    if read.as == "text" then
+        local lines: { string } = {}
+        for _, region in SURFACE_REGIONS do
+            if tree[region] ~= nil then
+                collect_text(tree[region], lines)
+            end
+        end
+        return string.sub(table.concat(lines, "\n"), 1, read.max_chars or 8000)
+    end
+    local budget = { left = read.nodes or 500 }
+    if read.root ~= nil then
+        local region, hit = locate(tree, read.root)
+        if hit == nil then
+            if mock.missing_root_raises then
+                error("surface node " .. tostring(read.root) .. " not found")
+            end
+            return nil
+        end
+        local clipped = clip_node(hit, read.depth, budget)
+        return if mock.rooted_wrapper then { surface = tree.surface, [region :: string] = clipped } else clipped
+    end
+    local out: { [string]: any } = { surface = tree.surface }
+    local omitted = 0
+    for _, region in SURFACE_REGIONS do
+        local root = tree[region]
+        if root ~= nil then
+            if budget.left > 0 then
+                out[region] = clip_node(root, read.depth, budget)
+            else
+                omitted += count_nodes(root)
+            end
+        end
+    end
+    if omitted > 0 then
+        out.more = omitted
+    end
+    return out
+end
 local custom_agents: { [any]: any } = { { id = "zeta" } :: any, { name = "alpha.1" } :: any, "zeta" :: any, { id = "Bad" } :: any, bare = {}, ["-x"] = {} }
 local cx = {
     settings = { get = function(_, key) assert(key == "agents.custom"); return custom_agents end },
@@ -81,8 +234,16 @@ local cx = {
         tab_of = function(_, id) return panes[id].tab end,
         layout = function() return { floats = {}, root = tab_tree, tab = 42 } end,
         focused = function() return focused_pane end,
-        surface = function() return nil end,
-        event = function(_, pane) effect("event", pane) end,
+        surface = function(_, pane, opts) return read_surface(pane, opts) end,
+        event = function(_, pane, ev)
+            if mock.event_failure then
+                error(mock.event_failure)
+            end
+            effect("event", pane, if ev.id ~= nil then tostring(ev.id) else nil)
+            if mock.on_event then
+                mock.on_event(pane, ev)
+            end
+        end,
     },
     canvas = {
         list = function()
@@ -92,7 +253,9 @@ local cx = {
     agents = {
         list = function() return agents end,
         ask = function(_, pane, prompt) effect("ask", pane, prompt) end,
-        transcript = function() return {} end,
+        transcript = function()
+            return if mock.assistant_text then { { role = "assistant", text = mock.assistant_text } } else {}
+        end,
     },
     layout = {
         float = function(_, pane, over, _, opts)
@@ -131,6 +294,7 @@ local function rpc(op: string, anchor: number, target: number?, extra: { [string
 end
 local function start(data: { [string]: any }?)
     watchdog = nil
+    timers = {}
     clock = 0
     store = data or {}
     load_plugin(fixture_require)
@@ -403,3 +567,784 @@ assert(radar_bridge.move_queued(cx, owned_item, 3) and rpc("status", 3).owner_pa
 local advertised = rpc("status", 1).custom_agents
 assert(#advertised == 3 and advertised[1] == "alpha.1" and advertised[2] == "bare" and advertised[3] == "zeta")
 assert(select(2, radar_bridge.move_queued(cx, 9999, 3)) == "queue item 9999 is no longer queued (already dispatched or cancelled); run 'wingman queue list' to inspect current queue")
+
+-- Tail-aware native surface reads, event preflight and escalation currency.
+local tsp = real_require("./tsp")
+
+local function has(text: any, needle: string): boolean
+    return type(text) == "string" and string.find(text, needle, 1, true) ~= nil
+end
+
+local function assert_plain_json(value: any, path: string, ancestors: { [any]: boolean })
+    local kind = type(value)
+    if kind == "string" or kind == "number" or kind == "boolean" then
+        return
+    end
+    assert(kind == "table", path .. " is a " .. kind)
+    assert(not ancestors[value] and getmetatable(value) == nil, path .. " is cyclic or carries a metatable")
+    ancestors[value] = true
+    local length = #value
+    local count = 0
+    for key, child in value do
+        count += 1
+        assert(type(key) == "string" or (type(key) == "number" and key >= 1 and key <= length), path .. " has a non-JSON key")
+        assert_plain_json(child, path .. "." .. tostring(key), ancestors)
+    end
+    assert(length == 0 or count == length, path .. " mixes array and object keys")
+    ancestors[value] = nil
+end
+
+local function ask_count(pane: number): number
+    local total = 0
+    for _, entry in effects do
+        if entry.op == "ask" and entry.target == pane then
+            total += 1
+        end
+    end
+    return total
+end
+
+local function last_ask(pane: number): string
+    for index = #effects, 1, -1 do
+        local entry = effects[index]
+        if entry.op == "ask" and entry.target == pane then
+            return entry.prompt or ""
+        end
+    end
+    return ""
+end
+
+local function event_ids(from: number): { string }
+    local ids: { string } = {}
+    for index = from + 1, #effects do
+        if effects[index].op == "event" then
+            table.insert(ids, effects[index].prompt or "")
+        end
+    end
+    return ids
+end
+
+-- Fires (and drops) the captured timers that were scheduled for exactly `ms`.
+local function run_timers(ms: number): number
+    local due: { (any) -> () } = {}
+    local remaining: { { ms: number, callback: (any) -> () } } = {}
+    for _, entry in timers do
+        if entry.ms == ms then
+            table.insert(due, entry.callback)
+        else
+            table.insert(remaining, entry)
+        end
+    end
+    timers = remaining
+    for _, callback in due do
+        callback(cx)
+    end
+    return #due
+end
+
+-- Every table read stays inside Tern's node cap and, for the tail-aware paths, never scans the whole surface.
+local function assert_bounded_reads(rooted_only: boolean)
+    for index, call in mock.calls do
+        if call.as == "table" then
+            assert(type(call.nodes) == "number" and call.nodes >= 1 and call.nodes <= 5000, "read " .. index .. " has no bounded node budget")
+            assert(call.depth == nil or (call.depth >= 0 and call.depth <= 64), "read " .. index .. " has an invalid depth")
+            assert(not rooted_only or call.root ~= nil, "read " .. index .. " scanned the whole surface")
+        end
+    end
+end
+
+local function fleet(owners: { [string]: number }?, owner_state: string?): (any, any, any, any)
+    agents = {
+        { pane = 1, cwd = "/work", state = owner_state or "idle" },
+        { pane = 2, cwd = "/work", state = "working" },
+        { pane = 3, cwd = "/work", state = "idle" },
+        { pane = 4, cwd = "/work", state = "idle" },
+    }
+    mock.surfaces, mock.absent, mock.calls = {}, {}, {}
+    mock.rooted_reads, mock.rooted_wrapper, mock.missing_root_raises = true, false, false
+    mock.event_failure, mock.on_event, mock.assistant_text = nil, nil, nil
+    start(if owners then { owners_v1 = owners } else nil)
+    return agents[1], agents[2], agents[3], agents[4]
+end
+
+local function ask_card(id: string, question: string, options: { string }): any
+    local children: { any } = { node(id .. "-q", "text", { text = question }) }
+    for index, label in options do
+        table.insert(children, node(`{id}-opt-{index}`, "button", { label = label, actions = { click = "pick" } }))
+    end
+    table.insert(children, node(id .. ".actions/submit", "button", { label = "Submit", actions = { click = "submit" } }))
+    return node(id, "card", { role = "omp.ask.card" }, children)
+end
+
+-- A transcript of 40 turns of 50 lines plus the live tail: far beyond one capped read, with an empty layer.
+-- `nested` lands inside the final turn, `entries` become direct main entries after it.
+local function long_surface(layout: { nested: { any }?, entries: { any }?, dock: any?, old_error: boolean? }): any
+    local entries: { any } = {}
+    for group = 1, 40 do
+        local lines: { any } = {}
+        for line = 1, 50 do
+            table.insert(lines, node(`m{group}_{line}`, "text", { text = `history {group}.{line}` }))
+        end
+        if group == 3 and layout.old_error then
+            table.insert(lines, node("old-error", "error", { role = "omp.error" }, { node("old-error-text", "text", { text = "Recovered earlier failure" }) }))
+        end
+        table.insert(entries, node(`g{group}`, "turn", nil, lines))
+    end
+    local last: { any } = {}
+    for line = 1, 6 do
+        table.insert(last, node(`t{line}`, "text", { text = `tail line {line}` }))
+    end
+    table.insert(last, node("t-final", "text", { text = "LAST-LINE-MARKER" }))
+    for _, extra in ipairs(layout.nested or {}) do
+        table.insert(last, extra)
+    end
+    table.insert(entries, node("g41", "turn", nil, last))
+    for _, extra in ipairs(layout.entries or {}) do
+        table.insert(entries, extra)
+    end
+    return {
+        surface = { id = "surface-long", mode = "screen" },
+        layer = node("layer", "layer", nil, nil),
+        main = node("main", "chat", nil, entries),
+        dock = layout.dock or node("dock", "dock", nil, nil),
+    }
+end
+
+local function card_surface(): any
+    return long_surface({ nested = {
+        node("tail-content", "col", nil, { ask_card("ask-7", "Pick a database", { "PostgreSQL", "SQLite" }) }),
+    } })
+end
+
+local function stall_entry(): any
+    return node("err-9", "error", { role = "omp.error" }, { node("err-9-text", "text", { text = "Stream stalled: connection reset" }) })
+end
+
+local function retry_dock(): any
+    return node("dock", "dock", nil, { node("hint", "text", { role = "omp.hint.retry", text = "F5 to retry" }) })
+end
+
+local function stall_surface(): any
+    return long_surface({ entries = { stall_entry() }, dock = retry_dock() })
+end
+
+local function small_stall_surface(): any
+    return {
+        surface = { id = "surface-stall", mode = "screen" },
+        main = node("main", "chat", nil, { node("context", "text", { text = "context" }), stall_entry() }),
+        dock = retry_dock(),
+    }
+end
+
+local function small_surface(card: any): any
+    return {
+        surface = { id = "surface-card", mode = "screen" },
+        main = node("main", "chat", nil, { node("context", "text", { text = "context" }), card }),
+    }
+end
+
+local function chained_card(number: number): any
+    return ask_card("ask-" .. number, "Question " .. number, { "Yes " .. number, "No " .. number })
+end
+
+type Question = { prompt: string, options: { { label: string, detail: string? } }, open: boolean?, other: boolean?, selected: number? }
+
+-- The real omp.ask.card layout: intro body, one group per question, an open question's list `<group>/f<n>` with o<n> items and `other`.
+local function semantic_card(root: string, intro: string?, questions: { Question }): any
+    local children: { any } = {}
+    if intro ~= nil then
+        table.insert(children, node(root .. ".body/intro", "col", nil, { node(root .. ".body/intro/p0", "text", { text = intro }) }))
+    end
+    for index, question in questions do
+        local group = `{root}.g{index - 1}`
+        local parts: { any } = { node(group .. "/q", "text", { text = question.prompt }) }
+        if question.open ~= false then
+            local items: { any } = {}
+            for position, option in question.options do
+                table.insert(items, node(`{group}/f{index - 1}/o{position - 1}`, "item", {
+                    label = option.label, detail = option.detail, selected = question.selected == position or nil,
+                }))
+            end
+            if question.other ~= false then
+                table.insert(items, node(`{group}/f{index - 1}/other`, "item", { label = "Other" }))
+            end
+            table.insert(parts, node(`{group}/f{index - 1}`, "list", nil, items))
+        else
+            table.insert(parts, node(group .. "/fold", "card", { role = "omp.ask.fold" }, { node(group .. "/fold/t", "text", { text = "folded" }) }))
+        end
+        table.insert(children, node(group, "col", nil, parts))
+    end
+    table.insert(children, node(root .. ".actions/cancel", "button", { label = "Cancel", actions = { click = "cancel" } }))
+    table.insert(children, node(root .. ".actions/submit", "button", { label = "Submit", actions = { click = "submit" } }))
+    return node(root, "card", { role = "omp.ask.card" }, children)
+end
+
+local function approval_card(root: string, role: string, buttons: { string }): any
+    local children: { any } = { node(root .. "/prompt", "text", { text = "Run rm -rf build?" }) }
+    for _, click in buttons do
+        table.insert(children, node(`{root}.actions/{click}`, "button", { label = click, actions = { click = click } }))
+    end
+    return node(root, "card", { role = role }, children)
+end
+
+-- The interactive card sits beyond what any single capped read returns; every runtime shape of a rooted read works.
+for _, wrapper in { false, true } do
+    local shape = if wrapper then "wrapper" else "direct"
+    fleet({ ["2"] = 1 })
+    mock.rooted_wrapper = wrapper
+    local whole = card_surface()
+    mock.surfaces[2] = whole
+
+    local total = 0
+    for _, region in SURFACE_REGIONS do
+        total += count_nodes(whole[region])
+    end
+    assert(total > 2000, shape .. ": the mock transcript must exceed 2000 nodes")
+    assert(select(2, locate(whole, "ask-7")) ~= nil)
+    local capped = read_surface(2, { as = "table", nodes = 2000 })
+    assert(select(2, locate(capped, "ask-7")) == nil, shape .. ": a capped whole-surface read must not reach the tail card")
+
+    mock.calls = {}
+    local shallow = tsp.read_root_node(cx, 2, "g41", { depth = 1, nodes = 100 })
+    assert(shallow ~= nil and shallow.id == "g41" and #shallow.c == 8, shape .. ": shallow rooted read")
+    assert(shallow.c[8].id == "tail-content" and shallow.c[8].more == 5 and shallow.c[8].c == nil, shape .. ": depth hides the nested card")
+    local probe = tsp.read_root_node(cx, 2, "main", { depth = 0, nodes = 1 })
+    assert(probe ~= nil and probe.id == "main" and probe.c == nil and probe.more > 2000, shape .. ": mounted probe stays one node")
+    for _, raises in { false, true } do
+        mock.missing_root_raises = raises
+        assert(tsp.read_root_node(cx, 2, "ghost", { depth = 0, nodes = 1 }) == nil, shape .. ": missing node")
+    end
+    mock.missing_root_raises = false
+
+    mock.surfaces[2] = long_surface({ nested = { node("tail-content", "col", nil, { semantic_card("ask-7", "Choosing storage", {
+        { prompt = "Pick a database", options = { { label = "PostgreSQL", detail = "relational" }, { label = "SQLite" } }, selected = 2 },
+    }) }) } })
+    mock.calls = {}
+    mock.assistant_text = string.rep("Long assistant prose. ", 400)
+    local key, body = tsp.build_waiting_summary(cx, 2)
+    assert(key == "omp.ask.card:ask-7", shape .. ": " .. key)
+    assert(has(body, "Pick a database") and has(body, "PostgreSQL") and has(body, "SQLite"), shape .. ": card text reaches the owner")
+    assert(has(body, "wingman answer --pane 2"), shape .. ": the owner gets the reply command")
+    assert(not has(body, "ask-7") and not has(body, "click=") and not has(body, "Last assistant message") and not has(body, "Long assistant prose"), shape .. ": no node ids, chrome or assistant prose on a card: " .. body)
+    assert(has(body, "Choosing storage") and has(body, "Q: Pick a database") and has(body, "1. PostgreSQL — relational") and has(body, "2. SQLite (selected)"), shape .. ": semantic question text: " .. body)
+    assert(not has(body, "<svg") and not has(body, "g0") and not has(body, "actions/"), shape .. ": no svg or internal ids: " .. body)
+    assert(not has(body, "(surface unavailable)"))
+    assert_bounded_reads(true)
+
+    mock.surfaces[2] = stall_surface()
+    mock.calls = {}
+    local faulted, fault_key, summary = tsp.inspect_fault_surface(cx, 2)
+    assert(faulted and string.find(fault_key or "", "^fault:err%-9:") ~= nil, shape .. ": fault at the transcript tail")
+    assert(has(summary, "Stream stalled: connection reset"), shape .. ": " .. tostring(summary))
+    assert_bounded_reads(true)
+    mock.surfaces[2] = long_surface({ entries = { node("abort-1", "text", { role = "omp.assistant.abort", text = "Aborted by user" }) } })
+    assert(not tsp.inspect_fault_surface(cx, 2), shape .. ": a plain Esc abort is not a fault")
+    mock.surfaces[2].dock = retry_dock()
+    local dock_fault, _, dock_summary = tsp.inspect_fault_surface(cx, 2)
+    assert(dock_fault and has(dock_summary, "Aborted by user"), shape .. ": a retry hint is active with a tail abort")
+    mock.surfaces[2] = long_surface({ old_error = true })
+    assert(not tsp.inspect_fault_surface(cx, 2), shape .. ": an old error above a clean tail is not a fault")
+
+    -- The real window surface op: plain JSON replies, the live card, the explicit root and the tail fallback.
+    mock.surfaces[2] = card_surface()
+    mock.calls = {}
+    local as_table = rpc("surface", 1, 2, { auto_root = true, as = "table" })
+    assert(as_table.ok and as_table.root == "ask-7" and as_table.interactive_root == "ask-7", shape)
+    assert(as_table.interactive_role == "omp.ask.card" and as_table.surface.id == "ask-7" and #as_table.surface.c == 4, shape)
+    assert_plain_json(frame, shape .. " surface table", {})
+    local as_text = rpc("surface", 1, 2, { auto_root = true })
+    assert(as_text.ok and as_text.interactive_root == "ask-7" and type(as_text.surface) == "string", shape)
+    assert(has(as_text.surface, "Pick a database") and has(as_text.surface, "click=pick"), shape .. ": " .. as_text.surface)
+    assert_plain_json(frame, shape .. " surface text", {})
+    assert_bounded_reads(true)
+    local explicit = rpc("surface", 1, 2, { root = "ask-7", as = "table" })
+    assert(explicit.ok and explicit.surface.id == "ask-7" and #explicit.surface.c == 4, shape)
+    assert_plain_json(frame, shape .. " explicit root", {})
+    local stale = rpc("surface", 1, 2, { root = "gone" })
+    assert(not stale.ok and has(stale.error, '"gone"') and has(stale.error, "not found on pane 2"), shape)
+
+    mock.surfaces[2] = long_surface({})
+    mock.calls = {}
+    local tail = rpc("surface", 1, 2, { auto_root = true })
+    assert(tail.ok and tail.interactive_root == nil and tail.interactive_role == nil and tail.surface == nil and tail.state == "working", shape)
+    assert(tail.root == nil, shape .. ": no scrollback without a card")
+    assert_bounded_reads(true)
+    local tail_table = rpc("surface", 1, 2, { auto_root = true, as = "table" })
+    assert(tail_table.ok and tail_table.interactive_root == nil and tail_table.surface == nil, shape)
+    assert_plain_json(frame, shape .. " quiet", {})
+    mock.surfaces[2] = stall_surface()
+    local fault = rpc("surface", 1, 2, { auto_root = true })
+    assert(fault.ok and fault.interactive_role == "omp.fault" and has(fault.surface, "Stream stalled"), shape .. ": an active fault is still shown")
+
+    mock.absent[2] = true
+    local absent = rpc("surface", 1, 2, { auto_root = true })
+    assert(absent.ok and absent.surface == nil and absent.interactive_root == nil, shape .. ": no surface mounted")
+    assert_plain_json(frame, shape .. " absent", {})
+end
+
+-- A runtime without rooted reads falls back to one capped whole-surface read.
+do
+    fleet({ ["2"] = 1 })
+    mock.rooted_reads = false
+    mock.surfaces[2] = small_surface(ask_card("ask-7", "Pick a database", { "PostgreSQL", "SQLite" }))
+    mock.calls = {}
+    local key, body = tsp.build_waiting_summary(cx, 2)
+    assert(key == "omp.ask.card:ask-7" and has(body, "PostgreSQL"), key)
+    local fallback = rpc("surface", 1, 2, { auto_root = true })
+    assert(fallback.ok and fallback.interactive_root == "ask-7" and has(fallback.surface, "Pick a database"))
+    assert_bounded_reads(false)
+    mock.surfaces[2] = small_stall_surface()
+    assert(tsp.inspect_fault_surface(cx, 2), "faults on a small surface are found without rooted reads too")
+end
+
+-- Events: shape validation, mounted-node preflight against the live surface, and the batch stopping at the first failure.
+for _, raises in { false, true } do
+    fleet(nil)
+    mock.missing_root_raises = raises
+    local base = #effects
+
+    local default_event = rpc("event", 1, 2)
+    assert(default_event.ok and #default_event.results == 1 and default_event.results[1].ok, "the default `test` event mounts")
+    assert(#effects == base + 1 and effects[#effects].op == "event" and effects[#effects].prompt == "test")
+    assert_plain_json(frame, "event reply", {})
+    assert(rpc("status", 2).owner_pane == 1, "a delivered event binds the answering owner")
+
+    local ghost = { { ev = "action", id = "ghost", act = "submit" } }
+    local missing = rpc("event", 1, 3, { events = ghost })
+    assert(not missing.ok and has(missing.error, '"ghost"') and has(missing.error, "not found on pane 3") and has(missing.error, "no active interactive card"))
+    assert(#missing.results == 1 and not missing.results[1].ok and #effects == base + 1, "a missing node sends nothing")
+    assert(rpc("status", 3).owner_pane == nil, "a rejected event must not bind the target")
+    assert_plain_json(frame, "missing reply", {})
+
+    local malformed: { any } = { "oops", 42, {}, { ev = 7 }, { ev = "" } }
+    for index, bad in malformed do
+        local rejected = rpc("event", 1, 2, { events = { bad } })
+        assert(not rejected.ok and has(rejected.error, "invalid event") and #effects == base + 1, "malformed event " .. index)
+    end
+    local empty = rpc("event", 1, 2, { events = {} })
+    assert(not empty.ok and empty.error == "no events given" and #effects == base + 1)
+
+    local keyed = rpc("event", 1, 2, { events = { { ev = "key", key = "Enter" } } })
+    assert(keyed.ok and #effects == base + 2 and effects[#effects].prompt == nil, "an event without a node id needs no mounted node")
+
+    local before_batch = #effects
+    local stopped = rpc("event", 1, 2, { events = {
+        { ev = "action", id = "test", act = "submit" },
+        { ev = "action", id = "ghost", act = "submit" },
+        { ev = "action", id = "test", act = "submit" },
+    } })
+    assert(not stopped.ok and #stopped.results == 2 and stopped.results[1].ok and not stopped.results[2].ok)
+    assert(#event_ids(before_batch) == 1, "the batch stops at the first missing node")
+    local mixed_events: { any } = { { ev = "action", id = "test", act = "submit" }, "oops", { ev = "action", id = "test", act = "submit" } }
+    local after_malformed = rpc("event", 1, 2, { events = mixed_events })
+    assert(not after_malformed.ok and #after_malformed.results == 2 and #event_ids(before_batch) == 2)
+
+    mock.event_failure = "pane refused the event"
+    local before_failure = #effects
+    local failed = rpc("event", 1, 2, { events = { { ev = "action", id = "test", act = "submit" }, { ev = "action", id = "test", act = "submit" } } })
+    assert(not failed.ok and has(failed.error, "pane refused the event") and #failed.results == 1 and #effects == before_failure)
+    mock.event_failure = nil
+
+    mock.absent[2] = true
+    local none = rpc("event", 1, 2)
+    assert(not none.ok and has(none.error, "no active TSP surface") and #effects == before_failure)
+    mock.absent[2] = nil
+
+    mock.surfaces[2] = small_surface(ask_card("40", "Pick one", { "A", "B" }))
+    local submit = { ev = "action", id = "40.actions/submit", act = "submit" }
+    local wrong = rpc("event", 1, 2, { events = { { ev = "action", id = "ui", act = "pick:0:0" }, submit } })
+    assert(not wrong.ok and #wrong.results == 1 and wrong.results[1].error == wrong.error and #effects == before_failure)
+    assert(has(wrong.error, [[surface node "ui" not found on pane 2 (active interactive root is "40", role omp.ask.card)]]))
+    local correct = rpc("event", 1, 2, { events = { { ev = "action", id = "40", act = "pick:0:0" }, submit } })
+    local answer_ids = event_ids(before_failure)
+    assert(correct.ok and #answer_ids == 2 and answer_ids[1] == "40" and answer_ids[2] == "40.actions/submit")
+
+    -- Dynamic ids: every event is checked against the surface as the previous event left it.
+    mock.surfaces[2] = small_surface(chained_card(7))
+    mock.on_event = function(pane: number, ev: any)
+        local number = tonumber(string.match(tostring(ev.id), "^ask%-(%d+)%-opt"))
+        if ev.act == "select" and number then
+            mock.surfaces[pane] = small_surface(chained_card(number + 1))
+        end
+    end
+    local before_dynamic = #effects
+    local early = rpc("event", 1, 2, { events = { { ev = "action", id = "ask-8-opt-1", act = "select" } } })
+    assert(not early.ok and has(early.error, [[active interactive root is "ask-7", role omp.ask.card]]) and #effects == before_dynamic)
+    local chain = rpc("event", 1, 2, { events = {
+        { ev = "action", id = "ask-7-opt-1", act = "select" },
+        { ev = "action", id = "ask-8-opt-2", act = "select" },
+        { ev = "action", id = "ask-9", act = "submit" },
+    } })
+    assert(chain.ok and #chain.results == 3)
+    local sent = event_ids(before_dynamic)
+    assert(#sent == 3 and sent[1] == "ask-7-opt-1" and sent[2] == "ask-8-opt-2" and sent[3] == "ask-9")
+    assert_plain_json(frame, "chain reply", {})
+    local answered = rpc("event", 1, 2, { events = { { ev = "action", id = "ask-7-opt-2", act = "select" } } })
+    assert(not answered.ok and has(answered.error, [[active interactive root is "ask-9"]]), "a stale card id is rejected")
+
+    mock.surfaces[2] = small_surface(chained_card(7))
+    local before_stale = #effects
+    local stale_batch = rpc("event", 1, 2, { events = {
+        { ev = "action", id = "ask-7-opt-1", act = "select" },
+        { ev = "action", id = "ask-7-opt-2", act = "select" },
+    } })
+    assert(not stale_batch.ok and #stale_batch.results == 2 and stale_batch.results[1].ok and not stale_batch.results[2].ok)
+    assert(has(stale_batch.error, [[active interactive root is "ask-8"]]) and #event_ids(before_stale) == 1)
+end
+
+-- Escalation currency: queued waiting/fault escalations must reflect the live worker, turn completions must not.
+local OWNED = { ["2"] = 1, ["3"] = 1, ["4"] = 1 }
+
+local function ask_question(worker: any)
+    worker.state = "waiting_input"
+    handlers.agent_state({ pane = worker.pane, old = "working", new = "waiting_input" }, cx)
+end
+
+local function stall(worker: any)
+    worker.state = "idle"
+    handlers.agent_state({ pane = worker.pane, old = "working", new = "idle" }, cx)
+end
+
+local function resume(worker: any, from: string)
+    worker.state = "working"
+    handlers.agent_state({ pane = worker.pane, old = from, new = "working" }, cx)
+end
+
+local function owner_goes_idle(owner: any)
+    owner.state = "idle"
+    handlers.agent_state({ pane = owner.pane, old = "working", new = "idle" }, cx)
+end
+
+local function answer_card(pane: number, id: string)
+    local out = rpc("event", 1, pane, { events = { { ev = "action", id = id, act = "submit" } } })
+    assert(out.ok, tostring(out.error))
+end
+
+do -- a still-current waiting escalation is delivered once the owner is idle
+    local owner, w2 = fleet(OWNED, "working")
+    mock.surfaces[2] = card_surface()
+    ask_question(w2)
+    assert(run_timers(120) == 1)
+    assert(radar_bridge.queued_callbacks(1) == 1 and radar_bridge.notified_waiting(2) == "omp.ask.card:ask-7")
+    local before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before + 1 and radar_bridge.queued_callbacks(1) == 0)
+    local prompt = last_ask(1)
+    assert(has(prompt, "[Wingman waiting_input · pane 2]") and has(prompt, "Pick a database") and not has(prompt, "ask-7"), prompt)
+end
+
+do -- answer -> waiting -> working -> owner idle: the queued escalation is gone
+    local owner, w2 = fleet(OWNED, "working")
+    mock.surfaces[2] = card_surface()
+    ask_question(w2)
+    assert(run_timers(120) == 1 and radar_bridge.queued_callbacks(1) == 1)
+    local key = radar_bridge.notified_waiting(2)
+    answer_card(2, "ask-7")
+    assert(radar_bridge.queued_callbacks(1) == 0, "an answered card must leave the owner queue")
+    assert(radar_bridge.notified_waiting(2) == key, "the card key stays until Tern leaves waiting_input")
+    assert(rpc("status", 1).ok and w2.state == "waiting_input")
+    assert(run_timers(120) == 1 and radar_bridge.queued_callbacks(1) == 0, "status must not requeue the answered card before Tern transitions")
+    resume(w2, "waiting_input")
+    assert(radar_bridge.notified_waiting(2) == nil)
+    local before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before, "a stale waiting escalation reached the owner")
+end
+
+do -- the escalation timer outlived the answer
+    local owner, w2 = fleet(OWNED, "working")
+    mock.surfaces[2] = card_surface()
+    ask_question(w2)
+    answer_card(2, "ask-7")
+    resume(w2, "waiting_input")
+    assert(run_timers(120) == 1)
+    assert(radar_bridge.queued_callbacks(1) == 0 and radar_bridge.notified_waiting(2) == nil)
+    local before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before)
+end
+
+do -- live filtering at flush: transitions Tern never reported, and a newer card replacing the queued one
+    local owner, w2 = fleet(OWNED, "working")
+    mock.surfaces[2] = card_surface()
+    ask_question(w2)
+    assert(run_timers(120) == 1 and radar_bridge.queued_callbacks(1) == 1)
+    w2.state = "idle"
+    local before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before and radar_bridge.queued_callbacks(1) == 0, "a worker that left waiting_input is dropped")
+
+    owner, w2 = fleet(OWNED, "working")
+    mock.surfaces[2] = card_surface()
+    ask_question(w2)
+    assert(run_timers(120) == 1 and radar_bridge.queued_callbacks(1) == 1)
+    mock.surfaces[2] = long_surface({ nested = { ask_card("ask-8", "Pick a cache", { "Redis", "None" }) } })
+    handlers.agent_state({ pane = 2, old = "waiting_input", new = "waiting_input" }, cx)
+    assert(run_timers(120) == 1 and radar_bridge.queued_callbacks(1) == 2)
+    assert(radar_bridge.notified_waiting(2) == "omp.ask.card:ask-8")
+    before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before + 1)
+    local prompt = last_ask(1)
+    assert(has(prompt, "Pick a cache") and not has(prompt, "Pick a database"), prompt)
+end
+
+do -- fault escalations: delivered while current, purged on retry, and pending timers invalidated
+    local owner, _, _, w4 = fleet(OWNED, "working")
+    mock.surfaces[4] = small_stall_surface()
+    stall(w4)
+    assert(run_timers(1500) == 1 and radar_bridge.queued_callbacks(1) == 1)
+    assert(has(radar_bridge.fault(4), "Stream stalled"), tostring(radar_bridge.fault(4)))
+    local before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before + 1 and radar_bridge.queued_callbacks(1) == 0)
+    local prompt = last_ask(1)
+    assert(has(prompt, "[Wingman fault · retryable · pane 4]") and has(prompt, "Stream stalled") and has(prompt, "wingman retry --pane 4"), prompt)
+
+    owner, _, _, w4 = fleet(OWNED, "working")
+    mock.surfaces[4] = stall_surface()
+    stall(w4)
+    assert(run_timers(1500) == 1 and radar_bridge.queued_callbacks(1) == 1)
+    resume(w4, "idle")
+    assert(radar_bridge.queued_callbacks(1) == 0 and radar_bridge.notified_waiting(4) == nil, "a retried worker leaves no queued fault")
+    before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before)
+
+    owner, _, _, w4 = fleet(OWNED, "working")
+    mock.surfaces[4] = stall_surface()
+    stall(w4)
+    assert(run_timers(1500) == 1 and radar_bridge.queued_callbacks(1) == 1)
+    w4.state = "working"
+    before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before and radar_bridge.queued_callbacks(1) == 0, "a fault whose worker moved on is dropped at flush")
+
+    owner, _, _, w4 = fleet(OWNED, "working")
+    mock.surfaces[4] = stall_surface()
+    stall(w4)
+    resume(w4, "idle")
+    assert(run_timers(1500) == 1 and radar_bridge.queued_callbacks(1) == 0, "the settle timer must not escalate a resumed worker")
+
+    owner, _, _, w4 = fleet(OWNED, "working")
+    mock.surfaces[4] = stall_surface()
+    w4.state = "idle"
+    handlers.agent_finished({ pane = 4, result = "failed" }, cx)
+    resume(w4, "idle")
+    assert(run_timers(150) == 1 and radar_bridge.queued_callbacks(1) == 0 and radar_bridge.notified_waiting(4) == nil, "the failed-turn timer is invalidated by a retry")
+    stall(w4)
+    w4.state = "idle"
+    handlers.agent_finished({ pane = 4, result = "failed" }, cx)
+    assert(run_timers(150) == 1 and radar_bridge.queued_callbacks(1) == 1, "an unretried failed turn still escalates")
+end
+
+do -- real turn completions survive every purge; stale waiting/fault entries do not
+    local owner, w2, w3, w4 = fleet(OWNED, "working")
+    mock.surfaces[2] = card_surface()
+    mock.surfaces[4] = stall_surface()
+    ask_question(w2)
+    assert(run_timers(120) == 1)
+    stall(w4)
+    assert(run_timers(1500) == 1)
+    resume(w3, "idle")
+    w3.state = "idle"
+    w3.last_message = "build ok"
+    handlers.agent_finished({ pane = 3, result = "done" }, cx)
+    assert(radar_bridge.queued_callbacks(1) == 3, "waiting, fault and turn entries queue behind the busy owner")
+    resume(w3, "idle")
+    assert(radar_bridge.queued_callbacks(1) == 3, "starting the next turn must not drop the finished one")
+    answer_card(2, "ask-7")
+    assert(radar_bridge.queued_callbacks(1) == 2)
+    resume(w2, "waiting_input")
+    resume(w4, "idle")
+    assert(radar_bridge.queued_callbacks(1) == 1, "only the real turn completion remains")
+    w3.state = "idle"
+    local before = ask_count(1)
+    owner_goes_idle(owner)
+    assert(ask_count(1) == before + 1 and radar_bridge.queued_callbacks(1) == 0)
+    local prompt = last_ask(1)
+    assert(has(prompt, "[Wingman auto-callback · done · pane 3]") and has(prompt, "build ok"), prompt)
+    assert(not has(prompt, "ask-7") and not has(prompt, "Stream stalled"), prompt)
+end
+
+-- wingman answer: the real handler driven through the fixture session.
+local seen: { any } = {}
+local function record_events(extra: ((number, any) -> ())?)
+    seen = {}
+    mock.on_event = function(pane: number, ev: any)
+        table.insert(seen, ev)
+        if extra then
+            extra(pane, ev)
+        end
+    end
+end
+
+local function answer(extra: { [string]: any }): any
+    local copy: { [string]: any } = { choices = {} }
+    for key, value in extra do
+        copy[key] = value
+    end
+    return rpc("answer", 1, 2, copy)
+end
+
+local function answer_pending(extra: { [string]: any }): number
+    frame = nil
+    request_id += 1
+    request = { op = "answer", anchor_pane = 1, target_pane = 2, async_callback = true, choices = {} }
+    for key, value in extra do
+        request[key] = value
+    end
+    receive("request", cx)
+    return request_id
+end
+
+local function ev_acts(): { string }
+    local out: { string } = {}
+    for _, ev in seen do
+        table.insert(out, `{ev.ev}:{ev.id}:{ev.act or ev.item or ""}`)
+    end
+    return out
+end
+
+local function surface_with(card: any)
+    mock.surfaces[2] = small_surface(card)
+end
+
+local THREE: Question = { prompt = "Pick a database", options = { { label = "PostgreSQL" }, { label = "SQLite" }, { label = "MySQL" } } }
+
+do -- single and multi-question picks
+    fleet(nil)
+    record_events()
+    surface_with(semantic_card("ask-7", nil, { THREE }))
+    local out = answer({ choices = { 2 } })
+    assert(out.ok and out.root == nil and #out.results == 2, tostring(out.error))
+    local acts = ev_acts()
+    assert(#acts == 2 and acts[1] == "action:ask-7:pick:0:1" and acts[2] == "action:ask-7.actions/submit:submit", table.concat(acts, " | "))
+    assert_plain_json(frame, "answer reply", {})
+    assert(rpc("status", 2).owner_pane == 1, "a delivered answer binds the owner")
+
+    surface_with(semantic_card("ask-7", "Setup", { THREE, { prompt = "Pick a cache", options = { { label = "Redis" }, { label = "None" } } } }))
+    record_events()
+    out = answer({ choices = { 1, 2 } })
+    acts = ev_acts()
+    assert(out.ok and #acts == 3 and acts[1] == "action:ask-7:pick:0:0" and acts[2] == "action:ask-7:pick:1:1" and acts[3] == "action:ask-7.actions/submit:submit", table.concat(acts, " | "))
+    record_events()
+    out = answer({ choices = { 1, 3 }, question = 1 })
+    acts = ev_acts()
+    assert(out.ok and acts[1] == "action:ask-7:pick:0:0" and acts[2] == "action:ask-7:pick:0:2" and acts[3] == "action:ask-7.actions/submit:submit", table.concat(acts, " | "))
+    record_events()
+    out = answer({ choices = { 2 }, question = 2 })
+    acts = ev_acts()
+    assert(out.ok and acts[1] == "action:ask-7:pick:1:1" and #acts == 2, table.concat(acts, " | "))
+end
+
+do -- invalid answers fire nothing and bind nothing
+    fleet(nil)
+    record_events()
+    surface_with(semantic_card("ask-7", nil, { THREE }))
+    for index, bad in { { 0 }, { 4 }, { 9 } } do
+        local out = answer({ choices = bad })
+        assert(not out.ok and has(out.error or "", "choice"), "invalid choices " .. index .. ": " .. tostring(out.error))
+        assert(#seen == 0, "invalid choices " .. index .. " must not reach the pane")
+    end
+    assert(rpc("status", 2).owner_pane == nil, "a rejected answer must not bind the owner")
+    mock.surfaces[2] = long_surface({})
+    local none = answer({ choices = { 1 } })
+    assert(not none.ok and has(none.error or "", "no active interactive prompt on pane 2") and #seen == 0, tostring(none.error))
+    mock.absent[2] = true
+    local absent = answer({ cancel = true })
+    assert(not absent.ok and #seen == 0)
+end
+
+do -- approve / deny / cancel
+    for _, role in { "omp.overlay.approval", "omp.editor.ask.approval" } do
+        fleet(nil)
+        record_events()
+        surface_with(approval_card("appr-1", role, { "approve", "deny" }))
+        local out = answer({ approve = true })
+        local acts = ev_acts()
+        assert(out.ok and #acts == 1 and acts[1] == "action:appr-1.actions/approve:approve", role .. " " .. table.concat(acts, " | "))
+        record_events()
+        out = answer({ deny = true })
+        acts = ev_acts()
+        assert(out.ok and #acts == 1 and acts[1] == "action:appr-1.actions/deny:deny", role .. " " .. table.concat(acts, " | "))
+    end
+    fleet(nil)
+    record_events()
+    surface_with(semantic_card("ask-7", nil, { THREE }))
+    local out = answer({ cancel = true })
+    local acts = ev_acts()
+    assert(out.ok and #acts == 1 and acts[1] == "action:ask-7.actions/cancel:cancel", table.concat(acts, " | "))
+end
+
+local OTHER_TEXT = "héllo 😀"
+local OTHER_UTF16 = 8
+
+local function input_node(): any
+    return node("ask-7.g0/input", "input", { value = "" })
+end
+
+do -- Other with the list and input already mounted
+    fleet(nil)
+    record_events()
+    surface_with(semantic_card("ask-7", nil, { THREE }))
+    local card = mock.surfaces[2].main.c[2]
+    table.insert(card.c[1].c, input_node())
+    local out = answer({ other = OTHER_TEXT })
+    assert(out.ok, tostring(out.error))
+    assert(#seen == 4, table.concat(ev_acts(), " | "))
+    assert(seen[1].ev == "action" and seen[1].id == "ask-7" and seen[1].act == "open:0")
+    assert(seen[2].ev == "select" and seen[2].id == "ask-7.g0/f0" and seen[2].item == "other")
+    local edit = seen[3]
+    assert(edit.ev == "edit" and edit.id == "ask-7.g0/input" and edit.text == OTHER_TEXT and edit.from == 0 and edit.to == 0 and edit.len == 0, "edit event")
+    assert(edit.cursor == OTHER_UTF16, "cursor counts UTF-16 units, got " .. tostring(edit.cursor))
+    assert(seen[4].ev == "action" and seen[4].id == "ask-7.actions/submit" and seen[4].act == "submit")
+    assert(rpc("status", 2).owner_pane == 1)
+end
+
+do -- Other when the list and the input mount 60ms late
+    fleet(nil)
+    record_events()
+    local card = semantic_card("ask-7", nil, { THREE })
+    local group = card.c[1]
+    local list = table.remove(group.c, 2)
+    surface_with(card)
+    local cid = answer_pending({ other = OTHER_TEXT, question = 1 })
+    assert(replies[cid] == nil, "the reply waits for the late list")
+    assert(#seen == 1 and seen[1].act == "open:0", table.concat(ev_acts(), " | "))
+    assert(radar_bridge.queued_callbacks(1) == 0 and rpc("status", 3).ok)
+    table.insert(group.c, list)
+    assert(run_timers(60) == 1)
+    assert(#seen == 2 and seen[2].ev == "select" and seen[2].item == "other", table.concat(ev_acts(), " | "))
+    assert(replies[cid] == nil, "the reply waits for the late input")
+    table.insert(group.c, input_node())
+    assert(run_timers(60) == 1)
+    assert(replies[cid] and replies[cid].reply.ok, "delayed Other completes")
+    assert(#seen == 4 and seen[3].ev == "edit" and seen[3].cursor == OTHER_UTF16 and seen[3].text == OTHER_TEXT)
+    assert(seen[4].act == "submit")
+    assert(rpc("status", 2).owner_pane == 1, "rearm only after the final success")
+
+    fleet(nil)
+    record_events()
+    local late = semantic_card("ask-7", nil, { THREE })
+    table.remove(late.c[1].c, 2)
+    surface_with(late)
+    answer_pending({ other = "x" })
+    assert(frame == nil)
+    assert(run_timers(60) == 1)
+    assert(frame and frame.reply and not frame.reply.ok, "a list that never mounts fails the answer")
+    assert(#seen == 1 and rpc("status", 2).owner_pane == nil, "a failed Other binds nothing")
+end
+
+do -- a completion keeps its conclusion when a chart precedes it
+    local owner, _, w3 = fleet(OWNED, "working")
+    resume(w3, "idle")
+    local chart = '```svg\n<svg aria-label="latency"><rect width="9"/></svg>\n```\n'
+    w3.state = "idle"
+    w3.last_message = chart .. "Final conclusion: ship it"
+    mock.assistant_text = w3.last_message
+    handlers.agent_finished({ pane = 3, result = "done" }, cx)
+    owner_goes_idle(owner)
+    local prompt = last_ask(1)
+    assert(has(prompt, "[chart: latency]") and has(prompt, "Final conclusion: ship it") and not has(prompt, "<svg") and not has(prompt, "<rect"), prompt)
+end
