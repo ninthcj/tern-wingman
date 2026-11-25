@@ -1348,3 +1348,249 @@ do -- a completion keeps its conclusion when a chart precedes it
     local prompt = last_ask(1)
     assert(has(prompt, "[chart: latency]") and has(prompt, "Final conclusion: ship it") and not has(prompt, "<svg") and not has(prompt, "<rect"), prompt)
 end
+
+-- Composer telemetry and thinking control: bounded TSP reads, scoped status, ordered effects, promotion re-resolution.
+local EFFORT_ID = "j.bar/model/effort"
+
+local function composer_nodes(prefix: string, context: string, level: string): { any }
+    return {
+        node(prefix .. ".context", "meter", { role = "omp.composer.context", label = context }),
+        node(prefix .. ".bar/model/effort", "effort", { role = "omp.composer.model.effort", level = level }),
+    }
+end
+
+local function composer_surface(context: string, level: string): any
+    return {
+        surface = { id = "surface-composer", mode = "screen" },
+        main = node("main", "chat", nil, composer_nodes("j", context, level)),
+    }
+end
+
+local function root_reads(prefix: string): { SurfaceCall }
+    local hits: { SurfaceCall } = {}
+    for _, call in mock.calls do
+        if type(call.root) == "string" and string.sub(call.root, 1, #prefix) == prefix then
+            table.insert(hits, call)
+        end
+    end
+    return hits
+end
+
+local function effect_ops(from: number): { string }
+    local ops: { string } = {}
+    for index = from + 1, #effects do
+        table.insert(ops, effects[index].op .. ":" .. effects[index].target)
+    end
+    return ops
+end
+
+local function record_thinking_events(): { any }
+    local log: { any } = {}
+    mock.on_event = function(pane: number, ev: any)
+        table.insert(log, { pane = pane, ev = ev })
+    end
+    return log
+end
+
+do -- bounded reads: fast path, last-editor fallback, and no fallback after a fast hit
+    fleet(nil)
+    mock.surfaces[2] = composer_surface("20%", "low")
+    mock.calls = {}
+    local context, level, control = tsp.read_composer_telemetry(cx, 2)
+    assert(context == "20%" and level == "low" and control == EFFORT_ID)
+    assert(#mock.calls == 2 and #root_reads("dock") == 0)
+    for _, call in mock.calls do
+        assert(call.depth == 0 and call.nodes == 1, "fast reads request exactly one node")
+    end
+    assert_bounded_reads(true)
+
+    local first = composer_nodes("e1", "5%", "high")
+    local last_editor_nodes = composer_nodes("e2", "61%", "medium")
+    local editors = node("dock", "dock", nil, {
+        node("e1", "editor", { role = "omp.editor" }),
+        node("e2", "editor", { role = "omp.editor" }),
+    })
+    mock.surfaces[2] = {
+        surface = { id = "surface-dock", mode = "screen" },
+        main = node("main", "chat", nil, { first[1], first[2], last_editor_nodes[1], last_editor_nodes[2] }),
+        dock = editors,
+    }
+    mock.calls = {}
+    local fallback_context, fallback_level, fallback_control = tsp.read_composer_telemetry(cx, 2)
+    assert(fallback_context == "61%" and fallback_level == "medium" and fallback_control == "e2.bar/model/effort", "the reverse scan picks the last editor")
+    assert(#root_reads("e1") == 0 and #root_reads("dock") == 1)
+    local dock_call = root_reads("dock")[1]
+    assert(#mock.calls == 5 and dock_call.depth == 2 and dock_call.nodes == 64)
+    assert_bounded_reads(true)
+
+    mock.surfaces[2].dock = node("dock", "dock", nil, {
+        node("tray", "col", { role = "omp.tray" }, { node("task", "row") }),
+        node("wrapper", "col", nil, {
+            node("e1", "editor", { role = "omp.editor" }),
+            node("e2", "editor", { role = "omp.editor" }),
+        }),
+    })
+    mock.calls = {}
+    local nested_context, nested_level, nested_control = tsp.read_composer_telemetry(cx, 2)
+    assert(nested_context == "61%" and nested_level == "medium" and nested_control == "e2.bar/model/effort")
+    assert(#mock.calls == 5 and #root_reads("e1") == 0, "nested fallback still probes only the latest editor")
+
+    mock.surfaces[2] = {
+        surface = { id = "surface-fast", mode = "screen" },
+        main = node("main", "chat", nil, { composer_nodes("j", "7%", "low")[1], first[1], first[2] }),
+        dock = editors,
+    }
+    mock.calls = {}
+    local partial_context, partial_level, partial_control = tsp.read_composer_telemetry(cx, 2)
+    assert(partial_context == "7%" and partial_level == nil and partial_control == nil)
+    assert(#root_reads("dock") == 0 and #root_reads("e") == 0, "a single fast node hit never falls back")
+
+    mock.rooted_wrapper = true
+    mock.surfaces[2] = {
+        main = node("main", "chat", nil, {
+            node("j.context", "custom", { role = "omp.composer.context", label = "not a percentage", value = 0.146 }),
+            node(EFFORT_ID, "custom", { role = "omp.composer.model.effort", level = "  auto  " }),
+        }),
+    }
+    local numeric_context, trimmed_level, wrapped_control = tsp.read_composer_telemetry(cx, 2)
+    assert(numeric_context == "15%" and trimmed_level == "auto" and wrapped_control == EFFORT_ID)
+    mock.surfaces[2].main.c[1] = node("j.context", "text", { label = "50%" })
+    mock.surfaces[2].main.c[2] = node(EFFORT_ID, "effort", { level = "   " })
+    local invalid_context, blank_level, mounted_control = tsp.read_composer_telemetry(cx, 2)
+    assert(invalid_context == nil and blank_level == nil and mounted_control == EFFORT_ID)
+end
+
+do -- status telemetry is scoped to the caller's own, owner and unowned same-tab agents
+    fleet({ ["2"] = 1, ["4"] = 3 })
+    for pane = 1, 4 do
+        agents[pane].state = "working"
+        mock.surfaces[pane] = composer_surface(`{pane}0%`, "low")
+    end
+    mock.calls = {}
+    local status = rpc("status", 1)
+    local rows: { [number]: any } = {}
+    for _, row in status.agents do
+        rows[row.pane] = row
+    end
+    assert(rows[2].context == "20%" and rows[2].thinking == "low", "a bound worker reports telemetry")
+    assert(rows[3].context == "30%", "an unowned agent in the caller's tab reports telemetry")
+    assert(rows[1].context == nil and rows[4].context == nil and rows[4].thinking == nil, "self and others' workers stay unread")
+    for _, call in root_reads("j.") do
+        assert(call.pane == 2 or call.pane == 3, "unscoped telemetry read of pane " .. call.pane)
+    end
+    assert_bounded_reads(false)
+
+    local all = rpc("status", 1, nil, { all = true })
+    for _, row in all.agents do
+        assert(row.context ~= nil, "status --all reads every live agent: pane " .. row.pane)
+    end
+    local from_worker = rpc("status", 2)
+    for _, row in from_worker.agents do
+        if row.pane == 1 or row.pane == 3 then
+            assert(row.context ~= nil, "a worker sees its owner and unowned peers: pane " .. row.pane)
+        else
+            assert(row.context == nil, "a worker does not read itself or foreign workers: pane " .. row.pane)
+        end
+    end
+    agents[3].state = "exited"
+    assert(rpc("status", 1).agents[3].context == nil)
+    assert_plain_json(frame, "status telemetry", {})
+end
+
+do -- immediate dispatch: validation first, then thinking.set before ask, no effects when rejected
+    fleet(nil)
+    mock.surfaces[3] = composer_surface("20%", "low")
+    local log = record_thinking_events()
+    local base = #effects
+    local invalid = rpc("dispatch", 1, 3, { thinking = "bogus" })
+    assert(not invalid.ok and #effects == base and rpc("status", 3).owner_pane == nil)
+    assert(not rpc("dispatch", 1, 3, { thinking = 5 }).ok and #effects == base)
+    local unsupported = rpc("dispatch", 1, 4, { thinking = "high" })
+    assert(not unsupported.ok and has(unsupported.error, "thinking control") and #effects == base)
+    assert(rpc("status", 4).owner_pane == nil)
+
+    assert(rpc("dispatch", 1, 3, { thinking = "high" }).ok)
+    local ops = effect_ops(base)
+    assert(#ops == 2 and ops[1] == "event:3" and ops[2] == "ask:3", table.concat(ops, ","))
+    local event = log[1].ev
+    assert(event.ev == "action" and event.id == EFFORT_ID and event.act == "thinking.set" and event.value == "high")
+    local before = #effects
+    assert(rpc("dispatch", 1, 4).ok and #effects == before + 1, "a dispatch without thinking never sets")
+end
+
+do -- queued: no mid-turn event, control re-resolved at promotion
+    local _, _, w3 = fleet(nil)
+    mock.surfaces[3] = composer_surface("20%", "low")
+    local log = record_thinking_events()
+    w3.state = "working"
+    local base = #effects
+    local first_dispatch = rpc("dispatch", 1, 3, { thinking = "xhigh", prompt = "first" })
+    assert(first_dispatch.ok and first_dispatch.queued and #log == 0 and #effects == base, "no event while the pane is mid-turn")
+    w3.state = "idle"
+    handlers.agent_finished({ pane = 3, result = "done" }, cx)
+    local ops = effect_ops(base)
+    assert(#ops == 2 and ops[1] == "event:3" and ops[2] == "ask:3", table.concat(ops, ","))
+    assert(log[1].ev.value == "xhigh" and last_ask(3) == "first")
+
+    w3.state = "working"
+    local next_dispatch = rpc("dispatch", 1, 3, { thinking = "off", prompt = "second" })
+    assert(next_dispatch.ok and next_dispatch.queued)
+    mock.surfaces[3] = nil
+    mock.absent[3] = true
+    local before_ask = ask_count(3)
+    local before_events = #log
+    w3.state = "idle"
+    handlers.agent_finished({ pane = 3, result = "done" }, cx)
+    assert(ask_count(3) == before_ask and #log == before_events, "an unsupported pane at promotion sends nothing")
+    assert(#radar_bridge.queue_items(3) == 0)
+end
+
+do -- moved: rejected before mutating, then applied at the destination in order
+    fleet(nil)
+    mock.surfaces[2] = composer_surface("20%", "low")
+    local log = record_thinking_events()
+    local queued_thinking = rpc("dispatch", 1, 2, { thinking = "medium", prompt = "carry" })
+    assert(queued_thinking.ok and queued_thinking.queued)
+    local base = #effects
+    local unsupported_move = queue_rpc("move", { id = queued_thinking.queue_id, to_pane = 3 })
+    assert(not unsupported_move.ok and has(unsupported_move.error, "thinking control") and #effects == base and #log == 0)
+    assert(#radar_bridge.queue_items(2) == 1 and #radar_bridge.queue_items(3) == 0, "a rejected move leaves the queue untouched")
+    assert(not radar_bridge.move_queued(cx, queued_thinking.queue_id, 3) and #radar_bridge.queue_items(2) == 1)
+    assert(rpc("status", 3).owner_pane == nil)
+
+    mock.surfaces[3] = composer_surface("30%", "low")
+    local supported_move = queue_rpc("move", { id = queued_thinking.queue_id, to_pane = 3 })
+    assert(supported_move.ok and supported_move.dispatched)
+    local ops = effect_ops(base)
+    assert(#ops == 2 and ops[1] == "event:3" and ops[2] == "ask:3", table.concat(ops, ","))
+    assert(log[1].ev.value == "medium" and last_ask(3) == "carry")
+end
+
+do -- completion paths do not read or expose composer telemetry
+    fleet(nil)
+    mock.surfaces[3] = composer_surface("20%", "low")
+    local sync_dispatch = rpc("dispatch", 1, 3, { async_callback = false })
+    local cid = request_id
+    assert(sync_dispatch._ack)
+    handlers.agent_state({ pane = 3, old = "idle", new = "working" }, cx)
+    agents[3].state = "idle"
+    mock.calls = {}
+    handlers.agent_finished({ pane = 3, result = "done" }, cx)
+    local reply = replies[cid].reply
+    assert(reply.status == "done" and reply.context == nil and reply.thinking == nil)
+    assert_plain_json(frame, "completion", {})
+    local awaited = rpc("await", 1, 3)
+    assert(awaited.status == "done" and awaited.context == nil and awaited.thinking == nil)
+    assert(#mock.calls == 0, "finish_wait and immediate await require no surface reads")
+
+    local owner, _, w3 = fleet(OWNED, "working")
+    mock.surfaces[3] = composer_surface("20%", "low")
+    resume(w3, "idle")
+    w3.state = "idle"
+    w3.last_message = "telemetry ok"
+    mock.calls = {}
+    handlers.agent_finished({ pane = 3, result = "done" }, cx)
+    owner_goes_idle(owner)
+    assert(last_ask(1) == "[Wingman auto-callback · done · pane 3]\ntelemetry ok", last_ask(1))
+    assert(#root_reads("j.") == 0, "completion callbacks do not probe composer nodes")
+end

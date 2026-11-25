@@ -154,6 +154,34 @@ local function collect_turn_output(cx: WindowCx, pane_id: number): (string?, any
 	return last_msg, transcript
 end
 
+local THINKING_LEVELS: { [string]: boolean } =
+	{ off = true, minimal = true, low = true, medium = true, high = true, xhigh = true, max = true, auto = true }
+
+-- Context % and thinking level read from the pane's composer; absent values stay nil. One bounded read set, never a scan.
+local function composer_telemetry(cx: WindowCx, pane: number): (string?, string?, string?)
+	local ok, context, level, control = pcall(tsp.read_composer_telemetry, cx, pane)
+	if not ok then
+		return nil, nil, nil
+	end
+	return context, level, control
+end
+
+local function resolve_thinking_control(cx: WindowCx, pane: number): (string?, string?)
+	local _, _, control = composer_telemetry(cx, pane)
+	if control == nil then
+		return nil, "pane " .. pane .. " does not expose a thinking control"
+	end
+	return control, nil
+end
+
+local function send_thinking(cx: WindowCx, pane: number, control: string, level: string): (boolean, string?)
+	local ok, err = pcall(function(): any
+		cx.session:event(pane, { ev = "action", id = control, act = "thinking.set", value = level })
+		return nil
+	end)
+	return ok, if ok then nil else tostring(err)
+end
+
 local ensure_watchdog: () -> ()
 
 local function has_pending_dispatch(pane: number): boolean
@@ -372,7 +400,23 @@ local function promote_next_queued(cx: WindowCx, pane_id: number): number?
 		if not item then
 			return nil
 		end
-		local ok, err = ask_worker(cx, pane_id, item.prompt)
+		local ok, err: any = true, nil
+		if item.thinking ~= nil then
+			local control, why = resolve_thinking_control(cx, pane_id)
+			if control == nil then
+				ok, err = false, "queued thinking.set unavailable: " .. tostring(why)
+			else
+				ok, err = send_thinking(cx, pane_id, control, item.thinking)
+				if not ok then
+					err = "queued thinking.set failed: " .. tostring(err)
+				end
+			end
+		end
+		local ask_failed = false
+		if ok then
+			ok, err = ask_worker(cx, pane_id, item.prompt)
+			ask_failed = not ok
+		end
 		if ok then
 			unsolicited_working[pane_id] = item.cid == nil
 			if item.cid ~= nil then
@@ -386,7 +430,7 @@ local function promote_next_queued(cx: WindowCx, pane_id: number): number?
 			end
 			return item.id
 		end
-		local reason = "queued cx.agents:ask failed: " .. tostring(err)
+		local reason = if ask_failed then "queued cx.agents:ask failed: " .. tostring(err) else tostring(err)
 		if item.cid ~= nil then
 			reply_to_queued({ item }, "failed", reason)
 		else
@@ -1179,6 +1223,10 @@ local function relocate_queued(
 			end
 		end
 	end
+	local queued_item = select(3, dispatches.find(id, pane))
+	if dst ~= pane and queued_item ~= nil and queued_item.thinking ~= nil and select(3, composer_telemetry(cx, dst)) == nil then
+		return nil, "destination pane " .. dst .. " does not expose a thinking control"
+	end
 	local item, err, position = dispatches.move(id, to_pos, dst, pane)
 	if not item then
 		return nil, err
@@ -1655,6 +1703,11 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			local info = cx.session:pane(a.pane)
 			local atab = if info then info.tab else nil
 			local owner = state.owner_of_pane(cx, a.pane)
+			local context: string?, level: string?
+			if a.state ~= "exited" and (req.all == true or anchor == nil or (a.pane ~= anchor
+				and (owner == anchor or a.pane == my_owner or (my_tab ~= nil and atab == my_tab and owner == nil)))) then
+				context, level = composer_telemetry(cx, a.pane)
+			end
 			local items = dispatches.compact(a.pane)
 			local cb_q = queued_callbacks[a.pane]
 			local cb_q_count = if cb_q then #cb_q else 0
@@ -1673,6 +1726,8 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 				queued_items = tern.json.array(items),
 				queued_callbacks_count = cb_q_count,
 				cwd = a.cwd,
+				context = context,
+				thinking = level,
 				state = a.state,
 				model = if (a.model :: any) ~= tern.json.null then a.model else nil,
 				command = if (a.command :: any) ~= tern.json.null then a.command else nil,
@@ -1942,6 +1997,14 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = "dispatch prompt is empty" }, false)
 			return
 		end
+		local thinking: string? = nil
+		if supplied(req.thinking) then
+			if type(req.thinking) ~= "string" or not THINKING_LEVELS[req.thinking] then
+				send_mux(cid, { ok = false, error = "invalid thinking level" }, false)
+				return
+			end
+			thinking = req.thinking
+		end
 		local position = if supplied(req.position) then positive_integer(req.position) else nil
 		if supplied(req.position) and position == nil then
 			send_mux(cid, { ok = false, error = "queue position must be a positive integer" }, false)
@@ -2023,6 +2086,16 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 			send_mux(cid, { ok = false, error = string.format("queue position %d out of range (1..%d)", position, dispatches.count(target_pane) + 1) }, false)
 			return
 		end
+		-- A supplied level for an existing pane must be settable now; a new worker takes it from its launch flag.
+		local control: string? = nil
+		if thinking ~= nil and target_pane ~= nil then
+			local why: string?
+			control, why = resolve_thinking_control(cx, target_pane)
+			if control == nil then
+				send_mux(cid, { ok = false, error = why }, false)
+				return
+			end
+		end
 
 		local new_worker = target_pane == nil
 		local pane: number
@@ -2049,12 +2122,19 @@ local function handle_request(cx: WindowCx, cid: number, req: any)
 		if busy then
 			load_dispatch_ids(cx)
 			local err: string?
-			queued_item, err, queued_position = dispatches.enqueue(pane, { cid = if async_cb then nil else cid, anchor = anchor, prompt = prompt }, position)
+			queued_item, err, queued_position = dispatches.enqueue(pane, { cid = if async_cb then nil else cid, anchor = anchor, prompt = prompt, thinking = thinking }, position)
 			if not queued_item then
 				send_mux(cid, { ok = false, error = err }, false)
 				return
 			end
 		else
+			if control ~= nil then
+				local sent, sent_err = send_thinking(cx, pane, control, thinking :: string)
+				if not sent then
+					send_mux(cid, { ok = false, error = "thinking.set failed: " .. tostring(sent_err) }, false)
+					return
+				end
+			end
 			-- Tern queues the prompt until the composer is sendable, including on a freshly parked pane.
 			local ok, err = ask_worker(cx, pane, prompt)
 			if not ok then

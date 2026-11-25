@@ -12,7 +12,7 @@ Run `wingman` from Tern, or use `python3 <skill-dir>/scripts/wingman.py` if it i
 ```bash
 wingman info [--all] [--sessions] [--limit N] [--cwd DIR]
 wingman send <new|same|latest|sessionId> (-m TEXT | --prompt-file FILE|-) \
-  [--agent ID] [--cwd DIR] [--pane ID] [--replace] [--model M] \
+  [--agent ID] [--cwd DIR] [--pane ID] [--replace] [--model M] [--thinking LEVEL] \
   [--layout split|down|pip|tab|park] [--pip tl|tr|bl|br] \
   [--async | --wait] [--max-time 30m] [--position N | --no-queue] [--json]
 wingman transcript [--pane ID] [--last 6] [--max-chars 8000] [--tools | --full]
@@ -21,6 +21,7 @@ wingman retry [--pane ID] [--async | --wait] [--max-time 30m] [--json]
 
 - `info` shows your workers, owner, and unclaimed peers in your tab. Use `--all` for the window and `--sessions` for history. Pick an ID from `availableAgents` (`omp` is the default).
 - `send new` adds a worker; `--replace` replaces only the targeted worker. `send same` reuses a worker. If several match, pass `--pane ID` or an explicit `--cwd DIR`. Outside Tern, only `omp` runs headless.
+- `info` reports `context` and `thinking` for `omp` workers. If a worker stops mid-scope or you’re considering `--replace`, check `info` first. If `thinking` dropped to `low` and `context` has headroom, continue with `send same --thinking high` to keep the warm cache. Reserve `--replace` for saturated context or unrelated work.
 - Agent callers are async by default. Continue when the callback arrives; don't poll. Workers report back automatically when their turn ends or enters `waiting_input`—never instruct a worker to run a reverse `wingman` callback mid-turn. Use `--wait` only when you need the result on stdout.
 - `transcript` defaults to compact messages and tool summaries. Use `--tools` for tool output or `--full` for the raw transcript.
 

@@ -13,6 +13,7 @@ export type Item = {
 	-- Mux client blocked on this task; nil for async dispatches.
 	cid: number?,
 	prompt: string,
+	thinking: string?,
 	enqueued_ms: number,
 }
 
@@ -21,6 +22,7 @@ export type Draft = {
 	anchor: number,
 	cid: number?,
 	prompt: string,
+	thinking: string?,
 }
 
 -- JSON-ready copy of an item with its current 1-based slot.
@@ -32,6 +34,7 @@ export type Snapshot = {
 	waiting_caller: boolean,
 	enqueued_ms: number,
 	prompt: string,
+	thinking: string?,
 	preview: string,
 }
 
@@ -112,7 +115,8 @@ local function make_item(
 	anchor: number,
 	cid: number?,
 	prompt: string,
-	enqueued_ms: number
+	enqueued_ms: number,
+	thinking: string?
 ): Item
 	return table.freeze({
 		id = id,
@@ -120,6 +124,7 @@ local function make_item(
 		anchor = anchor,
 		cid = cid,
 		prompt = prompt,
+		thinking = thinking,
 		enqueued_ms = enqueued_ms,
 	})
 end
@@ -133,6 +138,7 @@ local function snapshot(item: Item, position: number): Snapshot
 		waiting_caller = item.cid ~= nil,
 		enqueued_ms = item.enqueued_ms,
 		prompt = item.prompt,
+		thinking = item.thinking,
 		preview = preview(item.prompt),
 	}
 end
@@ -237,7 +243,7 @@ local function new(now: () -> number, last_id: number?, reserve_id: Reserve?): Q
 				return nil, refusal or "queue id reservation refused", nil
 			end
 		end
-		local item = make_item(id, pane, draft.anchor, draft.cid, draft.prompt, enqueued_ms)
+		local item = make_item(id, pane, draft.anchor, draft.cid, draft.prompt, enqueued_ms, draft.thinking)
 		next_id = id + 1
 		local list = pending
 		if list == nil then
@@ -257,7 +263,7 @@ local function new(now: () -> number, last_id: number?, reserve_id: Reserve?): Q
 		if owner == nil or position == nil or item == nil then
 			return nil, missing(id, pane), nil
 		end
-		local replacement = make_item(item.id, item.pane, item.anchor, item.cid, prompt, item.enqueued_ms)
+		local replacement = make_item(item.id, item.pane, item.anchor, item.cid, prompt, item.enqueued_ms, item.thinking)
 		local list = queues[owner] :: { Item }
 		list[position] = replacement
 		return replacement, nil, position
@@ -356,7 +362,7 @@ local function new(now: () -> number, last_id: number?, reserve_id: Reserve?): Q
 			return item, nil, slot
 		end
 		remove_at(owner, position)
-		local moved = make_item(item.id, destination, item.anchor, item.cid, item.prompt, item.enqueued_ms)
+		local moved = make_item(item.id, destination, item.anchor, item.cid, item.prompt, item.enqueued_ms, item.thinking)
 		if landing == nil then
 			landing = {}
 			queues[destination] = landing

@@ -1544,7 +1544,7 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         for text in (queued, sent, retry):
             self.assertEqual(len(text.splitlines()), 1)
 
-    def _bridge_harness(self, tmp: str, frames: list, on_frame=None):
+    def _bridge_harness(self, tmp: str, frames: list, on_frame=None, on_connect=None):
         """Run `call_bridge(timeout=None)` against fake sockets; return (reply, read deadlines, sent payloads, sleeps)."""
         from unittest import mock
 
@@ -1556,7 +1556,9 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         class FakeSock:
             def __init__(self, *a, **k): ...
             def settimeout(self, _t): ...
-            def connect(self, _a): ...
+            def connect(self, addr):
+                if on_connect is not None:
+                    on_connect(Path(addr))
             def sendall(self, data): sent.append(json.loads(data))
             def close(self): ...
 
@@ -1600,6 +1602,43 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         self.assertEqual([s["op"] for s in sent], ["dispatch", "await"])
         self.assertEqual(deadlines, [None] * 4, "timeout=None must never become a deadline after discovery")
         self.assertGreaterEqual(len(sleeps), 3)
+
+    def test_call_bridge_reattaches_after_refused_stale_socket(self) -> None:
+        attempts = []
+
+        def refuse_stale_once(path: Path) -> None:
+            attempts.append(path)
+            if len(attempts) == 2:
+                raise ConnectionRefusedError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = Path(tmp) / "w-1.sock"
+            stale.touch()
+            reply, deadlines, sent, _ = self._bridge_harness(
+                tmp,
+                [{"_ack": True, "pane": 105}, {"_reload": True}, {"ok": True, "last_message": "done"}],
+                on_connect=refuse_stale_once,
+            )
+        self.assertEqual(reply, {"ok": True, "last_message": "done"})
+        self.assertEqual(attempts, [stale, stale, stale])
+        self.assertEqual([s["op"] for s in sent], ["dispatch", "await"])
+        self.assertEqual(sent[1]["target_pane"], 105)
+        self.assertEqual(deadlines, [None] * 3)
+
+    def test_call_bridge_reload_skips_do_not_reset_discovery_window(self) -> None:
+        skipped = []
+
+        def record_skip(frame: dict, _path: Path) -> None:
+            if frame.get("_skip"):
+                skipped.append(frame)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "w-1.sock").touch()
+            frames = [{"_ack": True, "pane": 105}, {"_reload": True}]
+            frames += [{"_skip": True}] * 100
+            with self.assertRaisesRegex(TimeoutError, "no active Tern"):
+                self._bridge_harness(tmp, frames, record_skip)
+        self.assertGreater(len(skipped), 1)
 
     def test_call_bridge_discovery_wait_is_bounded_and_independent_of_deadline(self) -> None:
         from unittest import mock
@@ -1703,6 +1742,82 @@ class WingmanMultiWorkerTests(unittest.TestCase):
         fixture = ROOT_DIR / "tests" / "native_ui_fixture.luau"
         proc = subprocess.run([luau, str(fixture)], cwd=ROOT_DIR, capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
+    def _json_send(self, argv: list[str], reply: dict, subcmd: str = "send") -> dict:
+        from unittest import mock
+
+        buf = __import__("io").StringIO()
+        ns = wingman.build_parser().parse_args([subcmd, *argv, "--json", "--wait"])
+        with self._patched(_multi_status([105]), [], reply=reply) as stack:
+            stack.enter_context(mock.patch("sys.stdout", buf))
+            with self.assertRaises(SystemExit) as cm:
+                ns.func(ns)
+        self.assertEqual(cm.exception.code, 0)
+        return json.loads(buf.getvalue())
+
+    def _telemetry_info(self, argv: list[str], status: dict) -> tuple[dict, list[dict]]:
+        from unittest import mock
+
+        calls: list[dict] = []
+        buf = __import__("io").StringIO()
+        ns = wingman.build_parser().parse_args(["info", *argv])
+        with self._patched(status, calls) as stack:
+            stack.enter_context(mock.patch.object(wingman, "find_ovnfs_bin", lambda: None))
+            stack.enter_context(mock.patch("sys.stdout", buf))
+            ns.func(ns)
+        return json.loads(buf.getvalue()), calls
+
+    def test_thinking_levels_validated_by_cli_and_agent_rules(self) -> None:
+        parser = wingman.build_parser()
+        for level in ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"):
+            with self.subTest(level=level):
+                ns = parser.parse_args(["send", "new", "--thinking", level, "-m", "go"])
+                wingman.validate_agent_options(ns, use_tui=True)
+        with self.assertRaises(SystemExit), mock_stderr():
+            wingman.build_parser().parse_args(["send", "new", "--thinking", "bogus", "-m", "go"])
+        ns = wingman.build_parser().parse_args(["send", "new", "-m", "go"])
+        ns.thinking = "bogus"
+        with self.assertRaises(SystemExit) as cm:
+            wingman.validate_agent_options(ns, use_tui=True)
+        self.assertIn("invalid --thinking", str(cm.exception.code))
+        ns.agent = "agy"
+        ns.thinking = "high"
+        with self.assertRaises(SystemExit) as cm:
+            wingman.validate_agent_options(ns, use_tui=True)
+        self.assertIn("only applies to --agent omp", str(cm.exception.code))
+
+    def test_thinking_on_dispatch_and_launch_command_but_absent_when_unset(self) -> None:
+        req = self._dispatch(["new", "--thinking", "high"], _multi_status([]))
+        self.assertNotIn("thinking", req)
+        self.assertIn("--thinking high", req["command"])
+        req = self._dispatch(["same", "--thinking", "low"], _multi_status([105]))
+        self.assertEqual(req["thinking"], "low")
+        self.assertNotIn("command", req)
+        self.assertNotIn("thinking", self._dispatch(["new"], _multi_status([])))
+
+    def test_sync_json_send_and_retry_do_not_expose_telemetry(self) -> None:
+        reply = {"ok": True, "pane": 105, "status": "done", "last_message": "ok", "context": "42%", "thinking": "high"}
+        for subcmd, argv in (("send", ["same", "-m", "go"]), ("retry", [])):
+            with self.subTest(subcmd=subcmd):
+                out = self._json_send(argv, reply, subcmd)
+                self.assertEqual(out["lastMessage"], "ok")
+                self.assertNotIn("context", out)
+                self.assertNotIn("thinking", out)
+
+    def test_info_status_all_flag_and_telemetry_in_compact_and_all(self) -> None:
+        status = _multi_status([105])
+        status["agents"][1].update(context="10%", thinking="low")
+        compact, calls = self._telemetry_info([], status)
+        self.assertIs(calls[0]["all"], False)
+        worker = next(a for a in compact["ternAgents"] if a["pane"] == 105)
+        self.assertEqual((worker["context"], worker["thinking"]), ("10%", "low"))
+        full, calls = self._telemetry_info(["--all"], status)
+        self.assertTrue(calls[0]["all"])
+        worker = next(a for a in full["ternAgents"] if a["pane"] == 105)
+        self.assertEqual((worker["context"], worker["thinking"]), ("10%", "low"))
+        other = next(a for a in full["ternAgents"] if a["pane"] == 100)
+        self.assertNotIn("context", other)
+        self.assertNotIn("thinking", other)
 
     def test_window_luau_ownership_fixture(self) -> None:
         import shutil

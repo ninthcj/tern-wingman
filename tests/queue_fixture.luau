@@ -410,3 +410,15 @@ do
     check(#split_four == 118 and utf8.len(split_four) == 31, "a four-byte character split by the cut is dropped")
     expect(preview_of(string.rep("\128", 200)), "", "stray continuation bytes never yield a split character")
 end
+
+do
+    local pending = queue.new(now)
+    local item = assert(pending.enqueue(2, { anchor = 1, prompt = "original", thinking = "high" }))
+    expect(pending.list(2)[1].thinking, "high", "thinking on queue snapshot")
+    assert(pending.edit(item.id, "revised"))
+    assert(pending.move(item.id, 1, 3))
+    expect(pending.list_panes({ 2, 3 })[1].thinking, "high", "thinking follows edited and moved task")
+    local next_item = assert(pending.pop_next(3))
+    expect(next_item.thinking, "high", "thinking at dispatch")
+    expect(next_item.prompt, "revised", "edited prompt at dispatch")
+end

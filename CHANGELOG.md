@@ -2,6 +2,15 @@
 
 All notable changes to `tern-wingman` are documented in this file.
 
+## [0.9.1] - 2026-11-25
+
+### Added
+- **On-demand `omp` composer telemetry (`wingman info`)**: Scoped `info` queries expose `context` usage (`j.context`) and active `thinking` level (`j.bar/model/effort`) via O(1) single-node TSP reads (with reverse shallow `dock` fallback) without polluting auto-callbacks or sync `send`/`retry` outputs.
+- **Live `--thinking LEVEL` control on `send same`**: `wingman send same --thinking <level>` applies the requested `omp` thinking level via native `thinking.set` right before prompt dispatch—and preserves per-item `thinking` across queued dispatches, edits, and moves—so supervisors can raise effort without `--replace` destroying warm caches.
+
+### Fixed
+- **Hot-reload stale-socket race in `call_bridge`**: Stale `.sock` files (`ConnectionRefusedError`) or `_skip` frames during plugin reload no longer prematurely abort active `await` reattachments or reset the socket-discovery budget.
+
 ## [0.9.0] - 2026-11-24
 
 ### Added

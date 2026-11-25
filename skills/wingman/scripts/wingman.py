@@ -260,8 +260,7 @@ def call_bridge(
         if hasattr(socket, "AF_UNIX"):
             endpoints.extend(("unix", p) for p in sorted(ipc.glob("w-*.sock")))
         endpoints.extend(("tcp", p) for p in sorted(ipc.glob("w-*.tcp")))
-        if endpoints:
-            discovery_deadline = None
+        connected_any = False
         need_reload_retry = False
 
         for kind, sp in endpoints:
@@ -301,6 +300,9 @@ def call_bridge(
                 except OSError:
                     continue
 
+                connected_any = True
+                if ack_pane is None:
+                    discovery_deadline = None
                 wire = (json.dumps(wire_payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
                 sock.sendall(wire)
 
@@ -316,6 +318,7 @@ def call_bridge(
                     if frame.get("_skip"):
                         break
                     if frame.get("_ack"):
+                        discovery_deadline = None
                         ack_pane = int(frame["pane"])
                         ack_queued = bool(frame.get("queued"))
                         if on_ack is not None and not notified_ack:
@@ -345,14 +348,10 @@ def call_bridge(
                 "target_pane": ack_pane,
                 "daemon_socket": daemon_sock,
             }
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out after {timeout}s waiting for Tern wingman plugin")
-            time.sleep(0.15)
-            continue
 
-        # No mux socket yet (plugin mid-reload or not installed): wait briefly for one to bind.
-        # `deadline` is the caller's (None = wait for the whole turn) and must survive a reload untouched.
-        if not endpoints:
+        # A socket file can outlive its listener, and a different window can skip a resumed wait.
+        # Bound discovery separately from the caller's turn deadline (which may be None).
+        if not connected_any or ack_pane is not None:
             now = time.monotonic()
             if discovery_deadline is None:
                 discovery_deadline = now + DEFAULT_BRIDGE_TIMEOUT
@@ -745,6 +744,7 @@ def is_caller_tern_agent(status: dict[str, Any], my_pane: int) -> bool:
 
 
 BUILTIN_AGENT_IDS = ("omp", "claude", "codex", "copilot")
+TELEMETRY_KEYS = ("context", "thinking")
 
 
 def merge_available_agents(custom: Any) -> list[str]:
@@ -778,8 +778,8 @@ def _is_visible_peer(a: dict[str, Any], pid: int, is_self: bool, is_bound: bool,
 
 def _compact_agent(entry: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {key: entry[key] for key in ("pane", "kind", "state", "cwd", "isBoundToMe")}
-    for key in ("model", "boundOwner"):
-        if entry[key]:
+    for key in ("model", "context", "thinking", "boundOwner"):
+        if entry.get(key):
             out[key] = entry[key]
     for key in ("parked", "floating"):
         if entry[key]:
@@ -806,7 +806,9 @@ def cmd_info(args: argparse.Namespace) -> None:
     bridge_status: dict[str, Any] | None = None
     if my_pane is not None:
         try:
-            bridge_status = call_bridge({"op": "status", "anchor_pane": my_pane}, timeout=DEFAULT_BRIDGE_TIMEOUT)
+            bridge_status = call_bridge(
+                {"op": "status", "anchor_pane": my_pane, "all": bool(args.all)}, timeout=DEFAULT_BRIDGE_TIMEOUT
+            )
         except Exception:
             bridge_status = None
 
@@ -874,6 +876,9 @@ def cmd_info(args: argparse.Namespace) -> None:
                 "kind": "omp" if pid in pane_files else "acp",
                 "lastMessage": lm,
             }
+            for key in TELEMETRY_KEYS:
+                if isinstance(a.get(key), str) and a[key]:
+                    entry[key] = a[key]
             if args.all:
                 entry["lastMessagePreview"] = clip_text(entry.pop("lastMessage"), 200)
                 agents_out.append(entry)
@@ -918,6 +923,7 @@ def _read_prompt_input(prompt: str | None, prompt_file: str | None, label: str =
 
 PLACEMENTS = ("split", "down", "pip", "tab", "park")
 PIP_CORNERS = ("tl", "tr", "bl", "br")
+THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")
 
 
 def _parse_pane_id(raw: Any, my_pane: int | None) -> int:
@@ -978,6 +984,8 @@ def validate_agent_options(args: argparse.Namespace, use_tui: bool) -> None:
         raise SystemExit(
             f"error: invalid --agent {agent!r}: use lowercase letters, digits, '.', '_' or '-' (max 64, no leading '-')"
         )
+    if args.thinking is not None and args.thinking not in THINKING_LEVELS:
+        raise SystemExit(f"error: invalid --thinking {args.thinking!r}: choose one of {', '.join(THINKING_LEVELS)}")
     if agent == "omp":
         return
     if not use_tui:
@@ -1147,6 +1155,8 @@ def _send(args: argparse.Namespace, res: dict[str, Any]) -> None:
             req["pip_corner"] = pip_corner
         if args.auto_callback is not None:
             req["auto_callback"] = bool(args.auto_callback)
+        if not launching and args.thinking is not None:
+            req["thinking"] = args.thinking
 
         if launching and not is_omp and layout in ("park", "tab"):
             print(
@@ -1932,7 +1942,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--mode", choices=["auto", "tui", "headless"], default="auto")
     p_send.add_argument("--agent", default="omp", help="Worker agent id: `omp` (default) or any Tern ACP agent id (built-in `claude`/`codex`/`copilot` or a configured custom agent); non-omp agents launch via `tern acp <id>`")
     p_send.add_argument("--model", help="Optional model override")
-    p_send.add_argument("--thinking", help="Optional thinking level")
+    p_send.add_argument("--thinking", choices=list(THINKING_LEVELS), help="Optional omp thinking level (launch flag; also applied to a live pane at dispatch)")
     p_send.add_argument("--max-time", help="Optional max runtime (e.g. 30m, 1h)")
     p_send.add_argument("--takeover-idle", action="store_true")
     p_send.add_argument("--allow-fork", action="store_true")

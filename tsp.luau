@@ -177,6 +177,64 @@ local function read_root_node(cx: WindowCx, pane_id: number, id: string, opts: {
 	return nil
 end
 
+local COMPOSER_NODE_READ = { depth = 0, nodes = 1 }
+
+local function read_composer_nodes(cx: WindowCx, pane_id: number, prefix: string): (any, any)
+	return read_root_node(cx, pane_id, prefix .. ".context", COMPOSER_NODE_READ),
+		read_root_node(cx, pane_id, prefix .. ".bar/model/effort", COMPOSER_NODE_READ)
+end
+
+local function last_composer_editor(node: any, depth: number): string?
+	if type(node) ~= "table" then
+		return nil
+	end
+	if depth > 0 and type(node.c) == "table" then
+		for i = #node.c, 1, -1 do
+			local id = last_composer_editor(node.c[i], depth - 1)
+			if id ~= nil then
+				return id
+			end
+		end
+	end
+	if type(node.p) == "table" and node.p.role == "omp.editor" and type(node.id) == "string" and node.id ~= "" then
+		return node.id
+	end
+	return nil
+end
+
+local function read_composer_telemetry(cx: WindowCx, pane_id: number): (string?, string?, string?)
+	local meter, control = read_composer_nodes(cx, pane_id, "j")
+	if meter == nil and control == nil then
+		local dock = read_root_node(cx, pane_id, "dock", { depth = 2, nodes = 64 })
+		local id = last_composer_editor(dock, 2)
+		if id ~= nil and id ~= "j" then
+			meter, control = read_composer_nodes(cx, pane_id, id)
+		end
+	end
+
+	local context: string? = nil
+	if meter ~= nil then
+		local p = meter.p
+		if type(p) == "table" and (meter.k == "meter" or p.role == "omp.composer.context") then
+			local label = if type(p.label) == "string" then string.match(p.label, "^%s*(%d+%%)%s*$") else nil
+			if label ~= nil then
+				context = label
+			elseif type(p.value) == "number" and p.value >= 0 and p.value < math.huge then
+				context = string.format("%d%%", math.floor(p.value * 100 + 0.5))
+			end
+		end
+	end
+
+	if control ~= nil then
+		local p = control.p
+		if control.k == "effort" or (type(p) == "table" and p.role == "omp.composer.model.effort") then
+			local level = if type(p) == "table" and type(p.level) == "string" then string.match(p.level, "^%s*(.-)%s*$") else nil
+			return context, if level == "" then nil else level, tostring(control.id)
+		end
+	end
+	return context, nil, nil
+end
+
 local function expand_child(cx: WindowCx, pane_id: number, child: any): any
 	if type(child) == "table" and child.id ~= nil then
 		return read_root_node(cx, pane_id, tostring(child.id), { nodes = 1500 }) or child
@@ -977,6 +1035,7 @@ return {
 	find_question_list = find_question_list,
 	find_input_node = find_input_node,
 	read_root_node = read_root_node,
+	read_composer_telemetry = read_composer_telemetry,
 	resolve_interactive_surface = resolve_interactive_surface,
 	format_tsp_subtree = format_tsp_subtree,
 	build_waiting_summary = build_waiting_summary,
